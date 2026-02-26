@@ -2,16 +2,19 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Basics & PPA Setup
-RUN apt-get update && apt-get install -y software-properties-common gnupg curl
-RUN add-apt-repository -y ppa:xtradeb/apps
+# 1. Add Mozilla PPA and set priorities to bypass the Snap version
+RUN apt-get update && apt-get install -y software-properties-common gnupg && \
+    add-apt-repository -y ppa:mozillateam/ppa
 
-# 2. Force Pinning (The "Firefox way")
 RUN echo 'Package: * \n\
-Pin: release o=LP-PPA-xtradeb-apps \n\
-Pin-Priority: 1001' > /etc/apt/preferences.d/xtradeb-ppa
+Pin: release o=LP-PPA-mozillateam \n\
+Pin-Priority: 1001 \n\
+\n\
+Package: firefox \n\
+Pin: release o=LP-PPA-mozillateam \n\
+Pin-Priority: 1002' > /etc/apt/preferences.d/mozilla-firefox
 
-# 3. Install Chromium + essential libs for headless/containers
+# 2. Install everything (now using the real Firefox from the PPA)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -19,18 +22,17 @@ RUN apt-get update && apt-get install -y \
     novnc \
     websockify \
     supervisor \
-    chromium-browser \
-    libnss3 \
-    libgbm1 \
-    libasound2 \
+    firefox \
     && apt-get clean
 
-# 4. Setup noVNC
+# 3. Enable the full noVNC interface (with fullscreen button)
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
 WORKDIR /app
 COPY . .
 
-RUN chmod +x /app/run.sh && chmod -R 777 /tmp
+# Fix permissions
+RUN chmod -R 777 /tmp
+RUN chmod +x /app/run.sh
 
 CMD ["/app/run.sh"]

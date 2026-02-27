@@ -2,19 +2,21 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Add Chromium PPA and set priorities to bypass the Snap version
-RUN apt-get update && apt-get install -y software-properties-common gnupg && \
-    add-apt-repository -y ppa:canonical-chromium-builds/stage
+# 1. Add Google Chrome repo and set priorities to bypass Snap
+RUN apt-get update && apt-get install -y software-properties-common gnupg wget ca-certificates && \
+    mkdir -p /usr/share/keyrings && \
+    wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
 
 RUN echo 'Package: * \n\
-Pin: release o=LP-PPA-canonical-chromium-builds-stage \n\
+Pin: origin dl.google.com \n\
 Pin-Priority: 1001 \n\
 \n\
-Package: chromium-browser \n\
-Pin: release o=LP-PPA-canonical-chromium-builds-stage \n\
-Pin-Priority: 1002' > /etc/apt/preferences.d/chromium-browser
+Package: google-chrome-stable \n\
+Pin: origin dl.google.com \n\
+Pin-Priority: 1002' > /etc/apt/preferences.d/google-chrome
 
-# 2. Install everything (now using the real Chromium from the PPA)
+# 2. Install everything (now using Google Chrome stable from Google's repo)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -22,7 +24,7 @@ RUN apt-get update && apt-get install -y \
     novnc \
     websockify \
     supervisor \
-    chromium-browser \
+    google-chrome-stable \
     && apt-get clean
 
 # 3. Enable the full noVNC interface (with fullscreen button)
@@ -36,4 +38,3 @@ RUN chmod -R 777 /tmp
 RUN chmod +x /app/run.sh
 
 CMD ["/app/run.sh"]
-

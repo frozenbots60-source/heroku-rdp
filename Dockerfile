@@ -25,6 +25,37 @@ RUN apt-get update && apt-get install -y \
     websockify \
     supervisor \
     google-chrome-stable \
+    fonts-liberation \
+    libappindicator3-1 \
+    libasound2 \
+    libatk1.0-0 \
+    libc6 \
+    libcairo2 \
+    libdbus-1-3 \
+    libexpat1 \
+    libfontconfig1 \
+    libgcc-s1 \
+    libgdk-pixbuf2.0-0 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxcursor1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxi6 \
+    libxrandr2 \
+    libxrender1 \
+    libxss1 \
+    libxtst6 \
+    libgbm1 \
+    ca-certificates \
+    lsb-release \
     && apt-get clean
 
 # 3. Enable the full noVNC interface (with fullscreen button)

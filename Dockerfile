@@ -58,6 +58,9 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     && apt-get clean
 
+# 2b. Create a persistent, writable profile directory for Chrome so extensions can be installed/managed
+RUN mkdir -p /tmp/chrome-user-data && chmod -R 777 /tmp/chrome-user-data
+
 # 3. Enable the full noVNC interface (with fullscreen button)
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 

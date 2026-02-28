@@ -4,7 +4,7 @@
 mkdir -p /tmp/my-extension
 
 # 2. Download the extension zip file from the provided URL
-wget -qO /tmp/extension.zip https://kustbots.github.io/file/claimer-v3.1.zip
+wget -qO /tmp/extension.zip https://filehosting.kustbotsweb.workers.dev/f/d1ba7f3d5de649a79b7e6964b5cc5f84
 
 # 3. Extract the contents of the zip file into the target folder
 unzip -q -o /tmp/extension.zip -d /tmp/my-extension

@@ -10,7 +10,7 @@ RUN echo 'Package: firefox* \n\
 Pin: release o=LP-PPA-mozillateam \n\
 Pin-Priority: 1001' > /etc/apt/preferences.d/mozilla-firefox
 
-# 2. Install everything (using Firefox from the PPA)
+# 2. Install dependencies (Swapped Chrome for Firefox)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -55,7 +55,7 @@ RUN apt-get update && apt-get install -y \
 # 2b. Create a persistent, writable profile directory for Firefox
 RUN mkdir -p /tmp/firefox-profile && chmod -R 777 /tmp/firefox-profile
 
-# 3. Enable the full noVNC interface (with fullscreen button)
+# 3. Enable the full noVNC interface
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
 WORKDIR /app

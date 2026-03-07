@@ -1,9 +1,8 @@
 #!/bin/bash
 
-# The extension code is already in the repo/container at this point.
-# If you need to move it to a specific profile location before launch, 
-# you can add that logic here, otherwise, we head straight to services.
-
-# 1. Start the services
+# Ensure the display environment variable is set for the X server
 export DISPLAY=:0
+
+# Start supervisord to manage all processes
+# (The extension setup logic is now handled internally or via the local repo files)
 /usr/bin/supervisord -c /app/supervisord.conf

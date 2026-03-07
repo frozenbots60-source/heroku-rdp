@@ -2,21 +2,15 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Add Google Chrome repo and set priorities to bypass Snap
+# 1. Add Mozilla PPA and set priorities to bypass Snap
 RUN apt-get update && apt-get install -y software-properties-common gnupg wget ca-certificates && \
-    mkdir -p /usr/share/keyrings && \
-    wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg && \
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+    add-apt-repository -y ppa:mozillateam/ppa
 
-RUN echo 'Package: * \n\
-Pin: origin dl.google.com \n\
-Pin-Priority: 1001 \n\
-\n\
-Package: google-chrome-stable \n\
-Pin: origin dl.google.com \n\
-Pin-Priority: 1002' > /etc/apt/preferences.d/google-chrome
+RUN echo 'Package: firefox* \n\
+Pin: release o=LP-PPA-mozillateam \n\
+Pin-Priority: 1001' > /etc/apt/preferences.d/mozilla-firefox
 
-# 2. Install everything (now using Google Chrome stable from Google's repo)
+# 2. Install everything (using Firefox from the PPA)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -24,9 +18,8 @@ RUN apt-get update && apt-get install -y \
     novnc \
     websockify \
     supervisor \
-    google-chrome-stable \
+    firefox \
     fonts-liberation \
-    libappindicator3-1 \
     libasound2 \
     libatk1.0-0 \
     libc6 \
@@ -56,10 +49,11 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     ca-certificates \
     lsb-release \
+    unzip \
     && apt-get clean
 
-# 2b. Create a persistent, writable profile directory for Chrome so extensions can be installed/managed
-RUN mkdir -p /tmp/chrome-user-data && chmod -R 777 /tmp/chrome-user-data
+# 2b. Create a persistent, writable profile directory for Firefox
+RUN mkdir -p /tmp/firefox-profile && chmod -R 777 /tmp/firefox-profile
 
 # 3. Enable the full noVNC interface (with fullscreen button)
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html

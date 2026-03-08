@@ -10,7 +10,7 @@ RUN echo 'Package: firefox* \n\
 Pin: release o=LP-PPA-mozillateam \n\
 Pin-Priority: 1001' > /etc/apt/preferences.d/mozilla-firefox
 
-# 2. Install dependencies (Added python3 and python3-pip here)
+# 2. Install dependencies (Added geckodriver here)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     websockify \
     supervisor \
     firefox \
+    geckodriver \
     python3 \
     python3-pip \
     fonts-liberation \
@@ -55,11 +56,10 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean
 
 # --- NEW SECTION: Install Python Automation Libraries ---
-RUN pip3 install selenium webdriver-manager
+RUN pip3 install selenium
 # -------------------------------------------------------
 
 # 2b. Set /tmp to be globally writable (Sticky Bit) 
-# This allows the non-root user to create the firefox-profile at runtime
 RUN chmod 1777 /tmp
 
 # 3. Enable the full noVNC interface

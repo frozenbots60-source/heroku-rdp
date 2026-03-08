@@ -67,23 +67,7 @@ def main():
     if not os.path.exists(PROFILE_DIR):
         os.makedirs(PROFILE_DIR)
 
-    # 3. Launch Normal Firefox (No Selenium!)
-    # We load the extension directly. This bypasses the 'webdriver' flag entirely.
-    print("Starting Normal Firefox...", flush=True)
-    
-    # Command to run Firefox
-    cmd = [
-        "firefox",
-        "--display=:0",
-        f"--profile={PROFILE_DIR}",
-        "--no-remote",
-        "--new-instance",
-        # Load our temporary extension (This requires a preference set in the profile)
-        "https://stake.com" 
-    ]
-
-    # We need to allow the extension to load. 
-    # In standard Firefox, unsigned extensions require a specific pref.
+    # 3. Write Preferences
     # We write the prefs file before launch.
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     with open(prefs_path, "w") as f:
@@ -94,29 +78,34 @@ def main():
         user_pref("general.useragent.override", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0");
         """)
 
-    # Launch Firefox in the background
-    # We use Popen to run it asynchronously
-    process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
-
-    print("=== Firefox launched. Waiting for extension to load... ===", flush=True)
-    
-    # We need to install the extension. 
-    # Since we can't click, we copy it to the 'extensions' folder of the profile manually
-    # But Firefox scans this folder on startup.
-    
-    # HACK: For a temporary extension on a clean profile, we copy the folder.
+    # 4. Prepare Extension Install File
+    # We must do this BEFORE starting Firefox so it sees the extension immediately
     extensions_install_dir = os.path.join(PROFILE_DIR, "extensions")
     if not os.path.exists(extensions_install_dir):
         os.makedirs(extensions_install_dir)
     
-    # We give it a generic ID
-    # We create a file that points to our extension directory
+    # Create pointer file for the extension
     with open(os.path.join(extensions_install_dir, "kust@claimer"), "w") as f:
         f.write(EXTENSION_DIR)
 
-    # Restart Firefox to recognize the extension (or just launch it once with the path)
-    # Actually, simpler way: just launch it once, the prefs are set.
-    # We will just let it run. The user can use the noVNC to verify.
+    # 5. Launch Normal Firefox
+    print("Starting Normal Firefox...", flush=True)
+    
+    # Command to run Firefox
+    cmd = [
+        "firefox",
+        "--display=:0",
+        f"--profile={PROFILE_DIR}",
+        "--no-remote",
+        "--new-instance",
+        "--disable-sandbox",  # FIX: Required for Heroku/Docker to prevent EPERM crash
+        "https://stake.com" 
+    ]
+
+    # Launch Firefox in the background
+    process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
+
+    print("=== Firefox launched. Waiting for extension to load... ===", flush=True)
     
     # Keep the script running
     try:
@@ -127,4 +116,3 @@ def main():
         process.kill()
 
 if __name__ == "__main__":
-    main()

@@ -30,14 +30,22 @@ def main():
     options.add_argument("--display=:0")
     
     # CRITICAL FIXES FOR HEROKU/DOCKER:
-    # 1. No Sandbox: Allows Firefox to run inside the container without permission errors
     options.add_argument("--no-sandbox")
-    # 2. Disable SHM: Prevents memory crashes in limited environments
     options.add_argument("--disable-dev-shm-usage")
     
-    # REMOVED: Custom Profile arguments (this was causing the crash)
-    # Letting Selenium create a temp profile automatically is safer.
+    # ==========================================
+    # STEALTH CONFIGURATION (Fixes Captcha Loop)
+    # ==========================================
+    # 1. Hide the 'webdriver' flag (Most important)
+    options.set_preference("dom.webdriver.enabled", False)
     
+    # 2. Set a real User-Agent (Prevents detection as a bot browser)
+    options.set_preference("general.useragent.override", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0")
+    
+    # 3. Prevent popup detection
+    options.set_preference("dom.disable_open_during_load", False)
+    # ==========================================
+
     # Use the geckodriver installed in Dockerfile
     service = Service('/usr/local/bin/geckodriver')
     
@@ -46,6 +54,10 @@ def main():
         print("Starting Firefox...", flush=True)
         driver = webdriver.Firefox(service=service, options=options)
         
+        # Extra Stealth: Remove the WebDriver property from the window object immediately
+        # This is a backup in case the preference doesn't work fully
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
         print("Navigating to Stake...", flush=True)
         driver.get("https://stake.com")
         time.sleep(5)

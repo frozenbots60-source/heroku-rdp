@@ -65,6 +65,15 @@ RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/ge
 RUN pip3 install selenium
 # --------------------------------
 
+# --- FIREFOX CONFIGURATION (FIX: Allow Unsigned Extensions) ---
+# This is required for the "Normal Firefox" method to load your script extension
+RUN mkdir -p /usr/lib/firefox/browser/defaults/preferences/ && \
+    echo 'pref("general.config.filename", "mozilla.cfg");' > /usr/lib/firefox/browser/defaults/preferences/autoconfig.js && \
+    echo 'pref("general.config.obscure_value", 0);' >> /usr/lib/firefox/browser/defaults/preferences/autoconfig.js && \
+    echo '//' > /usr/lib/firefox/mozilla.cfg && \
+    echo 'lockPref("xpinstall.signatures.required", false);' >> /usr/lib/firefox/mozilla.cfg
+# --------------------------------------------------------------
+
 # 2b. Set /tmp to be globally writable (Sticky Bit) 
 RUN chmod 1777 /tmp
 

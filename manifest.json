@@ -1,0 +1,13 @@
+{
+  "manifest_version": 2,
+  "name": "Kust Auto Claimer",
+  "version": "1.0",
+  "permissions": ["*://*.stake.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.stake.com/*"],
+      "js": ["kust_claimer.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

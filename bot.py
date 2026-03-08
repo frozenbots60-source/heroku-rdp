@@ -25,11 +25,20 @@ def main():
     time.sleep(5) 
 
     options = Options()
-    options.add_argument("--display=:0")
-    options.add_argument("--profile")
-    options.add_argument("/tmp/firefox-profile")
     
-    # Use the geckodriver installed via apt in Dockerfile
+    # Connect to the Display
+    options.add_argument("--display=:0")
+    
+    # CRITICAL FIXES FOR HEROKU/DOCKER:
+    # 1. No Sandbox: Allows Firefox to run inside the container without permission errors
+    options.add_argument("--no-sandbox")
+    # 2. Disable SHM: Prevents memory crashes in limited environments
+    options.add_argument("--disable-dev-shm-usage")
+    
+    # REMOVED: Custom Profile arguments (this was causing the crash)
+    # Letting Selenium create a temp profile automatically is safer.
+    
+    # Use the geckodriver installed in Dockerfile
     service = Service('/usr/local/bin/geckodriver')
     
     driver = None
@@ -49,7 +58,7 @@ def main():
         driver.execute_script(f"window.KustClaimer.setUsername('{USERNAME}');")
         driver.execute_script("window.KustClaimer.init();")
 
-        print("Bot is running.", flush=True)
+        print("=== Bot is running. Check noVNC to watch it. ===", flush=True)
 
         # Keep alive loop
         while True:

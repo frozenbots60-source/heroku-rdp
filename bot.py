@@ -67,19 +67,16 @@ def main():
     if not os.path.exists(PROFILE_DIR):
         os.makedirs(PROFILE_DIR)
 
-    # 3. Write Preferences
-    # We write the prefs file before launch.
+    # 3. Write Preferences - minimal and human-like settings
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     with open(prefs_path, "w") as f:
         f.write(f"""
         user_pref("xpinstall.signatures.required", false);
         user_pref("extensions.autoDisableScopes", 0);
         user_pref("dom.webdriver.enabled", false);
-        user_pref("general.useragent.override", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0");
         """)
 
     # 4. Prepare Extension Install File
-    # We must do this BEFORE starting Firefox so it sees the extension immediately
     extensions_install_dir = os.path.join(PROFILE_DIR, "extensions")
     if not os.path.exists(extensions_install_dir):
         os.makedirs(extensions_install_dir)
@@ -88,24 +85,20 @@ def main():
     with open(os.path.join(extensions_install_dir, "kust@claimer"), "w") as f:
         f.write(EXTENSION_DIR)
 
-    # 5. Launch Normal Firefox
-    print("Starting Normal Firefox...", flush=True)
+    # 5. Launch Firefox - normal and simple, like a real human
+    print("Starting Firefox...", flush=True)
     
-    # Command to run Firefox
     cmd = [
         "firefox",
         "--display=:0",
         f"--profile={PROFILE_DIR}",
-        "--no-remote",
-        "--new-instance",
-        "--disable-sandbox",  # FIX: Required for Heroku/Docker to prevent EPERM crash
-        "https://stake.com" 
+        "https://stake.com"
     ]
 
     # Launch Firefox in the background
     process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
 
-    print("=== Firefox launched. Waiting for extension to load... ===", flush=True)
+    print("=== Firefox launched with extension. Bot is running... ===", flush=True)
     
     # Keep the script running
     try:

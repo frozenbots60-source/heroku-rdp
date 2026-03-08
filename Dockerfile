@@ -10,7 +10,7 @@ RUN echo 'Package: firefox* \n\
 Pin: release o=LP-PPA-mozillateam \n\
 Pin-Priority: 1001' > /etc/apt/preferences.d/mozilla-firefox
 
-# 2. Install dependencies (Swapped Chrome for Firefox)
+# 2. Install dependencies (Added python3 and python3-pip here)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     websockify \
     supervisor \
     firefox \
+    python3 \
+    python3-pip \
     fonts-liberation \
     libasound2 \
     libatk1.0-0 \
@@ -51,6 +53,10 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     unzip \
     && apt-get clean
+
+# --- NEW SECTION: Install Python Automation Libraries ---
+RUN pip3 install selenium webdriver-manager
+# -------------------------------------------------------
 
 # 2b. Set /tmp to be globally writable (Sticky Bit) 
 # This allows the non-root user to create the firefox-profile at runtime

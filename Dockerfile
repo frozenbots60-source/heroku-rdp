@@ -10,7 +10,7 @@ RUN echo 'Package: firefox* \n\
 Pin: release o=LP-PPA-mozillateam \n\
 Pin-Priority: 1001' > /etc/apt/preferences.d/mozilla-firefox
 
-# 2. Install dependencies (Added geckodriver here)
+# 2. Install dependencies (Removed 'geckodriver' from this list)
 RUN apt-get update && apt-get install -y \
     xvfb \
     fluxbox \
@@ -19,7 +19,6 @@ RUN apt-get update && apt-get install -y \
     websockify \
     supervisor \
     firefox \
-    geckodriver \
     python3 \
     python3-pip \
     fonts-liberation \
@@ -55,9 +54,16 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && apt-get clean
 
-# --- NEW SECTION: Install Python Automation Libraries ---
+# --- NEW SECTION: Install Geckodriver Manually ---
+# We download the latest version from Mozilla's GitHub
+RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
+    && tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin \
+    && rm /tmp/geckodriver.tar.gz
+# ------------------------------------------------
+
+# --- Install Python Libraries ---
 RUN pip3 install selenium
-# -------------------------------------------------------
+# --------------------------------
 
 # 2b. Set /tmp to be globally writable (Sticky Bit) 
 RUN chmod 1777 /tmp

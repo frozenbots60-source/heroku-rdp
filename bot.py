@@ -30,7 +30,7 @@ def main():
     options.add_argument("/tmp/firefox-profile")
     
     # Use the geckodriver installed via apt in Dockerfile
-    service = Service('/usr/bin/geckodriver')
+    service = Service('/usr/local/bin/geckodriver')
     
     driver = None
     try:

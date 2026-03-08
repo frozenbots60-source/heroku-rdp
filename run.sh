@@ -1,10 +1,8 @@
 #!/bin/bash
-# Clean up any old locks that might be causing the "Inaccessible" error
-rm -rf /tmp/firefox-profile/lock
-rm -rf /tmp/firefox-profile/.parentlock
 
-# Ensure the profile dir is ready for the current runtime user
-mkdir -p /tmp/firefox-profile
+# Ensure the display environment variable is set for the X server
+export DISPLAY=:0
 
-# Start supervisord
-/usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf
+# Start supervisord to manage all processes
+# (The extension setup logic is now handled internally or via the local repo files)
+/usr/bin/supervisord -c /app/supervisord.conf

@@ -92,6 +92,7 @@ def main():
         "firefox",
         "--display=:0",
         f"--profile={PROFILE_DIR}",
+        "--disable-sandbox",
         "https://stake.com"
     ]
 

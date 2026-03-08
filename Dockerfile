@@ -52,8 +52,9 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && apt-get clean
 
-# 2b. Create a persistent, writable profile directory for Firefox
-RUN mkdir -p /tmp/firefox-profile && chmod -R 777 /tmp/firefox-profile
+# 2b. Set /tmp to be globally writable (Sticky Bit) 
+# This allows the non-root user to create the firefox-profile at runtime
+RUN chmod 1777 /tmp
 
 # 3. Enable the full noVNC interface
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
@@ -61,8 +62,7 @@ RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 WORKDIR /app
 COPY . .
 
-# Fix permissions
-RUN chmod -R 777 /tmp
+# Fix permissions for the startup script
 RUN chmod +x /app/run.sh
 
 CMD ["/app/run.sh"]

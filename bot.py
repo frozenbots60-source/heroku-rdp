@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import shutil
+import zipfile
+import json
 
 # ================================
 # CONFIGURATION
@@ -12,127 +14,99 @@ USERNAME = "kustxoxo"
 
 # Paths
 WORKDIR = "/app"
+SOURCE_XPI = os.path.join(WORKDIR, "claimer.xpi")
 EXTENSION_DIR = os.path.join(WORKDIR, "kust_extension")
 PROFILE_DIR = "/tmp/firefox-profile"
 
 def setup_extension():
-    """Injects the token into the script and creates the extension folder."""
+    """Unpacks XPI, injects token, and prepares the extension folder."""
     print("=" * 60, flush=True)
     print("[EXTENSION SETUP] Starting extension setup...", flush=True)
     print("=" * 60, flush=True)
 
-    # 1. Create a clean extension directory
+    # 1. Check if source XPI exists
+    if not os.path.exists(SOURCE_XPI):
+        print(f"[EXTENSION SETUP] ❌ ERROR: {SOURCE_XPI} not found!", flush=True)
+        sys.exit(1)
+
+    # 2. Create a clean extension directory
     if os.path.exists(EXTENSION_DIR):
-        print(f"[EXTENSION SETUP] Removing existing extension directory: {EXTENSION_DIR}", flush=True)
         shutil.rmtree(EXTENSION_DIR)
     os.makedirs(EXTENSION_DIR)
     print(f"[EXTENSION SETUP] Created extension directory: {EXTENSION_DIR}", flush=True)
 
-    # 2. Copy manifest.json
-    manifest_src = os.path.join(WORKDIR, "manifest.json")
-    manifest_dst = os.path.join(EXTENSION_DIR, "manifest.json")
-    
-    if not os.path.exists(manifest_src):
-        print("[EXTENSION SETUP] ❌ ERROR: manifest.json not found!", flush=True)
-        sys.exit(1)
-    
-    shutil.copy(manifest_src, manifest_dst)
-    print(f"[EXTENSION SETUP] ✓ manifest.json copied to: {manifest_dst}", flush=True)
-    
-    # Log manifest content
-    with open(manifest_dst, "r") as f:
-        manifest_content = f.read()
-    print(f"[EXTENSION SETUP] manifest.json content:\n{manifest_content}", flush=True)
-
-    # 3. Process the JS script (Inject Token and Username)
-    js_path = os.path.join(WORKDIR, "kust_claimer.js")
-    if not os.path.exists(js_path):
-        print("[EXTENSION SETUP] ❌ ERROR: kust_claimer.js not found!", flush=True)
+    # 3. Unpack the XPI
+    print(f"[EXTENSION SETUP] Unpacking {SOURCE_XPI}...", flush=True)
+    try:
+        with zipfile.ZipFile(SOURCE_XPI, 'r') as zip_ref:
+            zip_ref.extractall(EXTENSION_DIR)
+        print("[EXTENSION SETUP] ✓ Unpacked successfully.", flush=True)
+    except Exception as e:
+        print(f"[EXTENSION SETUP] ❌ ERROR unpacking: {e}", flush=True)
         sys.exit(1)
 
-    print(f"[EXTENSION SETUP] Found kust_claimer.js at: {js_path}", flush=True)
+    # 4. Force ID in Manifest (Required for auto-loading)
+    # This ensures the pointer file method works 100% of the time.
+    manifest_path = os.path.join(EXTENSION_DIR, "manifest.json")
+    try:
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+        
+        # Define our specific ID
+        ext_id = "kust-claimer@bot.com"
+        
+        # Add browser_specific_settings if not present
+        if "browser_specific_settings" not in manifest:
+            manifest["browser_specific_settings"] = {}
+        if "gecko" not in manifest["browser_specific_settings"]:
+            manifest["browser_specific_settings"]["gecko"] = {}
+            
+        manifest["browser_specific_settings"]["gecko"]["id"] = ext_id
+        
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+            
+        print(f"[EXTENSION SETUP] ✓ Forced extension ID in manifest: {ext_id}", flush=True)
+    except Exception as e:
+        print(f"[EXTENSION SETUP] ⚠️ Warning: Could not modify manifest.json: {e}", flush=True)
 
-    with open(js_path, "r") as f:
-        script_content = f.read()
+    # 5. Process the JS script (Inject Token and Username)
+    # Find the JS file (assuming it's claim.js or kust_claimer.js)
+    js_files = [f for f in os.listdir(EXTENSION_DIR) if f.endswith('.js') and 'background' not in f.lower()]
     
-    print(f"[EXTENSION SETUP] Original script size: {len(script_content)} bytes", flush=True)
+    if not js_files:
+        print("[EXTENSION SETUP] ⚠️ Warning: No content script found to inject.", flush=True)
+    else:
+        # Inject into the first found content script
+        target_js = js_files[0]
+        js_path = os.path.join(EXTENSION_DIR, target_js)
+        
+        print(f"[EXTENSION SETUP] Injecting config into: {target_js}", flush=True)
 
-    # Replace the default empty token/username with real ones
-    # We do this by adding a line at the very top of the script
-    inject_config = f"""
+        with open(js_path, "r") as f:
+            script_content = f.read()
+        
+        inject_config = f"""
     // --- AUTO INJECTED CONFIG ---
     window.KustClaimerConfig = {{ SESSION_TOKEN: '{SESSION_TOKEN}', USERNAME: '{USERNAME}' }};
     // ----------------------------
     """
-    
-    final_script = inject_config + script_content
-    print(f"[EXTENSION SETUP] Injected config - SESSION_TOKEN: {SESSION_TOKEN[:20]}...", flush=True)
-    print(f"[EXTENSION SETUP] Injected config - USERNAME: {USERNAME}", flush=True)
-    print(f"[EXTENSION SETUP] Final script size: {len(final_script)} bytes", flush=True)
-
-    # Save to extension folder
-    final_js_path = os.path.join(EXTENSION_DIR, "kust_claimer.js")
-    with open(final_js_path, "w") as f:
-        f.write(final_script)
-    
-    print(f"[EXTENSION SETUP] ✓ Script saved to: {final_js_path}", flush=True)
-    
-    # Log first 500 chars of injected script
-    print(f"[EXTENSION SETUP] Injected script preview (first 500 chars):\n{final_script[:500]}...", flush=True)
-    
-    # Verify extension files
-    print("\n[EXTENSION SETUP] Verifying extension files:", flush=True)
-    for root, dirs, files in os.walk(EXTENSION_DIR):
-        for file in files:
-            filepath = os.path.join(root, file)
-            size = os.path.getsize(filepath)
-            print(f"[EXTENSION SETUP]   ✓ {filepath} ({size} bytes)", flush=True)
+        
+        final_script = inject_config + script_content
+        
+        with open(js_path, "w") as f:
+            f.write(final_script)
+        
+        print(f"[EXTENSION SETUP] ✓ Token and Username injected.", flush=True)
     
     print("\n[EXTENSION SETUP] ✓ Extension setup complete!", flush=True)
     print("=" * 60, flush=True)
-
-def verify_extension_installation():
-    """Verify that the extension files are properly in place."""
-    print("\n[EXTENSION VERIFY] Checking extension installation...", flush=True)
-    
-    # Check extension directory
-    if not os.path.exists(EXTENSION_DIR):
-        print("[EXTENSION VERIFY] ❌ Extension directory does not exist!", flush=True)
-        return False
-    print(f"[EXTENSION VERIFY] ✓ Extension directory exists: {EXTENSION_DIR}", flush=True)
-    
-    # Check manifest
-    manifest_path = os.path.join(EXTENSION_DIR, "manifest.json")
-    if not os.path.exists(manifest_path):
-        print("[EXTENSION VERIFY] ❌ manifest.json missing!", flush=True)
-        return False
-    print(f"[EXTENSION VERIFY] ✓ manifest.json exists", flush=True)
-    
-    # Check script
-    script_path = os.path.join(EXTENSION_DIR, "kust_claimer.js")
-    if not os.path.exists(script_path):
-        print("[EXTENSION VERIFY] ❌ kust_claimer.js missing!", flush=True)
-        return False
-    print(f"[EXTENSION VERIFY] ✓ kust_claimer.js exists", flush=True)
-    
-    # Check for injected config
-    with open(script_path, "r") as f:
-        content = f.read()
-    if "KustClaimerConfig" in content:
-        print("[EXTENSION VERIFY] ✓ Config injection detected in script", flush=True)
-    else:
-        print("[EXTENSION VERIFY] ❌ Config injection NOT found in script!", flush=True)
-        return False
-    
-    print("[EXTENSION VERIFY] ✓ All extension files verified successfully!", flush=True)
-    return True
 
 def main():
     print("\n" + "=" * 60, flush=True)
     print("🤖 BOT STARTING", flush=True)
     print("=" * 60, flush=True)
     print(f"Working Directory: {WORKDIR}", flush=True)
-    print(f"Extension Directory: {EXTENSION_DIR}", flush=True)
     print(f"Profile Directory: {PROFILE_DIR}", flush=True)
     print(f"Session Token: {SESSION_TOKEN[:20]}...", flush=True)
     print(f"Username: {USERNAME}", flush=True)
@@ -142,25 +116,18 @@ def main():
     time.sleep(5)
     print("[MAIN] ✓ Xvfb should be ready", flush=True)
 
-    # 1. Setup the extension with the current token
+    # 1. Setup the extension
     setup_extension()
 
-    # 2. Verify extension installation
-    if not verify_extension_installation():
-        print("[MAIN] ❌ Extension verification failed! Exiting...", flush=True)
-        sys.exit(1)
-
-    # 3. Create Profile Directory
+    # 2. Create Profile Directory
     if not os.path.exists(PROFILE_DIR):
         os.makedirs(PROFILE_DIR)
-        print(f"[MAIN] ✓ Created profile directory: {PROFILE_DIR}", flush=True)
-    else:
-        print(f"[MAIN] ✓ Profile directory exists: {PROFILE_DIR}", flush=True)
 
-    # 4. Write Preferences - enable dev mode and extension logging
+    # 3. Write Preferences
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
-    print(f"[MAIN] Writing Firefox preferences to: {prefs_path}", flush=True)
+    print(f"[MAIN] Writing Firefox preferences...", flush=True)
     
+    # Preferences: Allow unsigned, go straight to stake.com, anti-detect
     prefs_content = f"""
     // Extension settings
     user_pref("xpinstall.signatures.required", false);
@@ -171,15 +138,12 @@ def main():
     user_pref("devtools.chrome.enabled", true);
     user_pref("devtools.debugger.remote-enabled", true);
     user_pref("devtools.debugger.prompt-connection", false);
-    user_pref("devtools.toolbox.host", "window");
-    user_pref("devtools.toolbox.selectedTool", "webconsole");
     
     // Extension debugging
     user_pref("extensions.sdk.console.logLevel", "all");
     user_pref("browser.dom.window.dump.enabled", true);
     user_pref("javascript.options.showInConsole", true);
     user_pref("extensions.logging.enabled", true);
-    user_pref("extensions.webextensions.logging", true);
     
     // Anti-detection
     user_pref("dom.webdriver.enabled", false);
@@ -188,79 +152,61 @@ def main():
     user_pref("general.platform.override", "Win32");
     user_pref("general.oscpu.override", "Windows NT 10.0; Win64; x64");
     
-    // Console logging
-    user_pref("browser.console.showInPanel", true);
-    user_pref("browser.startup.homepage", "about:debugging#/runtime/this-firefox");
+    // STARTUP - Go straight to Stake
+    user_pref("browser.startup.homepage", "https://stake.com/settings/offers");
+    user_pref("browser.startup.page", 1);
+    user_pref("browser.startup.homepage_override.mstone", "ignore");
     """
     
     with open(prefs_path, "w") as f:
         f.write(prefs_content)
-    
-    print("[MAIN] ✓ Firefox preferences written (including dev mode)", flush=True)
-    print(f"[MAIN] Preferences content:\n{prefs_content}", flush=True)
+    print("[MAIN] ✓ Preferences written.", flush=True)
 
-    # 5. Prepare Extension Install File
+    # 4. Prepare Extension Pointer
     extensions_install_dir = os.path.join(PROFILE_DIR, "extensions")
     if not os.path.exists(extensions_install_dir):
         os.makedirs(extensions_install_dir)
-        print(f"[MAIN] ✓ Created extensions directory: {extensions_install_dir}", flush=True)
     
-    # Create pointer file for the extension
-    pointer_file = os.path.join(extensions_install_dir, "kust@claimer")
+    # The filename MUST match the ID we set in the manifest
+    pointer_file = os.path.join(extensions_install_dir, "kust-claimer@bot.com")
     with open(pointer_file, "w") as f:
         f.write(EXTENSION_DIR)
-    print(f"[MAIN] ✓ Created extension pointer file: {pointer_file}", flush=True)
-    print(f"[MAIN]   → Points to: {EXTENSION_DIR}", flush=True)
+    print(f"[MAIN] ✓ Extension pointer created: {pointer_file}", flush=True)
 
-    # 6. Launch Firefox - with dev tools enabled
+    # 5. Launch Firefox
     print("\n" + "=" * 60, flush=True)
-    print("[MAIN] 🚀 Starting Firefox with Dev Mode...", flush=True)
+    print("[MAIN] 🚀 Starting Firefox...", flush=True)
     print("=" * 60, flush=True)
     
     cmd = [
         "firefox",
         "--display=:0",
         f"--profile={PROFILE_DIR}",
-        "--devtools",  # Open with dev tools
-        "about:debugging#/runtime/this-firefox"  # Start at extension debugging page
+        "--no-remote"
     ]
     
     print(f"[MAIN] Firefox command: {' '.join(cmd)}", flush=True)
 
-    # Launch Firefox in the background
     process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
     
     print("\n" + "=" * 60, flush=True)
     print("🔥 FIREFOX LAUNCHED SUCCESSFULLY", flush=True)
     print("=" * 60, flush=True)
-    print("\n[EXTENSION STATUS]", flush=True)
-    print(f"  Extension Path: {EXTENSION_DIR}", flush=True)
+    print("\n[STATUS]", flush=True)
+    print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
+    print(f"  Target URL: https://stake.com/settings/offers", flush=True)
     print(f"  Session Token: {SESSION_TOKEN[:20]}...", flush=True)
-    print(f"  Username: {USERNAME}", flush=True)
-    print(f"  Firefox PID: {process.pid}", flush=True)
-    print("\n[INFO] Firefox opened with:", flush=True)
-    print("  - DevTools enabled", flush=True)
-    print("  - Extension debugging page (about:debugging)", flush=True)
-    print("  - Console logging enabled", flush=True)
-    print("\n[INFO] Check the extension at:", flush=True)
-    print("  about:debugging#/runtime/this-firefox", flush=True)
-    print("\n[INFO] To see extension logs:", flush=True)
-    print("  1. Go to about:debugging#/runtime/this-firefox", flush=True)
-    print("  2. Find 'kust_claimer' extension", flush=True)
-    print("  3. Click 'Inspect' to see console logs", flush=True)
     print("=" * 60 + "\n", flush=True)
     
-    # Keep the script running with periodic status
     try:
         counter = 0
         while True:
             time.sleep(60)
             counter += 1
-            # Check if Firefox is still running
             if process.poll() is not None:
                 print(f"[MAIN] ⚠️ Firefox process ended with code: {process.returncode}", flush=True)
                 break
-            print(f"[MAIN] Bot running for {counter} minute(s) - PID: {process.pid} - Check noVNC console", flush=True)
+            print(f"[MAIN] Bot running for {counter} minute(s) - PID: {process.pid}", flush=True)
     except KeyboardInterrupt:
         print("\n[MAIN] Received interrupt signal, killing Firefox...", flush=True)
         process.kill()

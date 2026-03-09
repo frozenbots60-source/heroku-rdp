@@ -18,6 +18,10 @@ SOURCE_XPI = os.path.join(WORKDIR, "claimer.xpi")
 EXTENSION_DIR = os.path.join(WORKDIR, "kust_extension")
 PROFILE_DIR = "/tmp/firefox-profile"
 
+# Firefox System Paths (Standard Ubuntu locations)
+FIREFOX_CFG_PATH = "/usr/lib/firefox/mozilla.cfg"
+AUTOCONFIG_JS_PATH = "/usr/lib/firefox/defaults/pref/autoconfig.js"
+
 def setup_extension():
     """Unpacks XPI, injects token, and prepares the extension folder."""
     print("=" * 60, flush=True)
@@ -46,7 +50,6 @@ def setup_extension():
         sys.exit(1)
 
     # 4. Force ID in Manifest (Required for auto-loading)
-    # This ensures the pointer file method works 100% of the time.
     manifest_path = os.path.join(EXTENSION_DIR, "manifest.json")
     try:
         with open(manifest_path, "r") as f:
@@ -71,7 +74,6 @@ def setup_extension():
         print(f"[EXTENSION SETUP] ⚠️ Warning: Could not modify manifest.json: {e}", flush=True)
 
     # 5. Process the JS script (Inject Token and Username)
-    # Find the JS file (assuming it's claim.js or kust_claimer.js)
     js_files = [f for f in os.listdir(EXTENSION_DIR) if f.endswith('.js') and 'background' not in f.lower()]
     
     if not js_files:
@@ -102,6 +104,37 @@ def setup_extension():
     print("\n[EXTENSION SETUP] ✓ Extension setup complete!", flush=True)
     print("=" * 60, flush=True)
 
+def setup_autoconfig():
+    """
+    Writes the AutoConfig files that force Firefox to install the extension.
+    This is the most reliable method for containerized environments.
+    """
+    print("[MAIN] Writing AutoConfig files...", flush=True)
+    
+    # 1. Write autoconfig.js (Tells Firefox to read mozilla.cfg)
+    autoconfig_content = """pref("general.config.filename", "mozilla.cfg");
+pref("general.config.obscure_value", 0);
+"""
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(AUTOCONFIG_JS_PATH), exist_ok=True)
+    
+    with open(AUTOCONFIG_JS_PATH, "w") as f:
+        f.write(autoconfig_content)
+
+    # 2. Write mozilla.cfg (The actual script to load extension)
+    # We use a safe variable name to avoid path issues
+    cfg_content = f"""//
+try {{
+    var extPath = "{EXTENSION_DIR}";
+    Components.utils.import("resource://gre/modules/Addons.jsm");
+    AddonManager.installAddonFromLocation(extPath);
+}} catch(e) {{}}
+"""
+    with open(FIREFOX_CFG_PATH, "w") as f:
+        f.write(cfg_content)
+        
+    print("[MAIN] ✓ AutoConfig files written.", flush=True)
+
 def main():
     print("\n" + "=" * 60, flush=True)
     print("🤖 BOT STARTING", flush=True)
@@ -119,15 +152,17 @@ def main():
     # 1. Setup the extension
     setup_extension()
 
-    # 2. Create Profile Directory
+    # 2. Setup AutoConfig (Force load extension)
+    setup_autoconfig()
+
+    # 3. Create Profile Directory
     if not os.path.exists(PROFILE_DIR):
         os.makedirs(PROFILE_DIR)
 
-    # 3. Write Preferences
+    # 4. Write Preferences
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     print(f"[MAIN] Writing Firefox preferences...", flush=True)
     
-    # Preferences: Allow unsigned, go straight to stake.com, anti-detect
     prefs_content = f"""
     // Extension settings
     user_pref("xpinstall.signatures.required", false);
@@ -162,17 +197,6 @@ def main():
         f.write(prefs_content)
     print("[MAIN] ✓ Preferences written.", flush=True)
 
-    # 4. Prepare Extension Pointer
-    extensions_install_dir = os.path.join(PROFILE_DIR, "extensions")
-    if not os.path.exists(extensions_install_dir):
-        os.makedirs(extensions_install_dir)
-    
-    # The filename MUST match the ID we set in the manifest
-    pointer_file = os.path.join(extensions_install_dir, "kust-claimer@bot.com")
-    with open(pointer_file, "w") as f:
-        f.write(EXTENSION_DIR)
-    print(f"[MAIN] ✓ Extension pointer created: {pointer_file}", flush=True)
-
     # 5. Launch Firefox
     print("\n" + "=" * 60, flush=True)
     print("[MAIN] 🚀 Starting Firefox...", flush=True)
@@ -182,7 +206,8 @@ def main():
         "firefox",
         "--display=:0",
         f"--profile={PROFILE_DIR}",
-        "--no-remote"
+        "--no-remote",
+        "--no-sandbox"  # CRITICAL: Fixes the EPERM/Sandbox error on Heroku
     ]
     
     print(f"[MAIN] Firefox command: {' '.join(cmd)}", flush=True)

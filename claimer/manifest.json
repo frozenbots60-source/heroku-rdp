@@ -5,14 +5,19 @@
   "description": "claimer by kust bots",
   "author": "Kust",
   "permissions": ["storage"],
-  "host_permissions": [
-    "*://*/*"
-  ],
+  "host_permissions": ["*://*.stake.com/*", "*://*.stake.ac/*", "*://*.stake.games/*"],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "kust-claimer@local.host",
+      "strict_min_version": "109.0"
+    }
+  },
   "content_scripts": [
     {
       "matches": [
-        "*://*/settings/offers*",
-        "https://stake.ac/ar/settings/offers*"
+        "*://*.stake.com/*",
+        "*://*.stake.ac/*",
+        "*://*.stake.games/*"
       ],
       "js": ["claim.js"],
       "run_at": "document_idle",

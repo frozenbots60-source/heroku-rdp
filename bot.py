@@ -127,7 +127,7 @@ def main():
     user_pref("browser.dom.window.dump.enabled", true);
     
     // STARTUP
-    user_pref("browser.startup.homepage", "https://stake.com/settings/offers");
+    user_pref("browser.startup.homepage", "https://stake1017.com/");
     user_pref("browser.startup.page", 1);
     user_pref("browser.startup.homepage_override.mstone", "ignore");
     """

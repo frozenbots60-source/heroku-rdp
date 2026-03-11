@@ -1,957 +1,3393 @@
 // =============================================================================
-// KUST CODE CLAIMER - LITE SERVER VERSION
-// Lightweight headless version for low-end PCs and servers
-// Works on Firefox, Node.js, and browsers without GUI
-// Version: 3.0-lite (with GUI)
+// CHROME EXTENSION COMPATIBILITY LAYER
+// These shims allow the Tampermonkey script to run natively in Chrome (MV3)
 // =============================================================================
+
+const unsafeWindow = window;
+const GM_addStyle = (css) => {
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+};
+const GM_getValue = (key, defaultValue) => {
+    const value = localStorage.getItem(key);
+    if (value === null) return defaultValue;
+    try {
+        return JSON.parse(value);
+    } catch (e) {
+        return value;
+    }
+};
+const GM_setValue = (key, value) => {
+    localStorage.setItem(key, JSON.stringify(value));
+};
+const GM_xmlhttpRequest = (details) => {
+    const { method, url, headers, data, onload, onerror } = details;
+    // Filter out headers that cause "Refused to set unsafe header" errors in Chrome
+    // This prevents the debugger from pausing on exceptions.
+    const safeHeaders = headers ? { ...headers } : {};
+    
+    const unsafeHeaders = ['Referer', 'Origin', 'User-Agent', 'Content-Length', 'Host', 'Connection', 'Cookie'];
+    unsafeHeaders.forEach(header => delete safeHeaders[header]);
+    
+    fetch(url, {
+        method: method || 'GET',
+        headers: safeHeaders,
+        body: data,
+        mode: 'cors'
+    })
+    .then(async response => {
+        const text = await response.text();
+        if (onload) {
+            onload({
+                responseText: text,
+                status: response.status,
+                statusText: response.statusText,
+                readyState: 4
+            });
+        }
+    })
+    .catch(error => {
+        if (onerror) {
+            onerror(error);
+        }
+    });
+};
+
+// =============================================================================
+// ORIGINAL SCRIPT STARTS HERE
+// =============================================================================
+
+// ==UserScript==
+// @name         kust-code-claimer
+// @namespace    http://tampermonkey.net/
+// @version      2.5
+// @description  Premium WebSocket listener & Auto Bonus Claimer for Stake.com (Dual Server Support) - Raw JSON Reporting
+// @author       Kust
+// @match        *://*stake*/settings/offers*
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
+// @connect      stake.com
+// @connect      stake*.com
+// @connect      stake*.in
+// @connect      stake*.pet
+// @connect      backend.tenopno.workers.dev
+// @connect      kust-bots-129c234bbe49.herokuapp.com
+// @connect      chat-auth-75bd02aa400a.herokuapp.com
+// @connect      velocity.kustbotsweb.workers.dev
+// @connect      code.hh123.site
+// @connect      cdn.socket.io
+// @connect      api.telegram.org
+// @connect      code-dash-ba59fe89410e.herokuapp.com
+// @run-at       document-idle
+// ==/UserScript==
 
 (function () {
     'use strict';
-
     // ================================
-    // CONFIGURATION
+    // ⚙️ CONFIGURATION
     // ================================
-    const CONFIG = {
-        // WebSocket server URLs
-        WS_SERVER_URL: 'wss://code-extract1-840a32439225.herokuapp.com/ws',
-        AUTH_CHECK_URL: 'https://code-auth11-4cc0b14f630c.herokuapp.com/check',
+    
+    // --- DYNAMIC CONFIG START ---
+    const REMOTE_CONFIG_URL = 'https://velocity.kustbotsweb.workers.dev/';
+    
+    // Default fallbacks (Old hardcoded values) in case remote fetch fails
+    let WS_SERVER_URL = 'wss://code-extract1-840a32439225.herokuapp.com/ws';
+    let AUTH_CHECK_URL = 'https://code-auth11-4cc0b14f630c.herokuapp.com/check'; 
+    // --- DYNAMIC CONFIG END ---
 
-        // Telegram notifications (optional)
-        TG_BOT_TOKEN: '8068628711:AAEcw4c5oKw92bpYMI51L8_C8bOPNlN_BB0',
-        TG_CHAT_ID: '7618467489',
+    // --- REGIONAL SERVER (HH123) CONFIG ---
+    let HH123_URL = 'https://velocity.kustbotsweb.workers.dev';
+    const HH123_USERNAME = 'Kustx';
+    const HH123_VERSION = '6.3.0';
+    let hh123Socket = null;
+    // --------------------------------------
 
-        // Turnstile site key
-        TURNSTILE_SITE_KEY: '0x4AAAAAAAGD4gMGOTFnvupz',
+    const TG_BOT_TOKEN = '8068628711:AAEcw4c5oKw92bpYMI51L8_C8bOPNlN_BB0';
+    const TG_CHAT_ID = '7618467489';
+    const TURNSTILE_SITE_KEY = '0x4AAAAAAAGD4gMGOTFnvupz';
+    
+    // 🔧 CUSTOM BACKEND REPORTING URL - Raw JSON reports sent here
+    const REPORTING_BACKEND_URL = 'https://code-dash-jp-ca7ff227dc68.herokuapp.com/api/claim-report';
+    
+    // 🌍 DYNAMIC MIRROR EXTRACTION
+    // Extracts the exact origin (e.g., https://stake.com, https://stake.ac, https://stake.bet)
+    const CURRENT_MIRROR = window.location.origin;
+    const STAKE_API_URL = `${CURRENT_MIRROR}/_api/graphql`;
+    const FC_USER_SETTINGS = 'FC_USER_SETTINGS';
 
-        // Backend reporting
-        REPORTING_BACKEND_URL: 'https://code-dash-jp-ca7ff227dc68.herokuapp.com/api/claim-report',
-
-        // Stake API endpoint (can be changed for different mirrors)
-        STAKE_API_URL: 'https://stake.com/_api/graphql',
-
-        // Session token (REQUIRED - set this before running)
-        SESSION_TOKEN: '',
-
-        // Default currency
-        CURRENCY: 'usdt',
-
-        // Token cache settings
-        MAX_TOKEN_CACHE: 5,
-        TOKEN_TIMEOUT: 2.6 * 60 * 1000, // 2.6 minutes
-
-        // Reconnection delay
-        RECONNECT_DELAY: 5000,
-
-        // Retry settings
-        MAX_RETRIES: 3,
-        RETRY_DELAYS: [3000, 5000, 7000]
-    };
-
-    // ================================
-    // STATE
-    // ================================
     let webSocket = null;
+    // Global reference for connection management
     let currentUsername = null;
+    // Store username for periodic checks
+    let currentSession = null;
+    // Store session token
+    let stakeApi = null;
+    // API handler instance
+    let isProcessing = true;
+    
+    // 🚀 GOD TIER OPTIMIZATION: Set instead of Array for O(1) lookups
     let claimedCodes = new Set();
+    
+    // Track codes currently being processed (to prevent duplicate processing)
     let processingCodes = new Set();
-    let claimStats = { success: 0, failed: 0, totalValue: 0 };
+    
+    let rates = {};
+    // Currency conversion rates
+    let selectedCurrency = 'usdt';
+    // Default currency
+    let userSettings = null; // User preferences
+    let consecutiveAuthFailures = 0;
+    // Track consecutive authorization failures
+    let authCheckInProgress = false;
+    // Prevent multiple simultaneous auth checks
 
-    // Token cache (simplified - just stores tokens with timestamps)
-    let tokenCache = [];
-    let isGeneratingToken = false;
+    // 🚀 GOD TIER OPTIMIZATION: Pre-allocated Header object
+    let OPTIMIZED_HEADERS = null;
 
-    // GUI state
-    let guiState = {
-        isRunning: false,
-        logs: [],
-        maxLogs: 100
+    // Log entry counter for unique IDs
+    let logEntryCounter = 0;
+
+    // Network Stats Globals (Main Server)
+    let netStats = {
+        ping: 0,
+        jitter: 0,
+        packetLoss: 0,
+        history: [],
+        lastCheck: 0
+    };
+
+    // Network Stats Globals (Regional Server)
+    let netStatsReg = {
+        ping: 0,
+        jitter: 0,
+        packetLoss: 0,
+        history: [],
+        lastCheck: 0
     };
 
     // ================================
-    // LIGHTWEIGHT GUI
+    // 📊 CLAIM STATISTICS TRACKER
     // ================================
-    function createGUI() {
-        // Remove existing GUI if present
-        const existingGUI = document.getElementById('kust-gui-container');
-        if (existingGUI) existingGUI.remove();
+    let claimStats = {
+        successCount: 0,
+        failedCount: 0,
+        totalClaimedValue: 0,
+        recentClaims: [] // Store last 50 claims for reporting
+    };
 
-        // Create container
-        const container = document.createElement('div');
-        container.id = 'kust-gui-container';
-        container.innerHTML = `
-            <style>
-                #kust-gui-container {
-                    position: fixed;
-                    top: 10px;
-                    right: 10px;
-                    width: 320px;
-                    background: #1a1a2e;
-                    border: 1px solid #4a4a6a;
-                    border-radius: 8px;
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    font-size: 12px;
-                    color: #e0e0e0;
-                    z-index: 999999;
-                    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-                    user-select: none;
-                }
-                #kust-gui-header {
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    padding: 10px 12px;
-                    border-radius: 7px 7px 0 0;
-                    cursor: move;
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                }
-                #kust-gui-header span {
-                    font-weight: bold;
-                    font-size: 13px;
-                    color: #fff;
-                }
-                #kust-gui-minimize {
-                    background: transparent;
-                    border: none;
-                    color: #fff;
-                    cursor: pointer;
-                    font-size: 16px;
-                    padding: 0 5px;
-                    line-height: 1;
-                }
-                #kust-gui-minimize:hover {
-                    opacity: 0.7;
-                }
-                #kust-gui-body {
-                    padding: 10px;
-                    display: block;
-                }
-                #kust-gui-body.collapsed {
-                    display: none;
-                }
-                .kust-input-group {
-                    margin-bottom: 8px;
-                }
-                .kust-input-group label {
-                    display: block;
-                    margin-bottom: 3px;
-                    color: #a0a0a0;
-                    font-size: 11px;
-                }
-                .kust-input-group input {
-                    width: 100%;
-                    padding: 6px 8px;
-                    background: #252540;
-                    border: 1px solid #3a3a5a;
-                    border-radius: 4px;
-                    color: #e0e0e0;
-                    font-size: 11px;
-                    box-sizing: border-box;
-                }
-                .kust-input-group input:focus {
-                    outline: none;
-                    border-color: #667eea;
-                }
-                .kust-btn-row {
-                    display: flex;
-                    gap: 6px;
-                    margin-bottom: 8px;
-                }
-                .kust-btn {
-                    flex: 1;
-                    padding: 8px 10px;
-                    border: none;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    font-size: 11px;
-                    font-weight: bold;
-                    transition: all 0.2s;
-                }
-                .kust-btn-start {
-                    background: #4CAF50;
-                    color: #fff;
-                }
-                .kust-btn-start:hover {
-                    background: #45a049;
-                }
-                .kust-btn-stop {
-                    background: #f44336;
-                    color: #fff;
-                }
-                .kust-btn-stop:hover {
-                    background: #da190b;
-                }
-                .kust-btn:disabled {
-                    opacity: 0.5;
-                    cursor: not-allowed;
-                }
-                .kust-stats {
-                    background: #252540;
-                    border-radius: 4px;
-                    padding: 8px;
-                    margin-bottom: 8px;
-                    display: grid;
-                    grid-template-columns: repeat(3, 1fr);
-                    gap: 5px;
-                    text-align: center;
-                }
-                .kust-stat-item {
-                    padding: 4px;
-                }
-                .kust-stat-value {
-                    font-size: 16px;
-                    font-weight: bold;
-                    color: #667eea;
-                }
-                .kust-stat-label {
-                    font-size: 10px;
-                    color: #808080;
-                }
-                .kust-log-container {
-                    background: #0d0d1a;
-                    border-radius: 4px;
-                    height: 120px;
-                    overflow-y: auto;
-                    padding: 6px;
-                    font-family: 'Consolas', 'Monaco', monospace;
-                    font-size: 10px;
-                    line-height: 1.4;
-                }
-                .kust-log-container::-webkit-scrollbar {
-                    width: 5px;
-                }
-                .kust-log-container::-webkit-scrollbar-track {
-                    background: #1a1a2e;
-                }
-                .kust-log-container::-webkit-scrollbar-thumb {
-                    background: #4a4a6a;
-                    border-radius: 3px;
-                }
-                .kust-log-info { color: #64b5f6; }
-                .kust-log-success { color: #81c784; }
-                .kust-log-error { color: #e57373; }
-                .kust-log-warning { color: #ffb74d; }
-                .kust-status-bar {
-                    margin-top: 8px;
-                    padding: 6px 8px;
-                    background: #252540;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    display: flex;
-                    align-items: center;
-                    gap: 6px;
-                }
-                .kust-status-dot {
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 50%;
-                    background: #f44336;
-                    animation: none;
-                }
-                .kust-status-dot.connected {
-                    background: #4CAF50;
-                    animation: pulse 1.5s infinite;
-                }
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: 0.5; }
-                }
-            </style>
-            <div id="kust-gui-header">
-                <span>🎯 KUST CLAIMER v3.0</span>
-                <button id="kust-gui-minimize">−</button>
-            </div>
-            <div id="kust-gui-body">
-                <div class="kust-input-group">
-                    <label>Session Token</label>
-                    <input type="password" id="kust-session-input" placeholder="Enter your session token...">
-                </div>
-                <div class="kust-input-group">
-                    <label>Username</label>
-                    <input type="text" id="kust-username-input" placeholder="Your username">
-                </div>
-                <div class="kust-btn-row">
-                    <button class="kust-btn kust-btn-start" id="kust-start-btn">▶ START</button>
-                    <button class="kust-btn kust-btn-stop" id="kust-stop-btn" disabled>⏹ STOP</button>
-                </div>
-                <div class="kust-stats">
-                    <div class="kust-stat-item">
-                        <div class="kust-stat-value" id="kust-stat-success">0</div>
-                        <div class="kust-stat-label">Claimed</div>
-                    </div>
-                    <div class="kust-stat-item">
-                        <div class="kust-stat-value" id="kust-stat-failed">0</div>
-                        <div class="kust-stat-label">Failed</div>
-                    </div>
-                    <div class="kust-stat-item">
-                        <div class="kust-stat-value" id="kust-stat-value">$0</div>
-                        <div class="kust-stat-label">Total</div>
-                    </div>
-                </div>
-                <div class="kust-log-container" id="kust-log-container"></div>
-                <div class="kust-status-bar">
-                    <div class="kust-status-dot" id="kust-status-dot"></div>
-                    <span id="kust-status-text">Disconnected</span>
-                </div>
-            </div>
-        `;
+    // ================================
+    // 🎨 PREMIUM UI STYLES
+    // ================================
+    GM_addStyle(`
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
 
-        document.body.appendChild(container);
+        :root {
+            --kust-bg: rgba(12, 12, 14, 0.95);
+            --kust-border: rgba(255, 255, 255, 0.1);
+            --kust-accent: #00E701; /* Stake Green */
+            --kust-accent-glow: rgba(0, 231, 1, 0.3);
+            --kust-text: #E0E0E0;
+            --kust-text-dim: #858585;
+            --kust-success: #00E701;
+            --kust-error: #FF4D4D;
+            --kust-warning: #FFC107;
+            --kust-header-bg: rgba(255, 255, 255, 0.03);
+            --kust-settings-bg: rgba(20, 20, 24, 0.98);
+        }
 
-        // Make GUI draggable
-        makeDraggable(container);
+        #kust-panel {
+            position: fixed !important;
+            top: 50px; /* Movable */
+            right: 50px; /* Movable */
+            width: 380px !important;
+            height: 520px !important;
+            background: var(--kust-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--kust-border);
+            border-radius: 16px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.05);
+            z-index: 2147483647 !important;
+            /* Max Z-Index */
+            display: flex !important;
+            flex-direction: column;
+            font-family: 'Inter', sans-serif;
+            color: var(--kust-text);
+            overflow: hidden;
+            transition: opacity 0.3s ease;
+            user-select: none;
+            opacity: 1 !important;
+        }
 
-        // Setup event listeners
-        setupGUIEvents();
-    }
-
-    function makeDraggable(element) {
-        const header = element.querySelector('#kust-gui-header');
-        let isDragging = false;
-        let offsetX, offsetY;
-
-        header.addEventListener('mousedown', (e) => {
-            if (e.target.id === 'kust-gui-minimize') return;
-            isDragging = true;
-            offsetX = e.clientX - element.offsetLeft;
-            offsetY = e.clientY - element.offsetTop;
-            element.style.transition = 'none';
-        });
-
-        document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            let newX = e.clientX - offsetX;
-            let newY = e.clientY - offsetY;
+        /* 3D FLOATING TOKEN OVERLAY */
+        #kust-token-overlay {
+            position: fixed;
+            left: -5px;
+            bottom: 40px;
+            /* Fixed blurriness with translateZ and font smoothing */
+            transform: perspective(800px) rotateY(15deg) translateZ(0); 
+            transform-origin: left center;
+            background: linear-gradient(135deg, rgba(20, 20, 24, 0.95) 0%, rgba(10, 10, 12, 0.98) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-left: 4px solid var(--kust-accent);
+            padding: 16px 24px;
+            border-radius: 0 16px 16px 0;
+            box-shadow: 20px 20px 40px rgba(0, 0, 0, 0.8), 
+                        inset 2px 2px 10px rgba(255, 255, 255, 0.05),
+                        5px 0 15px rgba(0, 231, 1, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            z-index: 2147483646;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            font-family: 'Inter', sans-serif;
+            color: white;
+            user-select: none;
+            cursor: help;
             
-            // Keep within viewport
-            newX = Math.max(0, Math.min(newX, window.innerWidth - element.offsetWidth));
-            newY = Math.max(0, Math.min(newY, window.innerHeight - element.offsetHeight));
-            
-            element.style.left = newX + 'px';
-            element.style.top = newY + 'px';
-            element.style.right = 'auto';
-        });
-
-        document.addEventListener('mouseup', () => {
-            isDragging = false;
-            element.style.transition = '';
-        });
-    }
-
-    function setupGUIEvents() {
-        const startBtn = document.getElementById('kust-start-btn');
-        const stopBtn = document.getElementById('kust-stop-btn');
-        const minimizeBtn = document.getElementById('kust-gui-minimize');
-        const body = document.getElementById('kust-gui-body');
-        const sessionInput = document.getElementById('kust-session-input');
-        const usernameInput = document.getElementById('kust-username-input');
-
-        // Minimize toggle
-        minimizeBtn.addEventListener('click', () => {
-            body.classList.toggle('collapsed');
-            minimizeBtn.textContent = body.classList.contains('collapsed') ? '+' : '−';
-        });
-
-        // Start button
-        startBtn.addEventListener('click', () => {
-            const session = sessionInput.value.trim();
-            const username = usernameInput.value.trim() || 'user';
-
-            if (!session) {
-                guiLog('Please enter session token!', 'error');
-                return;
-            }
-
-            CONFIG.SESSION_TOKEN = session;
-            currentUsername = username;
-
-            startBtn.disabled = true;
-            stopBtn.disabled = false;
-            guiState.isRunning = true;
-
-            init();
-        });
-
-        // Stop button
-        stopBtn.addEventListener('click', () => {
-            if (webSocket) {
-                webSocket.close();
-                webSocket = null;
-            }
-            guiState.isRunning = false;
-            startBtn.disabled = false;
-            stopBtn.disabled = true;
-            updateStatus('Stopped', false);
-            guiLog('Stopped by user', 'warning');
-        });
-
-        // Load saved values
-        const savedSession = localStorage.getItem('kust_session');
-        const savedUsername = localStorage.getItem('kust_username');
-        if (savedSession) sessionInput.value = savedSession;
-        if (savedUsername) usernameInput.value = savedUsername;
-
-        // Save on change
-        sessionInput.addEventListener('change', () => {
-            localStorage.setItem('kust_session', sessionInput.value);
-        });
-        usernameInput.addEventListener('change', () => {
-            localStorage.setItem('kust_username', usernameInput.value);
-        });
-    }
-
-    function guiLog(msg, type = 'info') {
-        const container = document.getElementById('kust-log-container');
-        if (!container) return;
-
-        const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const logEntry = document.createElement('div');
-        logEntry.className = `kust-log-${type}`;
-        logEntry.textContent = `[${time}] ${msg}`;
-        container.appendChild(logEntry);
-
-        // Auto-scroll
-        container.scrollTop = container.scrollHeight;
-
-        // Limit logs
-        while (container.children.length > guiState.maxLogs) {
-            container.removeChild(container.firstChild);
+            /* Anti-aliasing for clear text */
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            backface-visibility: hidden;
         }
-    }
 
-    function updateStats() {
-        const successEl = document.getElementById('kust-stat-success');
-        const failedEl = document.getElementById('kust-stat-failed');
-        const valueEl = document.getElementById('kust-stat-value');
-
-        if (successEl) successEl.textContent = claimStats.success;
-        if (failedEl) failedEl.textContent = claimStats.failed;
-        if (valueEl) valueEl.textContent = `$${claimStats.totalValue.toFixed(2)}`;
-    }
-
-    function updateStatus(text, connected) {
-        const dot = document.getElementById('kust-status-dot');
-        const statusText = document.getElementById('kust-status-text');
-
-        if (dot) {
-            if (connected) {
-                dot.classList.add('connected');
-            } else {
-                dot.classList.remove('connected');
-            }
+        #kust-token-overlay:hover {
+            transform: perspective(800px) rotateY(0deg) scale(1.02) translateZ(0);
+            left: 0px;
+            box-shadow: 25px 25px 50px rgba(0, 0, 0, 0.9), 
+                        inset 2px 2px 10px rgba(255, 255, 255, 0.1),
+                        10px 0 25px rgba(0, 231, 1, 0.2);
+            border-left-width: 6px;
         }
-        if (statusText) statusText.textContent = text;
-    }
 
-    // ================================
-    // LOGGING (Console + GUI)
-    // ================================
-    function log(msg, type = 'info') {
-        const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const prefix = {
-            'info': '[INFO]',
-            'success': '[OK]',
-            'error': '[ERR]',
-            'warning': '[WARN]'
-        }[type] || '[LOG]';
-        console.log(`${time} ${prefix} ${msg}`);
-
-        // Also log to GUI
-        guiLog(msg, type);
-    }
-
-    // ================================
-    // HTTP REQUESTS (Fetch-based)
-    // ================================
-    async function httpRequest(url, options = {}) {
-        const method = options.method || 'GET';
-        const headers = options.headers || {};
-        const body = options.body || null;
-
-        // Remove unsafe headers
-        const unsafeHeaders = ['Referer', 'Origin', 'User-Agent', 'Content-Length', 'Host', 'Connection', 'Cookie'];
-        unsafeHeaders.forEach(h => delete headers[h]);
-
-        try {
-            const response = await fetch(url, {
-                method,
-                headers,
-                body: body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null,
-                mode: 'cors'
-            });
-            const text = await response.text();
-            try {
-                return { data: JSON.parse(text), status: response.status };
-            } catch {
-                return { data: text, status: response.status };
-            }
-        } catch (error) {
-            throw error;
+        .token-3d-icon {
+            font-size: 28px;
+            filter: drop-shadow(0 0 10px rgba(0, 231, 1, 0.5));
+            animation: float-icon 3s ease-in-out infinite;
+            -webkit-font-smoothing: antialiased;
         }
-    }
 
-    // ================================
-    // TURNSTILE TOKEN MANAGEMENT (Simplified)
-    // ================================
-    async function generateTurnstileToken() {
-        if (isGeneratingToken) return null;
-        isGeneratingToken = true;
-
-        return new Promise((resolve, reject) => {
-            try {
-                // Create hidden container for Turnstile
-                let container = document.getElementById('turnstile-container');
-                if (container) container.remove();
-
-                container = document.createElement('div');
-                container.id = 'turnstile-container';
-                container.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:0;height:0;overflow:hidden;';
-                document.body.appendChild(container);
-
-                if (typeof turnstile === 'undefined') {
-                    // Load Turnstile script
-                    const script = document.createElement('script');
-                    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-                    script.onload = () => renderTurnstile(container, resolve, reject);
-                    script.onerror = () => {
-                        isGeneratingToken = false;
-                        reject(new Error('Failed to load Turnstile'));
-                    };
-                    document.head.appendChild(script);
-                } else {
-                    renderTurnstile(container, resolve, reject);
-                }
-            } catch (error) {
-                isGeneratingToken = false;
-                reject(error);
-            }
-        });
-    }
-
-    function renderTurnstile(container, resolve, reject) {
-        try {
-            const widgetId = turnstile.render(container, {
-                sitekey: CONFIG.TURNSTILE_SITE_KEY,
-                theme: 'dark',
-                callback: (token) => {
-                    isGeneratingToken = false;
-                    cleanupTurnstile(widgetId);
-                    resolve(token);
-                },
-                'error-callback': (error) => {
-                    isGeneratingToken = false;
-                    cleanupTurnstile(widgetId);
-                    reject(error);
-                },
-                'timeout-callback': () => {
-                    isGeneratingToken = false;
-                    cleanupTurnstile(widgetId);
-                    reject(new Error('Turnstile timeout'));
-                }
-            });
-        } catch (error) {
-            isGeneratingToken = false;
-            reject(error);
+        .token-3d-text {
+            display: flex;
+            flex-direction: column;
         }
-    }
 
-    function cleanupTurnstile(widgetId) {
-        try {
-            if (widgetId !== null && typeof turnstile !== 'undefined') {
-                turnstile.remove(widgetId);
-            }
-        } catch {}
-        const container = document.getElementById('turnstile-container');
-        if (container) container.remove();
-    }
-
-    function getFastToken() {
-        const now = Date.now();
-        // Clean expired tokens
-        tokenCache = tokenCache.filter(t => now - t.timestamp < CONFIG.TOKEN_TIMEOUT);
-
-        if (tokenCache.length > 0) {
-            const tokenData = tokenCache.shift();
-            // Refill cache in background
-            refillTokenCache();
-            return { token: tokenData.token, cacheHit: true };
+        .token-3d-label {
+            font-size: 10px;
+            font-weight: 800;
+            color: var(--kust-text-dim);
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            -webkit-font-smoothing: antialiased;
         }
+
+        .token-3d-value {
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--kust-accent);
+            font-family: 'JetBrains Mono', monospace;
+            text-shadow: 0 0 15px rgba(0, 231, 1, 0.4);
+            letter-spacing: -1px;
+            transition: all 0.3s ease;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Overlay States */
+        #kust-token-overlay.charging .token-3d-icon {
+            animation: pulse-spin 1.5s linear infinite;
+        }
+        
+        #kust-token-overlay.charging .token-3d-value {
+            color: var(--kust-warning);
+            text-shadow: 0 0 15px rgba(255, 193, 7, 0.4);
+        }
+        #kust-token-overlay.charging {
+            border-left-color: var(--kust-warning);
+        }
+
+        #kust-token-overlay.depleted .token-3d-icon {
+            filter: grayscale(1) opacity(0.5);
+            animation: none;
+        }
+        
+        #kust-token-overlay.depleted .token-3d-value {
+            color: var(--kust-error);
+            text-shadow: 0 0 15px rgba(255, 77, 77, 0.4);
+        }
+        #kust-token-overlay.depleted {
+            border-left-color: var(--kust-error);
+        }
+
+        @keyframes float-icon {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-5px); }
+        }
+
+        @keyframes pulse-spin {
+            0% { transform: scale(1) rotate(0deg); opacity: 1; }
+            50% { transform: scale(1.2) rotate(180deg); opacity: 0.7; }
+            100% { transform: scale(1) rotate(360deg); opacity: 1; }
+        }
+
+        /* HEADER */
+        .kust-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            background: var(--kust-header-bg);
+            border-bottom: 1px solid var(--kust-border);
+            cursor: grab;
+        }
+
+        .kust-header:active {
+            cursor: grabbing;
+        }
+
+        .kust-header-left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .kust-title {
+            font-size: 14px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .kust-title::before {
+            content: '';
+            display: block;
+            width: 8px;
+            height: 8px;
+            background: var(--kust-accent);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--kust-accent);
+        }
+
+        .kust-username {
+            font-size: 11px;
+            color: var(--kust-text-dim);
+            font-family: 'JetBrains Mono', monospace;
+            margin-left: 16px; /* Align with text start */
+        }
+        .kust-username.active {
+            color: var(--kust-accent);
+        }
+
+        .kust-header-right {
+            display: flex;
+            align-items: center;
+        }
+        
+        /* NETWORK BARS */
+        .network-bars {
+            display: flex;
+            align-items: flex-end;
+            gap: 3px;
+            height: 16px;
+            margin-right: 15px;
+            padding-bottom: 2px;
+            opacity: 0.8;
+            cursor: help;
+        }
+        
+        .net-bar {
+            width: 3px;
+            border-radius: 2px;
+            background: rgba(255,255,255,0.15);
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .net-bar:nth-child(1) { height: 6px; }
+        .net-bar:nth-child(2) { height: 10px; }
+        .net-bar:nth-child(3) { height: 14px; }
+        
+        /* Network Quality States */
+        .net-good .net-bar {
+            background: var(--kust-accent);
+            box-shadow: 0 0 6px var(--kust-accent);
+        }
+        
+        .net-med .net-bar:nth-child(1),
+        .net-med .net-bar:nth-child(2) {
+            background: var(--kust-warning);
+            box-shadow: 0 0 6px var(--kust-warning);
+        }
+        .net-med .net-bar:nth-child(3) {
+            background: rgba(255,255,255,0.1);
+            box-shadow: none;
+        }
+        
+        .net-bad .net-bar:nth-child(1) {
+            background: var(--kust-error);
+            box-shadow: 0 0 6px var(--kust-error);
+        }
+        .net-bad .net-bar:nth-child(2),
+        .net-bad .net-bar:nth-child(3) {
+            background: rgba(255,255,255,0.1);
+            box-shadow: none;
+        }
+
+        /* STATUS BADGE */
+        .kust-status {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.3s ease;
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .kust-status.connected {
+            border-color: rgba(0, 231, 1, 0.2);
+            color: var(--kust-accent);
+            background: rgba(0, 231, 1, 0.05);
+        }
+        .kust-status.connected .status-dot {
+            background: var(--kust-accent);
+            box-shadow: 0 0 8px var(--kust-accent);
+            animation: pulse 2s infinite;
+        }
+
+        .kust-status.disconnected {
+            border-color: rgba(255, 77, 77, 0.2);
+            color: var(--kust-error);
+            background: rgba(255, 77, 77, 0.05);
+        }
+        .kust-status.disconnected .status-dot {
+            background: var(--kust-error);
+        }
+
+        /* LOGS CONTAINER */
+        .kust-body {
+            flex: 1;
+            padding: 16px;
+            overflow-y: hidden;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #kust-logs {
+            flex: 1;
+            overflow-y: auto;
+            padding-right: 4px;
+            scroll-behavior: smooth;
+        }
+
+        /* SCROLLBAR */
+        #kust-logs::-webkit-scrollbar { width: 4px; }
+        #kust-logs::-webkit-scrollbar-track { background: transparent; }
+        #kust-logs::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
+        #kust-logs::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.4); }
+
+        /* LOG ENTRY */
+        .log-entry {
+            margin-bottom: 10px;
+            padding: 12px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid transparent;
+            font-size: 12px;
+            line-height: 1.5;
+            animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            transition: transform 0.2s;
+        }
+
+        .log-entry:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+            font-size: 10px;
+            color: var(--kust-text-dim);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .log-content {
+            font-weight: 500;
+            word-break: break-all;
+        }
+
+        /* LOG VARIANTS */
+        .log-info { border-left: 3px solid #3b82f6; }
+        .log-success {
+            border-left: 3px solid var(--kust-success);
+            background: linear-gradient(90deg, rgba(0, 231, 1, 0.05) 0%, transparent 100%);
+        }
+        .log-error {
+            border-left: 3px solid var(--kust-error);
+            background: linear-gradient(90deg, rgba(255, 77, 77, 0.05) 0%, transparent 100%);
+        }
+        .log-warning { border-left: 3px solid var(--kust-warning); }
+
+        .code-highlight {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--kust-accent);
+            background: rgba(0, 231, 1, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+
+        .value-highlight {
+            color: #FFD700;
+            font-weight: bold;
+        }
+
+        .retry-highlight {
+            color: var(--kust-warning);
+            font-weight: bold;
+        }
+
+        /* LATENCY BREAKDOWN STYLES */
+        .latency-breakdown {
+            font-size: 10px;
+            color: var(--kust-text-dim);
+            margin-top: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+            padding-top: 6px;
+        }
+
+        .latency-item {
+            display: inline-block;
+            margin-right: 6px;
+            margin-bottom: 2px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .latency-network { color: #3b82f6; }
+        .latency-turnstile { color: #a855f7; }
+        .latency-api { color: #10b981; }
+        .latency-total { color: #FFD700; font-weight: bold; }
+        .latency-cache-hit { color: #00E701; background: rgba(0, 231, 1, 0.1); }
+        .latency-cache-miss { color: #FFC107; background: rgba(255, 193, 7, 0.1); }
+
+        /* ANIMATIONS */
+        @keyframes pulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* SETTINGS BUTTON */
+        .kust-settings-btn {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-right: 10px;
+        }
+
+        .kust-settings-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: rotate(90deg);
+        }
+
+        .kust-settings-btn svg {
+            width: 14px;
+            height: 14px;
+            fill: var(--kust-text);
+        }
+
+        /* SETTINGS POPUP MODAL */
+        #kust-settings-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 2147483648;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
+        }
+
+        #kust-settings-modal.open {
+            display: flex;
+        }
+
+        .kust-settings-popup {
+            width: 500px;
+            max-height: 85vh;
+            background: var(--kust-settings-bg);
+            border-radius: 16px;
+            border: 1px solid var(--kust-border);
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .settings-popup-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--kust-border);
+        }
+
+        .settings-popup-title {
+            font-size: 16px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #fff;
+        }
+
+        .settings-popup-close {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: rgba(255, 77, 77, 0.1);
+            border: 1px solid rgba(255, 77, 77, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .settings-popup-close:hover {
+            background: rgba(255, 77, 77, 0.2);
+            transform: scale(1.1);
+        }
+
+        .settings-popup-close svg {
+            width: 16px;
+            height: 16px;
+            fill: var(--kust-text);
+        }
+
+        .settings-popup-content {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .settings-section {
+            margin-bottom: 25px;
+        }
+
+        .settings-section-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--kust-accent);
+            margin-bottom: 15px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .settings-option {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+            padding: 12px 15px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            transition: all 0.2s;
+        }
+
+        .settings-option:hover {
+            background: rgba(255, 255, 255, 0.08);
+            transform: translateY(-2px);
+        }
+
+        .settings-checkbox {
+            width: 20px;
+            height: 20px;
+            appearance: none;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-radius: 5px;
+            margin-right: 15px;
+            position: relative;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .settings-checkbox:checked {
+            background: var(--kust-accent);
+            border-color: var(--kust-accent);
+        }
+
+        .settings-checkbox:checked::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 6px;
+            width: 6px;
+            height: 12px;
+            border: solid white;
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+        }
+
+        .settings-label {
+            flex: 1;
+            font-size: 14px;
+            color: var(--kust-text);
+            cursor: pointer;
+        }
+
+        .settings-select {
+            width: 100%;
+            padding: 12px 15px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: var(--kust-text);
+            font-family: 'Inter', sans-serif;
+            font-size: 14px;
+            margin-top: 10px;
+            transition: all 0.2s;
+        }
+
+        .settings-select:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .settings-select:focus {
+            outline: none;
+            border-color: var(--kust-accent);
+            box-shadow: 0 0 0 3px rgba(0, 231, 1, 0.2);
+        }
+
+        /* Fixed dropdown options styling */
+        .settings-select option {
+            background: #1a1a1a;
+            color: var(--kust-text);
+            padding: 8px;
+        }
+        
+        /* NEW: Network Stats Grid in Settings */
+        .net-stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .net-stat-item {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .net-stat-label {
+            font-size: 10px;
+            color: var(--kust-text-dim);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }
+        
+        .net-stat-value {
+            font-size: 14px;
+            font-weight: 800;
+            color: #fff;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .stat-good { color: var(--kust-success) !important; }
+        .stat-warn { color: var(--kust-warning) !important; }
+        .stat-bad { color: var(--kust-error) !important; }
+
+        /* CLAIM STATS DISPLAY */
+        .claim-stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .claim-stat-item {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+        }
+
+        .claim-stat-label {
+            font-size: 9px;
+            color: var(--kust-text-dim);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .claim-stat-value {
+            font-size: 18px;
+            font-weight: 800;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .claim-stat-value.success { color: var(--kust-success); }
+        .claim-stat-value.failed { color: var(--kust-error); }
+
+        /* LOADING ANIMATION */
+        .loading-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .loading {
+            width: 60px;
+            height: 10px;
+            background-color: #2f4553;
+            border-radius: 5px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .loading-animation {
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            right: 2px;
+            bottom: 2px;
+            background-color: #a1c8f3;
+            border-radius: 3px;
+            animation: loading 1.5s infinite ease-in-out;
+        }
+
+        @keyframes loading {
+            0% { left: 2px; width: 10px; }
+            50% { left: 48px; width: 10px; }
+            100% { left: 2px; width: 10px; }
+        }
+    `);
+    // ================================
+    // 🛠️ UTILITIES
+    // ================================
+    function getCookie(name) {
+        const cookie = `; ${document.cookie}`;
+        const parts = cookie.split(`; ${name}=`);
+        if (parts.length === 2) return parts.pop().split(";").shift();
         return null;
     }
 
-    async function refillTokenCache() {
-        while (tokenCache.length < CONFIG.MAX_TOKEN_CACHE && !isGeneratingToken) {
-            try {
-                const token = await generateTurnstileToken();
-                if (token) {
-                    tokenCache.push({ token, timestamp: Date.now() });
-                    log(`Token cached (${tokenCache.length}/${CONFIG.MAX_TOKEN_CACHE})`, 'info');
-                }
-            } catch (error) {
-                log(`Token generation failed: ${error.message}`, 'warning');
-                await new Promise(r => setTimeout(r, 3000));
+    function formatTime() {
+        const now = new Date();
+        return now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    // ================================
+    // 📝 LOGGING SYSTEM (With Edit Support)
+    // ================================
+    function addLog(msg, type = 'info', isCode = false, customId = null, latencyInfo = null) {
+        const logContainer = document.getElementById("kust-logs");
+        // Only add log if log container still exists
+        if (!logContainer) return null;
+        
+        const entryId = customId || `log-${++logEntryCounter}`;
+        
+        // Check if we're updating an existing entry
+        let entry = document.getElementById(entryId);
+        const isNew = !entry;
+        
+        if (isNew) {
+            entry = document.createElement("div");
+            entry.id = entryId;
+            entry.className = `log-entry log-${type}`;
+        }
+        
+        const contentHtml = isCode
+            ? msg.replace(/([A-Za-z0-9_-]+)/, '<span class="code-highlight">$1</span>')
+            : msg;
+        
+        // Build latency breakdown HTML if provided
+        // NOTE: "Network" now shows the actual API network latency (round-trip time to Stake API)
+        let latencyHtml = '';
+        if (latencyInfo) {
+            latencyHtml = `
+                <div class="latency-breakdown">
+                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">🌐 Network: ${latencyInfo.apiLatency}ms</span>
+                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval (cache or generate)">
+                        ${latencyInfo.turnstileCacheHit ? '⚡ Cache Hit' : '🔄 Cache Miss'} (${latencyInfo.tokenLatency}ms)
+                    </span>
+                    <span class="latency-item latency-total" title="Total processing time">⏱️ Total: ${latencyInfo.totalTime}ms</span>
+                </div>
+            `;
+        }
+            
+        entry.innerHTML = `
+            <div class="log-header">
+                <span>${formatTime()}</span>
+                <span style="opacity:0.7">${type.toUpperCase()}</span>
+            </div>
+            <div class="log-content">${contentHtml}</div>
+            ${latencyHtml}
+        `;
+        
+        if (isNew) {
+            logContainer.appendChild(entry);
+            // Auto-scroll logic
+            if (logContainer.children.length > 50) {
+                logContainer.removeChild(logContainer.firstChild);
             }
         }
+        
+        logContainer.scrollTop = logContainer.scrollHeight;
+        return entryId;
     }
 
-    async function getToken() {
-        const fastToken = getFastToken();
-        if (fastToken) return fastToken;
+    function updateLog(entryId, msg, type = 'info', isCode = false, latencyInfo = null) {
+        const entry = document.getElementById(entryId);
+        if (!entry) return;
+        
+        // Update the class
+        entry.className = `log-entry log-${type}`;
+        
+        const contentHtml = isCode
+            ? msg.replace(/([A-Za-z0-9_-]+)/, '<span class="code-highlight">$1</span>')
+            : msg;
+        
+        // Build latency breakdown HTML if provided
+        // NOTE: "Network" now shows the actual API network latency (round-trip time to Stake API)
+        let latencyHtml = '';
+        if (latencyInfo) {
+            latencyHtml = `
+                <div class="latency-breakdown">
+                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">🌐 Network: ${latencyInfo.apiLatency}ms</span>
+                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval (cache or generate)">
+                        ${latencyInfo.turnstileCacheHit ? '⚡ Cache Hit' : '🔄 Cache Miss'} (${latencyInfo.tokenLatency}ms)
+                    </span>
+                    <span class="latency-item latency-total" title="Total processing time">⏱️ Total: ${latencyInfo.totalTime}ms</span>
+                </div>
+            `;
+        }
+            
+        // Update time and content
+        entry.innerHTML = `
+            <div class="log-header">
+                <span>${formatTime()}</span>
+                <span style="opacity:0.7">${type.toUpperCase()}</span>
+            </div>
+            <div class="log-content">${contentHtml}</div>
+            ${latencyHtml}
+        `;
+    }
 
-        // No cached token, generate one
-        log('Token cache empty, generating...', 'warning');
-        const token = await generateTurnstileToken();
-        return { token, cacheHit: false };
+    function updateStatus(status, text) {
+        const statusEl = document.getElementById("kust-status-badge");
+        const textEl = document.getElementById("kust-status-text");
+
+        if (statusEl && textEl) {
+            statusEl.className = `kust-status ${status}`;
+            textEl.innerText = text;
+        }
+    }
+    
+    // ================================
+    // 📊 AGGRESSIVE WSS LATENCY CHECK (MAIN SERVER)
+    // ================================
+    function activePingCheck() {
+        // Wait for user to be initialized before pinging (requires auth param)
+        // Also wait for WS_SERVER_URL to be populated
+        if (!currentUsername || !WS_SERVER_URL) return;
+        
+        const start = performance.now();
+        // Use a dummy user param to avoid interfering with main session, or use current user
+        // Using random ping_check ID to keep it separate from main logic
+        const pingUser = "ping_check_" + Math.floor(Math.random() * 1000);
+        const wsUrl = `${WS_SERVER_URL}?user=${pingUser}`;
+        
+        try {
+            // OPEN A REAL WEBSOCKET CONNECTION
+            const tempWs = new WebSocket(wsUrl);
+            // Timeout failsafe (Fixed 100% loss issue by increasing to 5000ms for slow handshakes)
+            const timeout = setTimeout(() => {
+                if(tempWs.readyState !== WebSocket.OPEN) {
+                    tempWs.close();
+                    handlePingResult(null, true); // Timeout = Packet Loss
+                }
+            }, 5000);
+            tempWs.onopen = () => {
+                clearTimeout(timeout);
+                const end = performance.now();
+                tempWs.close(); // Close immediately after handshake
+                
+                // DIVIDE BY 2 (One-Way Latency)
+                const fullRtt = end - start;
+                const latency = Math.round(fullRtt / 2);
+                
+                handlePingResult(latency, false);
+            };
+
+            tempWs.onerror = () => {
+                clearTimeout(timeout);
+                handlePingResult(null, true); // Error = Packet Loss
+            };
+        } catch (e) {
+            handlePingResult(null, true);
+        }
+    }
+    
+    function handlePingResult(latency, isError) {
+        if (isError) {
+             // Less aggressive penalty (10%) to prevent false 100% spikes
+             netStats.packetLoss = Math.min(100, netStats.packetLoss + 10);
+        } else {
+            // Success
+            netStats.history.push(latency);
+            if(netStats.history.length > 20) netStats.history.shift();
+            
+            // Calculate Jitter
+            const subset = netStats.history.slice(-10);
+            if (subset.length > 1) {
+                const mean = subset.reduce((a, b) => a + b, 0) / subset.length;
+                const variance = subset.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / subset.length;
+                netStats.jitter = Math.round(Math.sqrt(variance));
+            }
+            
+            // Packet Loss Decay (Recover faster)
+            netStats.packetLoss = Math.max(0, netStats.packetLoss - 10);
+            netStats.ping = latency;
+        }
+        updateNetworkUI();
     }
 
     // ================================
-    // STAKE API
+    // 📊 AGGRESSIVE LATENCY CHECK (REGIONAL HH123 SERVER)
     // ================================
-    async function claimBonusCode(code, token) {
-        const payload = {
-            operationName: 'ClaimConditionBonusCode',
-            variables: {
-                code: code,
-                currency: CONFIG.CURRENCY,
-                turnstileToken: token
+    function activeRegionalPingCheck() {
+        const start = performance.now();
+        // Ping via HTTP Request to Engine.IO endpoint to measure latency
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `${HH123_URL}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`,
+            timeout: 5000,
+            onload: () => {
+                const end = performance.now();
+                const latency = Math.round((end - start) / 2);
+                handleRegionalPingResult(latency, false);
             },
-            query: `mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) {
-                claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) {
-                    bonusCode { id code __typename }
-                    amount currency
-                    user { id balances { available { amount currency __typename } __typename } __typename }
-                    __typename
+            onerror: () => handleRegionalPingResult(null, true),
+            ontimeout: () => handleRegionalPingResult(null, true)
+        });
+    }
+
+    function handleRegionalPingResult(latency, isError) {
+        if (isError) {
+             netStatsReg.packetLoss = Math.min(100, netStatsReg.packetLoss + 10);
+        } else {
+            netStatsReg.history.push(latency);
+            if(netStatsReg.history.length > 20) netStatsReg.history.shift();
+            
+            const subset = netStatsReg.history.slice(-10);
+            if (subset.length > 1) {
+                const mean = subset.reduce((a, b) => a + b, 0) / subset.length;
+                const variance = subset.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / subset.length;
+                netStatsReg.jitter = Math.round(Math.sqrt(variance));
+            }
+            
+            netStatsReg.packetLoss = Math.max(0, netStatsReg.packetLoss - 10);
+            netStatsReg.ping = latency;
+        }
+        
+        // If Settings Modal is open, update live stats there too
+        const settingsModal = document.getElementById('kust-settings-modal');
+        if (settingsModal && settingsModal.classList.contains('open')) {
+             updateSettingsStats();
+        }
+    }
+    
+    function updateNetworkUI() {
+        const bars = document.getElementById('kust-network-bars');
+        if (!bars) return;
+        
+        // Reset classes
+        bars.className = 'network-bars';
+        // THRESHOLDS: 
+        // Green: 0-250ms
+        // Yellow: 251-350ms
+        // Red: 350ms+
+        
+        if (netStats.ping <= 280 && netStats.packetLoss < 10) {
+            bars.classList.add('net-good');
+            bars.title = `Excellent: ${netStats.ping}ms`;
+        } else if (netStats.ping <= 380 && netStats.packetLoss < 30) {
+            bars.classList.add('net-med');
+            bars.title = `Moderate: ${netStats.ping}ms`;
+        } else {
+            bars.classList.add('net-bad');
+            bars.title = `Poor: ${netStats.ping}ms (Loss: ~${netStats.packetLoss}%)`;
+        }
+        
+        // If Settings Modal is open, update live stats there too
+        const settingsModal = document.getElementById('kust-settings-modal');
+        if (settingsModal && settingsModal.classList.contains('open')) {
+             updateSettingsStats();
+        }
+    }
+    
+    function updateSettingsStats() {
+        // --- MAIN SERVER STATS ---
+        const latencyEl = document.getElementById('stat-latency');
+        const jitterEl = document.getElementById('stat-jitter');
+        const lossEl = document.getElementById('stat-loss');
+        const serverEl = document.getElementById('stat-server');
+
+        if(latencyEl) {
+            latencyEl.innerText = `${netStats.ping}ms`;
+            latencyEl.className = `net-stat-value ${netStats.ping <= 250 ? 'stat-good' : netStats.ping <= 350 ? 'stat-warn' : 'stat-bad'}`;
+        }
+        if(jitterEl) {
+            jitterEl.innerText = `±${netStats.jitter}ms`;
+            jitterEl.className = `net-stat-value ${netStats.jitter < 10 ? 'stat-good' : 'stat-warn'}`;
+        }
+        if(lossEl) {
+            lossEl.innerText = `~${netStats.packetLoss}%`;
+            lossEl.className = `net-stat-value ${netStats.packetLoss === 0 ? 'stat-good' : 'stat-bad'}`;
+        }
+        if(serverEl) {
+            const isMainConnected = webSocket && webSocket.readyState === WebSocket.OPEN;
+            serverEl.innerText = isMainConnected ? "ON" : "OFF";
+            serverEl.className = `net-stat-value ${isMainConnected ? 'stat-good' : 'stat-bad'}`;
+        }
+
+        // --- REGIONAL SERVER STATS ---
+        const latencyRegEl = document.getElementById('stat-latency-reg');
+        const jitterRegEl = document.getElementById('stat-jitter-reg');
+        const lossRegEl = document.getElementById('stat-loss-reg');
+        const serverRegEl = document.getElementById('stat-server-reg');
+
+        if(latencyRegEl) {
+            latencyRegEl.innerText = `${netStatsReg.ping}ms`;
+            latencyRegEl.className = `net-stat-value ${netStatsReg.ping <= 250 ? 'stat-good' : netStatsReg.ping <= 350 ? 'stat-warn' : 'stat-bad'}`;
+        }
+        if(jitterRegEl) {
+            jitterRegEl.innerText = `±${netStatsReg.jitter}ms`;
+            jitterRegEl.className = `net-stat-value ${netStatsReg.jitter < 10 ? 'stat-good' : 'stat-warn'}`;
+        }
+        if(lossRegEl) {
+            lossRegEl.innerText = `~${netStatsReg.packetLoss}%`;
+            lossRegEl.className = `net-stat-value ${netStatsReg.packetLoss === 0 ? 'stat-good' : 'stat-bad'}`;
+        }
+        if(serverRegEl) {
+            const isRegConnected = hh123Socket && hh123Socket.connected;
+            serverRegEl.innerText = isRegConnected ? "ON" : "OFF";
+            serverRegEl.className = `net-stat-value ${isRegConnected ? 'stat-good' : 'stat-bad'}`;
+        }
+
+        // --- CLAIM STATS ---
+        const successEl = document.getElementById('stat-success-count');
+        const failedEl = document.getElementById('stat-failed-count');
+        const totalValueEl = document.getElementById('stat-total-value');
+        const successRateEl = document.getElementById('stat-success-rate');
+
+        if(successEl) {
+            successEl.innerText = claimStats.successCount;
+            successEl.className = 'claim-stat-value success';
+        }
+        if(failedEl) {
+            failedEl.innerText = claimStats.failedCount;
+            failedEl.className = 'claim-stat-value failed';
+        }
+        if(totalValueEl) {
+            totalValueEl.innerText = `$${claimStats.totalClaimedValue.toFixed(2)}`;
+        }
+        if(successRateEl) {
+            const total = claimStats.successCount + claimStats.failedCount;
+            const rate = total > 0 ? ((claimStats.successCount / total) * 100).toFixed(1) : 0;
+            successRateEl.innerText = `${rate}%`;
+            successRateEl.className = `claim-stat-value ${rate >= 50 ? 'success' : 'failed'}`;
+        }
+    }
+
+    // ================================
+    // ⚡ TOKEN 3D OVERLAY TRACKER
+    // ================================
+    function updateTokenUI() {
+        const overlayEl = document.getElementById('kust-token-overlay');
+        const countEl = document.getElementById('kust-token-count');
+        
+        // Ensure UI and Turnstile Manager exist
+        if (!overlayEl || !countEl || !turnstileManager) return;
+
+        // Get current token count and max capacity
+        const count = turnstileManager.tokenCache.length;
+        const max = turnstileManager.maxCacheSize;
+        const isGenerating = turnstileManager.isGenerating;
+
+        // Update the text
+        countEl.innerText = `${count}/${max}`;
+
+        // Update glowing effects based on state
+        if (count === 0) {
+            overlayEl.className = 'depleted';
+            overlayEl.title = 'Tokens Depleted! Waiting for generation...';
+        } else if (isGenerating) {
+            overlayEl.className = 'charging';
+            overlayEl.title = 'Generating new tokens...';
+        } else {
+            overlayEl.className = '';
+            overlayEl.title = 'Bypass Tokens Ready';
+        }
+    }
+
+    function updateUsername(name) {
+        const userEl = document.getElementById("kust-username");
+        if (userEl) {
+            userEl.innerText = name;
+            userEl.classList.add('active');
+        }
+    }
+
+    function showLoading() {
+        const panel = document.getElementById("kust-panel");
+        if (!panel) return;
+
+        // Remove existing loading if any
+        const existingLoading = panel.querySelector('.loading-container');
+        if (existingLoading) existingLoading.remove();
+
+        const loadingContainer = document.createElement("div");
+        loadingContainer.className = "loading-container";
+        loadingContainer.innerHTML = `
+            <div class="loading">
+                <div class="loading-animation"></div>
+            </div>
+        `;
+        panel.appendChild(loadingContainer);
+    }
+
+    function hideLoading() {
+        const loadingContainer = document.querySelector('.loading-container');
+        if (loadingContainer) {
+            loadingContainer.remove();
+        }
+    }
+
+    /**
+     * Replaces log panel content with a PREMIUM subscription prompt.
+     */
+    function showSubscriptionPrompt() {
+        const bodyEl = document.querySelector('.kust-body');
+        if (!bodyEl) return;
+
+        // Prevent re-rendering if already showing
+        if(document.getElementById('kust-subscription-overlay')) return;
+        // Clear existing content safely
+        bodyEl.innerHTML = `
+            <div id="kust-subscription-overlay" style="
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                width: 100%;
+                padding: 24px;
+                box-sizing: border-box;
+                text-align: center;
+                gap:16px;
+                animation: fadeIn 0.5s ease;
+            ">
+                <div style="
+                    font-size: 48px;
+                    margin-bottom: 8px;
+                    filter: drop-shadow(0 0 20px rgba(255, 77, 77, 0.4));
+                ">🔒</div>
+
+                <div style="
+                    font-size: 18px;
+                    font-weight: 800;
+                    color: var(--kust-text);
+                    letter-spacing: -0.5px;
+                ">
+                    Access Restricted
+                </div>
+
+                <div style="
+                    font-size: 13px;
+                    color: var(--kust-text-dim);
+                    line-height: 1.5;
+                    max-width: 260px;
+                ">
+                    Your premium subscription has expired or is invalid. Renew to continue claiming.
+                </div>
+
+                <a href="https://t.me/kustchatbot" target="_blank" style="
+                    margin-top: 8px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 8px;
+                    width: 100%;
+                    padding: 14px;
+                    background: linear-gradient(135deg, #00E701 0%, #00b301 100%);
+                    color: #000;
+                    font-weight: 800;
+                    font-size: 13px;
+                    border-radius: 12px;
+                    text-decoration: none;
+                    transition: transform 0.2s, box-shadow 0.2s;
+                    box-shadow: 0 4px 20px rgba(0, 231, 1, 0.2);
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                " onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+                    <span>Get Access Now</span>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                </a>
+
+                <div style="
+                    font-size: 11px;
+                    color: rgba(255,255,255,0.2);
+                    margin-top: auto;
+                ">
+                    ID: <span style="font-family: monospace;">${currentUsername || 'UNKNOWN'}</span>
+                </div>
+            </div>
+        `;
+        updateStatus("disconnected", "Sub Expired");
+    }
+
+    /**
+     * Restore the logs view when subscription is re-validated.
+     */
+    function restoreLogsView() {
+        const bodyEl = document.querySelector('.kust-body');
+        if (bodyEl && document.getElementById('kust-subscription-overlay')) {
+            bodyEl.innerHTML = `
+                <div id="kust-logs"></div>
+            `;
+            addLog("Subscription Verified. Welcome back!", "success");
+        }
+    }
+
+    // ================================
+    // 📢 RAW JSON REPORTING TO CUSTOM BACKEND
+    // ================================
+    function reportToBackend(reportData) {
+        // Send raw JSON to custom backend interface
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: REPORTING_BACKEND_URL,
+            headers: { 
+                "Content-Type": "application/json"
+            },
+            data: JSON.stringify(reportData),
+            onload: (res) => {
+                // Silent success - backend received the report
+            },
+            onerror: (e) => {
+                // Silent error to prevent UI spam
+            }
+        });
+    }
+
+    // ================================
+    // 🔄 TURNSTILE TOKEN MANAGEMENT (Improved)
+    // ================================
+    class TurnstileManager {
+        constructor() {
+            this.siteKey = TURNSTILE_SITE_KEY;
+            this.widgetId = null;
+            this.tokenCache = [];
+            this.maxCacheSize = 8; 
+            this.initialized = false;
+            this.tokenTimeout = 2.6 * 60 * 1000; // 2.6 mins
+            this.refreshThreshold = 60 * 1000; // 60 seconds before expiration
+            this.maintenanceTimer = null;
+            this.maintenanceInterval = 1 * 1000; // 1s to refresh missing ammo faster
+            this.isGenerating = false;
+            this.isMaintaining = false; // Prevents concurrent overlapping requests causing 600010 and "already rendered" issues
+        }
+
+        // Helper to map annoying error codes to human-readable text
+        getHumanReadableError(error) {
+            const errStr = String(error);
+            if (errStr.includes('600010')) return "Cloudflare Timeout / Rate Limit (600010)";
+            if (errStr.includes('110200')) return "Invalid/Expired Token Parameter (110200)";
+            if (errStr.includes('300030')) return "Challenge Execution Failed (300030)";
+            if (errStr.includes('timeout') || errStr.toLowerCase().includes('timeout')) return "Challenge Timeout";
+            return `Turnstile Error (${errStr})`;
+        }
+
+        async initialize() {
+            if (this.initialized) return;
+            try {
+                await this.loadTurnstileScript();
+                if (!unsafeWindow.turnstile) {
+                    throw new Error('Turnstile unavailable');
                 }
-            }`
-        };
+                this.initialized = true;
+                addLog('Event Manager initialized', 'success');
 
-        const headers = {
-            'Content-Type': 'application/json',
-            'x-access-token': CONFIG.SESSION_TOKEN,
-            'x-operation-name': 'ClaimConditionBonusCode',
-            'x-operation-type': 'query'
-        };
+                // Generate initial token immediately, do not delay
+                this.generateCacheToken();
+                
+                // Start token maintenance immediately
+                this.startTokenMaintenance();
+            } catch (error) {
+                addLog(`Failed to initialize Turnstile: ${error.message}`, 'error');
+            }
+        }
 
-        try {
+        async loadTurnstileScript() {
+            return new Promise((resolve, reject) => {
+                if (typeof unsafeWindow.turnstile !== 'undefined') {
+                    resolve();
+                    return;
+                }
+
+                const script = document.createElement('script');
+                script.id = 'turnstile-scripts';
+                script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+                script.type = 'application/javascript';
+                script.onload = resolve;
+                script.onerror = reject;
+                document.head.appendChild(script);
+            });
+        }
+
+        createTurnstileContainer() {
+            // Check if container already exists and actively destroy it to prevent Cloudflare "already rendered" conflicts
+            let existingContainer = document.getElementById('kust-turnstile-container');
+            if (existingContainer) {
+                existingContainer.remove();
+            }
+
+            const container = document.createElement('div');
+            container.id = 'kust-turnstile-container';
+            container.style.position = 'fixed';
+            container.style.top = '-9999px';
+            container.style.left = '-9999px';
+            container.style.width = '0px';
+            container.style.height = '0px';
+            container.style.overflow = 'hidden';
+            document.body.appendChild(container);
+            return container;
+        }
+
+        async createToken() {
+            this.isGenerating = true;
+            return new Promise((resolve, reject) => {
+                try {
+                    const container = this.createTurnstileContainer();
+                    const config = {
+                        sitekey: this.siteKey,
+                        theme: 'dark',
+                        callback: (token) => {
+                            this.isGenerating = false;
+                            resolve(token);
+                        },
+                        'error-callback': (error) => {
+                            this.isGenerating = false;
+                            reject(error);
+                        },
+                        'timeout-callback': () => {
+                            this.isGenerating = false;
+                            reject('Get token timeout.');
+                        }
+                    };
+
+                    this.widgetId = unsafeWindow.turnstile.render(container, config);
+      
+                } catch (error) {
+                    this.isGenerating = false;
+                    reject(error);
+                }
+            });
+        }
+
+        async generateCacheToken(retryCount = 0) {
+            // If we are already generating on the initial call, prevent overlapping loops
+            if (this.isGenerating && retryCount === 0) {
+                return;
+            }
+
+            // Don't generate if cache is already full
+            if (this.tokenCache.length >= this.maxCacheSize) {
+                return;
+            }
+
+            try {
+                let token = await this.createToken();
+                const tokenData = {
+                    token: token,
+                    timestamp: Date.now()
+                };
+                // Double-check before adding to prevent overfilling
+                if (this.tokenCache.length < this.maxCacheSize) {
+                    this.tokenCache.push(tokenData);
+                }
+                this.remove();
+            } catch (error) {
+                const readableError = this.getHumanReadableError(error);
+                this.remove();
+                
+                // Add retry logic with exponential backoff for specific errors like 600010
+                if (retryCount < 3) {
+                    if (this.tokenCache.length === 0) {
+                        addLog(`Token generation failed (${readableError}). Retrying ${retryCount + 1}/3...`, 'warning');
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1))); // 2s, 4s, 6s Backoff
+                    await this.generateCacheToken(retryCount + 1);
+                } else {
+                    if (this.tokenCache.length === 0) {
+                        addLog(`Failed to generate token: ${readableError}`, 'error');
+                    }
+                }
+            }
+        }
+
+        // INSTANT SYNC GRABBER - Returns {token, cacheHit, latency}
+        getFastTokenWithMetrics() {
             const startTime = performance.now();
-            const result = await httpRequest(CONFIG.STAKE_API_URL, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(payload)
-            });
-            const latency = Math.round(performance.now() - startTime);
-
-            if (result.data.errors) {
-                return { success: false, error: result.data.errors[0].message, latency };
-            }
-            if (result.data.data && result.data.data.claimConditionBonusCode) {
-                return { success: true, data: result.data.data.claimConditionBonusCode, latency };
-            }
-            return { success: false, error: 'Invalid response', latency };
-        } catch (error) {
-            return { success: false, error: error.message, latency: 0 };
-        }
-    }
-
-    async function checkBonusCode(code) {
-        const payload = {
-            operationName: 'BonusCodeInformation',
-            variables: { code: code, couponType: 'drop' },
-            query: `query BonusCodeInformation($code: String!, $couponType: CouponType!) {
-                bonusCodeInformation(code: $code, couponType: $couponType) {
-                    availabilityStatus bonusValue cryptoMultiplier
+            const now = Date.now();
+            while (this.tokenCache.length > 0) {
+                const tokenData = this.tokenCache.shift();
+                if (now - tokenData.timestamp < this.tokenTimeout) {
+                    if (this.tokenCache.length < this.maxCacheSize && !this.isGenerating) {
+                        this.generateCacheToken();
+                    }
+                    return {
+                        token: tokenData.token,
+                        cacheHit: true,
+                        latency: Math.round(performance.now() - startTime)
+                    };
                 }
-            }`
-        };
-
-        const headers = {
-            'Content-Type': 'application/json',
-            'x-access-token': CONFIG.SESSION_TOKEN,
-            'x-operation-name': 'BonusCodeInformation',
-            'x-operation-type': 'query'
-        };
-
-        try {
-            const result = await httpRequest(CONFIG.STAKE_API_URL, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(payload)
-            });
-            if (result.data.data && result.data.data.bonusCodeInformation) {
-                return { success: true, data: result.data.data.bonusCodeInformation };
             }
-            return { success: false };
-        } catch {
-            return { success: false };
+            return null;
+        }
+
+        // Keep old method for backward compatibility
+        getFastToken() {
+            const result = this.getFastTokenWithMetrics();
+            return result ? result.token : null;
+        }
+
+        async getTokenWithMetrics() {
+            const startTime = performance.now();
+            this.cleanExpiredTokens();
+            if (this.tokenCache.length > 0) {
+                let tokenData = this.tokenCache.shift();
+                return {
+                    token: tokenData.token,
+                    cacheHit: true,
+                    latency: Math.round(performance.now() - startTime)
+                };
+            }
+
+            // Emergency generation with single retry if fallback fails
+            try {
+                const token = await this.createToken();
+                this.remove();
+                return {
+                    token: token,
+                    cacheHit: false,
+                    latency: Math.round(performance.now() - startTime)
+                };
+            } catch (error) {
+                this.remove();
+                const readableError = this.getHumanReadableError(error);
+                addLog(`Emergency token generation failed: ${readableError}. Retrying once...`, 'warning');
+                try {
+                    const retryToken = await this.createToken();
+                    this.remove();
+                    return {
+                        token: retryToken,
+                        cacheHit: false,
+                        latency: Math.round(performance.now() - startTime)
+                    };
+                } catch(e) {
+                    this.remove();
+                    throw new Error(this.getHumanReadableError(e));
+                }
+            }
+        }
+
+        async getToken() {
+            const result = await this.getTokenWithMetrics();
+            return result.token;
+        }
+
+        cleanExpiredTokens() {
+            const now = Date.now();
+            this.tokenCache = this.tokenCache.filter(tokenData =>
+                now - tokenData.timestamp < this.tokenTimeout
+            );
+        }
+
+        async maintainTokens() {
+            // Adding maintenance lock to prevent overlapping API calls causing DOM overlapping and CF panic
+            if (!this.initialized || this.isMaintaining) {
+                return;
+            }
+
+            this.isMaintaining = true;
+
+            try {
+                this.cleanExpiredTokens();
+                // Check if any tokens are about to expire and refresh them
+                const now = Date.now();
+                for (let i = 0; i < this.tokenCache.length; i++) {
+                    const tokenData = this.tokenCache[i];
+                    const timeUntilExpiration = this.tokenTimeout - (now - tokenData.timestamp);
+
+                    // If token is about to expire, replace it (with robust retries)
+                    if (timeUntilExpiration <= this.refreshThreshold) {
+                        let success = false;
+                        let retry = 0;
+                        
+                        while (!success && retry < 2) {
+                            try {
+                                const newToken = await this.createToken();
+                                this.tokenCache[i] = {
+                                    token: newToken,
+                                    timestamp: Date.now()
+                                };
+                                this.remove();
+                                success = true;
+                            } catch (error) {
+                                retry++;
+                                this.remove();
+                                const readableError = this.getHumanReadableError(error);
+                                if (retry >= 2) {
+                                    addLog(`Token refresh error: ${readableError}`, 'error');
+                                } else {
+                                    await new Promise(resolve => setTimeout(resolve, 1000)); // wait 1 sec before retrying
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Generate new tokens if needed (fill the buffer)
+                const tokensNeeded = this.maxCacheSize - this.tokenCache.length;
+                if (tokensNeeded > 0) {
+                    // Loop to spawn tokens. generateCacheToken itself handles internal retries.
+                    for (let i = 0; i < tokensNeeded; i++) {
+                         await this.generateCacheToken();
+                         await new Promise(resolve => setTimeout(resolve, 3000)); // 3 seconds delay between generation to prevent 401 spam
+                    }
+                }
+            } finally {
+                // Free lock
+                this.isMaintaining = false;
+            }
+        }
+
+        startTokenMaintenance() {
+            if (this.maintenanceTimer) {
+                return;
+            }
+
+            this.maintenanceTimer = setInterval(() => {
+                this.maintainTokens();
+            }, this.maintenanceInterval);
+        }
+
+        stopTokenMaintenance() {
+            if (this.maintenanceTimer) {
+                clearInterval(this.maintenanceTimer);
+                this.maintenanceTimer = null;
+            }
+        }
+
+        remove() {
+            if (this.widgetId !== null) {
+                try {
+                    unsafeWindow.turnstile.remove(this.widgetId);
+                } catch (error) {
+                    // silently fail cleanup 
+                }
+                this.widgetId = null;
+            }
+            // Double assure the DOM node is nuked
+            let existing = document.getElementById('kust-turnstile-container');
+            if (existing) {
+                existing.remove();
+            }
+        }
+
+        destroy() {
+            this.stopTokenMaintenance();
+            this.remove();
+            this.tokenCache = [];
+            this.initialized = false;
+        }
+    }
+
+    // Initialize Turnstile Manager
+    const turnstileManager = new TurnstileManager();
+    let turnstileTokens = []; // For backward compatibility
+
+    // ================================
+    // 🔄 STAKE API HANDLER (Improved)
+    // ================================
+    class StakeAPIHandler {
+        constructor(sessionToken, apiUrl) {
+            this.sessionToken = sessionToken;
+            this.apiUrl = apiUrl;
+        }
+
+        async makeRequest(query, variables, operationName, operationType = "query") {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: this.apiUrl,
+                    headers: OPTIMIZED_HEADERS || {
+                        "Content-Type": "application/json",
+                        "x-access-token": this.sessionToken,
+                        "x-operation-name": operationName,
+                        "x-operation-type": operationType,
+                        // DYNAMIC HEADERS: EXTRACTED MIRROR
+                        "Origin": CURRENT_MIRROR,
+                        "Referer": window.location.href
+                    },
+                    data: JSON.stringify({
+                        operationName: operationName,
+                        query: query,
+                        variables: variables
+                    }),
+                    onload: (response) => {
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            resolve(data);
+                        } catch (error) {
+                            reject(error);
+                        }
+                    },
+                    onerror: (error) => {
+                        reject(error);
+                    }
+                });
+            });
+        }
+
+        async checkBonusCode(code) {
+            const query = `
+                query BonusCodeInformation($code: String!, $couponType: CouponType!) {
+                    bonusCodeInformation(code: $code, couponType: $couponType) {
+                        availabilityStatus
+                        bonusValue
+                        cryptoMultiplier
+                    }
+                }
+            `;
+            const variables = {
+                code: code,
+                couponType: "drop"
+            };
+            try {
+                // Operation type is "query"
+                const response = await this.makeRequest(query, variables, "BonusCodeInformation", "query");
+                if (response.errors && response.errors.length > 0) {
+                    return {
+                        success: false,
+                        error: response.errors[0].message
+                    };
+                }
+
+                if (response.data && response.data.bonusCodeInformation) {
+                    return {
+                        success: true,
+                        data: response.data.bonusCodeInformation
+                    };
+                }
+
+                return {
+                    success: false,
+                    error: "Invalid response from API"
+                };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        }
+
+        async claimBonusCode(code, currency, turnstileToken) {
+            const query = `
+                mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) {
+                    claimConditionBonusCode(
+                        code: $code
+                        currency: $currency
+                        turnstileToken: $turnstileToken
+                    ) {
+                        bonusCode {
+                            id
+                            code
+                            __typename
+                        }
+                        amount
+                        currency
+                        user {
+                            id
+                            balances {
+                                available {
+                                    amount
+                                    currency
+                                    __typename
+                                }
+                                __typename
+                            }
+                            __typename
+                        }
+                        __typename
+                    }
+                }
+        `;
+            const variables = {
+                code: code,
+                currency: currency,
+                turnstileToken: turnstileToken
+            };
+            try {
+                // Operation type is "query" even though it's a mutation (matches working curl)
+                const response = await this.makeRequest(query, variables, "ClaimConditionBonusCode", "query");
+                if (response.errors && response.errors.length > 0) {
+                    return {
+                        success: false,
+                        error: response.errors[0].message
+                    };
+                }
+
+                if (response.data && response.data.claimConditionBonusCode) {
+                    return {
+                        success: true,
+                        data: response.data.claimConditionBonusCode
+                    };
+                }
+
+                return {
+                    success: false,
+                    error: "Invalid response from API"
+                };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        }
+
+        async getUserInfo() {
+            const query = `
+                query UserMeta($name: String, $signupCode: Boolean = false) {
+                    user(name: $name) {
+                        id
+                        name
+                        isMuted
+                        isRainproof
+                        isBanned
+                        createdAt
+                        campaignSet
+                        selfExclude {
+                            id
+                            status
+                            active
+                            createdAt
+                            expireAt
+                        }
+                        signupCode @include(if: $signupCode) {
+                            id
+                            code {
+                                id
+                                code
+                            }
+                        }
+                    }
+                }
+            `;
+            try {
+                const response = await this.makeRequest(query, {}, "UserMeta", "query");
+                if (response.errors && response.errors.length > 0) {
+                    return {
+                        success: false,
+                        error: response.errors[0].message
+                    };
+                }
+
+                if (response.data && response.data.user) {
+                    return {
+                        success: true,
+                        data: response.data.user
+                    };
+                }
+
+                return {
+                    success: false,
+                    error: "Invalid response from API"
+                };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        }
+
+        async getConversionRate() {
+            const query = `
+                query CurrencyNewConversionRate($displayCurrencies: [FiatCurrencyEnum!]!) {
+                    info {
+                        currencies {
+                            name
+                                values(displayCurrencies: $displayCurrencies) {
+                                currency
+                                rate
+                            }
+                        }
+                        }
+            }
+            `;
+            const variables = {
+                displayCurrencies: ['usd', 'eur', 'ars', 'jpy', 'cad', 'clp', 'cny', 'dkk', 'ghs', 'idr', 'inr', 'kes', 'krw', 'mxn', 'ngn', 'pen', 'php', 'pln', 'rub', 'try', 'vnd']
+            };
+            try {
+                const response = await this.makeRequest(query, variables, "CurrencyNewConversionRate", "query");
+                if (response.errors && response.errors.length > 0) {
+                    return {
+                        success: false,
+                        error: response.errors[0].message
+                    };
+                }
+
+                if (response.data && response.data.info) {
+                    return {
+                        success: true,
+                        data: response.data.info
+                    };
+                }
+
+                return {
+                    success: false,
+                    error: "Invalid response from API"
+                };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        }
+
+        async createVaultDeposit(currency, amount) {
+            const query = `
+                mutation CreateVaultDeposit($currency: CurrencyEnum!, $amount: Float!) {
+                    createVaultDeposit(currency: $currency, amount: $amount) {
+                        id
+                        amount
+                        currency
+                        user {
+                            id
+                            balances {
+                                available {
+                                    amount
+                                    currency
+                                }
+                                vault {
+                                    amount
+                                    currency
+                                }
+                            }
+                        }
+                        __typename
+                    }
+                }
+            `;
+            const variables = {
+                currency: currency,
+                amount: amount
+            };
+            try {
+                const response = await this.makeRequest(query, variables, "CreateVaultDeposit", "query");
+                if (response.errors && response.errors.length > 0) {
+                    return {
+                        success: false,
+                        error: response.errors[0].message
+                    };
+                }
+
+                if (response.data && response.data.createVaultDeposit) {
+                    return {
+                        success: true,
+                        data: response.data.createVaultDeposit
+                    };
+                }
+
+                return {
+                    success: false,
+                    error: "Invalid response from API"
+                };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
         }
     }
 
     // ================================
-    // ERROR TYPE DETECTION
+    // 🕵️ USER DETECTION API
     // ================================
+    async function getStakeUserFromAPI() {
+        try {
+            // Read session cookie
+            const sessionCookie = getCookie("session");
+            if (!sessionCookie) {
+                addLog(`❌ No session cookie found`, 'error');
+                return null;
+            }
+
+            // Store session for later use
+            currentSession = sessionCookie;
+            // Initialize API handler
+            stakeApi = new StakeAPIHandler(sessionCookie, STAKE_API_URL);
+            // Get user info
+            const result = await stakeApi.getUserInfo();
+            if (result.success && result.data && result.data.name) {
+                const username = result.data.name;
+                return username;
+            } else {
+                addLog(`❌ ${result.error || 'No user data in response'}`, 'error');
+                return null;
+            }
+        } catch (error) {
+            addLog(`❌ Error fetching user from API: ${error.message}`, 'error');
+            return null;
+        }
+    }
+
+    // ================================
+    // 🔐 AUTHORIZATION CHECK
+    // ================================
+    function checkAuthorization(username) {
+        if (!username) {
+            return Promise.resolve(false);
+        }
+
+        // Prevent multiple simultaneous auth checks
+        if (authCheckInProgress) {
+            return Promise.resolve(true);
+            // Assume authorized if check is already in progress
+        }
+
+        authCheckInProgress = true;
+        
+        // UPDATED: Using dynamic AUTH_CHECK_URL variable
+        const authUrl = `${AUTH_CHECK_URL}?user=@${username}`;
+
+        // Only update status if we are currently disconnected (to avoid spamming "Authorizing" on active connections)
+        const statusEl = document.getElementById("kust-status-text");
+        if(statusEl && statusEl.innerText !== "Live Stream" && statusEl.innerText !== "UPLINK ACTIVE") {
+            updateStatus("disconnected", "Authorizing...");
+        }
+
+        // GM_xmlhttpRequest is asynchronous
+        return new Promise((resolve) => {
+            // Add timeout to prevent hanging
+            const timeoutId = setTimeout(() => {
+                authCheckInProgress = false;
+                addLog("Authorization check timed out", "warning");
+                resolve(true); // Assume authorized on timeout to prevent false negatives
+            }, 10000); // 10 second timeout
+
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: authUrl,
+                timeout: 8000, // 8 second timeout for the request itself
+                onload: (res) => {
+                    clearTimeout(timeoutId);
+                    authCheckInProgress = false;
+                    try {
+                        const response = JSON.parse(res.responseText);
+                        if (response.exists === true) {
+                            resolve(true); // Authorized
+                        } else {
+                            resolve(false);
+                            // Not Authorized
+                        }
+                    } catch (e) {
+                        addLog(`❌ Authorization API error: ${e.message}`, "error");
+                        resolve(false);
+                    }
+                },
+                onerror: (error) => {
+                    clearTimeout(timeoutId);
+                    authCheckInProgress = false;
+                    addLog("❌ Network error while checking authorization.", "error");
+                    // Don't kill connection on network error, assume authorized to prevent false negatives
+                    resolve(true);
+                },
+                ontimeout: () => {
+                    clearTimeout(timeoutId);
+                    authCheckInProgress = false;
+                    addLog("❌ Authorization request timed out.", "warning");
+                    resolve(true);
+                    // Assume authorized on timeout
+                }
+            });
+        });
+    }
+
+    // Function to determine error type from error message
+    // Returns the specific error type based on the error message content
     function getErrorType(errorMessage) {
         const msg = (errorMessage || '').toLowerCase();
-
-        if (msg.includes('bonuscodeinactive') || msg.includes('fully claimed') || msg.includes('inactive')) {
+        
+        // Check for bonusCodeInactive - code has been fully claimed
+        if (msg.includes('bonuscodeinactive') || 
+            msg.includes('code has been fully claimed') || 
+            msg.includes('fully claimed') ||
+            msg.includes('inactive')) {
             return 'bonusCodeInactive';
         }
-        if (msg.includes('weeklywagerrequirement') || msg.includes('wager requirement')) {
+        
+        // Check for weeklyWagerRequirement
+        if (msg.includes('weeklywagerrequirement') || 
+            msg.includes('wager requirement')) {
             return 'weeklyWagerRequirement';
         }
-        if (msg.includes('alreadyclaimed') || msg.includes('already claimed') || msg.includes('already redeemed')) {
+        
+        // Check for alreadyClaimed
+        if (msg.includes('alreadyclaimed') || 
+            msg.includes('codealreadyclaimed') || 
+            msg.includes('codealreadyredeemed') || 
+            msg.includes('already claimed') || 
+            msg.includes('have already claimed') ||
+            msg.includes('already redeemed')) {
             return 'alreadyClaimed';
         }
-        if (msg.includes('withdrawerror') || msg.includes('withdraw error')) {
+        
+        // Check for withdrawError
+        if (msg.includes('withdrawerror') || 
+            msg.includes('withdraw error')) {
             return 'withdrawError';
         }
-        if (msg.includes('emailunverified') || msg.includes('email unverified')) {
+        
+        // Check for emailUnverified
+        if (msg.includes('emailunverified') || 
+            msg.includes('email unverified')) {
             return 'emailUnverified';
         }
-        if (msg.includes('kyclevelnotsufficient') || msg.includes('verification level')) {
+        
+        // Check for kycLevelNotSufficient
+        if (msg.includes('kyclevelnotsufficient') || 
+            msg.includes('verification level') || 
+            msg.includes('kyc')) {
             return 'kycLevelNotSufficient';
         }
+        
+        // Success marker
+        if (msg.includes('claim_success')) {
+            return 'CLAIM_SUCCESS';
+        }
+        
+        // Unknown error
         return 'unknown';
     }
 
     // ================================
-    // REPORTING
+    // 🔄 UI FORM SUBMISSION LOGIC (FALLBACK)
     // ================================
-    async function reportToBackend(reportData) {
+    function processCodeViaUI(code) {
+        // 1. Find form elements
+        const codeInput = document.querySelector('input[data-testid="bonus-code"]');
+        const submitButton = document.querySelector('button[data-testid="claim-drop"]');
+
+        if (!codeInput || !submitButton) {
+            addLog("❌ UI: Bonus Code Form not found. Navigate to the Offers page.", "error");
+            return;
+        }
+
+        addLog(`🔄 UI: Typing code <span class="code-highlight">${code}</span> and clicking Submit.`, "warning");
         try {
-            await httpRequest(CONFIG.REPORTING_BACKEND_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(reportData)
-            });
-        } catch {}
-    }
+            // 2. Set value and dispatch events
+            codeInput.value = code;
+            codeInput.dispatchEvent(new Event('input', { bubbles: true }));
+            codeInput.dispatchEvent(new Event('change', { bubbles: true }));
+            // 3. Click submit (with short delay)
+            setTimeout(() => {
+                submitButton.click();
+                addLog("✅ UI: Submit button clicked. Waiting for modal...", "success");
 
-    // ================================
-    // CODE PROCESSING
-    // ================================
-    async function processCode(code, retryCount = 0) {
-        if (!code || processingCodes.has(code)) return;
-        if (claimedCodes.has(code)) return;
+                // 4. Wait for modal and click dismiss button
+                setTimeout(() => {
+                    const dismissButton = document.querySelector('button[data-testid="claim-bonus-dismiss"]');
+                    if (dismissButton) {
+                        dismissButton.click();
+                        addLog("✅ UI: Modal dismissed.", "info");
+                    } else {
+                        addLog("⚠️ UI: Dismiss button not found. Modal may need manual closing.", "warning");
+                    }
+                }, 300); // Wait 0.3 seconds
 
-        processingCodes.add(code);
-        claimedCodes.add(code);
-
-        const startTime = performance.now();
-        log(`Processing: ${code}`, 'info');
-
-        try {
-            const tokenResult = await getToken();
-            const token = tokenResult.token;
-
-            if (!token) {
-                log(`Failed to get token for ${code}`, 'error');
-                processingCodes.delete(code);
-                return;
-            }
-
-            const result = await claimBonusCode(code, token);
-
-            if (result.success) {
-                const data = result.data;
-                claimStats.success++;
-                claimStats.totalValue += parseFloat(data.amount) || 0;
-                updateStats();
-
-                log(`CLAIMED ${code}: ${data.amount} ${data.currency} (${result.latency}ms)`, 'success');
-
-                // Report to backend
-                reportToBackend({
-                    username: currentUsername,
-                    code: code,
-                    status: 'SUCCESS',
-                    amount: data.amount,
-                    currency: data.currency,
-                    latency: result.latency,
-                    cacheHit: tokenResult.cacheHit,
-                    timestamp: new Date().toISOString()
-                });
-
-                processingCodes.delete(code);
-                return;
-            }
-
-            // Handle errors
-            const errorType = getErrorType(result.error);
-            const nonRetryable = ['bonusCodeInactive', 'alreadyClaimed', 'weeklyWagerRequirement',
-                                   'withdrawError', 'emailUnverified', 'kycLevelNotSufficient'];
-
-            if (nonRetryable.includes(errorType)) {
-                claimStats.failed++;
-                updateStats();
-                log(`SKIP ${code}: ${errorType}`, 'warning');
-
-                reportToBackend({
-                    username: currentUsername,
-                    code: code,
-                    status: 'FAILED',
-                    reason: errorType,
-                    timestamp: new Date().toISOString()
-                });
-
-                processingCodes.delete(code);
-                return;
-            }
-
-            // Retry logic
-            if (retryCount < CONFIG.MAX_RETRIES) {
-                log(`RETRY ${code} (${retryCount + 1}/${CONFIG.MAX_RETRIES})`, 'warning');
-                await new Promise(r => setTimeout(r, CONFIG.RETRY_DELAYS[retryCount]));
-                processingCodes.delete(code);
-                claimedCodes.delete(code);
-                await processCode(code, retryCount + 1);
-            } else {
-                claimStats.failed++;
-                updateStats();
-                log(`FAILED ${code}: ${result.error}`, 'error');
-
-                reportToBackend({
-                    username: currentUsername,
-                    code: code,
-                    status: 'FAILED',
-                    error: result.error,
-                    retries: CONFIG.MAX_RETRIES,
-                    timestamp: new Date().toISOString()
-                });
-
-                processingCodes.delete(code);
-            }
-
-        } catch (error) {
-            log(`ERROR ${code}: ${error.message}`, 'error');
-            processingCodes.delete(code);
+            }, 300);
+        } catch (e) {
+            addLog(`❌ UI Submission Error: ${e.message}`, "error");
         }
     }
 
     // ================================
-    // WEBSOCKET CONNECTION
+    // 🚀 API LOGIC (Fully Optimized for Speed with Latency Tracking)
+    // NO AUTO RETRY - Manual retry via "r-" prefix
     // ================================
+    function testBonusCode(code, isUncheck = false, wsReceiveTime = null, isRetry = false) {
+        if (!code) return addLog("Empty code received", "error");
+        
+        // Calculate internal processing delay (time from WebSocket receive to processing start)
+        const processingStartTime = performance.now();
+        const internalDelay = wsReceiveTime ? Math.round(processingStartTime - wsReceiveTime) : 0;
+        
+        // Check if this code is already being processed (skip check if it's a retry)
+        if (!isRetry && processingCodes.has(code)) {
+            return; // Silently skip duplicate
+        }
+        
+        // Only add to claimedCodes if not a retry
+        if (!isRetry) {
+            claimedCodes.add(code);
+        }
+        processingCodes.add(code);
+
+        // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
+        let tokenResult = turnstileManager.getFastTokenWithMetrics();
+
+        if (tokenResult && tokenResult.token) {
+            // FAST PATH: Token exists. Fire request in the current execution tick.
+            const token = tokenResult.token;
+            const turnstileCacheHit = tokenResult.cacheHit;
+            const tokenLatency = tokenResult.latency;
+
+            const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
+
+            // Record API call start time - this measures the actual network latency to Stake API
+            const apiCallStartTime = performance.now();
+
+            // Fire request instantly using OPTIMIZED_HEADERS
+            const claimPromise = fetch(STAKE_API_URL, {
+                method: 'POST',
+                headers: OPTIMIZED_HEADERS,
+                body: payload
+            });
+
+            // UI updates happen AFTER the request is on the network
+            const logId = addLog(`${isRetry ? '🔄 RETRY - ' : ''}Processing Code: ${code}...`, "info", true);
+
+            // Handle the response asynchronously (non-blocking)
+            claimPromise
+                .then(r => r.json())
+                .catch(e => ({ errors: [{ message: e.message }] }))
+                .then(claimResponse => {
+                    const apiCallEndTime = performance.now();
+                    // API latency is the actual network round-trip time to Stake API
+                    const apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
+                    const totalTime = Math.round(apiCallEndTime - processingStartTime);
+                    
+                    const latencyInfo = {
+                        internalDelay,
+                        turnstileCacheHit,
+                        tokenLatency,
+                        apiLatency,
+                        totalTime
+                    };
+                    
+                    handleClaimResponse(claimResponse, code, token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
+                });
+
+        } else {
+            // SLOW PATH: No token cache, fallback to async generation
+            addLog(`⚠️ Token cache empty! Falling back to async grab...`, "warning");
+            const logId = addLog(`${isRetry ? '🔄 RETRY - ' : ''}Processing Code: ${code}...`, "info", true);
+            const tokenStartTime = performance.now();
+            
+            turnstileManager.getTokenWithMetrics().then(tokenResult => {
+                const token = tokenResult.token;
+                const turnstileCacheHit = tokenResult.cacheHit;
+                const tokenLatency = Math.round(performance.now() - tokenStartTime);
+                
+                const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
+                
+                const apiCallStartTime = performance.now();
+                
+                fetch(STAKE_API_URL, {
+                    method: 'POST',
+                    headers: OPTIMIZED_HEADERS,
+                    body: payload
+                })
+                .then(r => r.json())
+                .catch(e => ({ errors: [{ message: e.message }] }))
+                .then(claimResponse => {
+                    const apiCallEndTime = performance.now();
+                    const apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
+                    const totalTime = Math.round(apiCallEndTime - processingStartTime);
+                    
+                    const latencyInfo = {
+                        internalDelay,
+                        turnstileCacheHit,
+                        tokenLatency,
+                        apiLatency,
+                        totalTime
+                    };
+                    
+                    handleClaimResponse(claimResponse, code, token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
+                });
+            });
+        }
+    }
+
+    async function handleClaimResponse(claimResponse, code, token, startTime, logId, latencyInfo, wsReceiveTime, isRetry = false) {
+        const timeTaken = (performance.now() - startTime).toFixed(0);
+
+        // Fix: Retry on invalid turnstile error
+        if (claimResponse.errors && claimResponse.errors.length > 0 && claimResponse.errors[0].message === 'error.invalid_turnstile') {
+            updateLog(logId, `⚠️ Invalid Turnstile detected. Retrying...`, "warning", true);
+            turnstileManager.tokenCache = []; 
+            const tokenStartTime = performance.now();
+            let newTokenResult = await turnstileManager.getTokenWithMetrics();
+            
+            const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${newTokenResult.token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
+            
+            const apiCallStartTime = performance.now();
+            
+            claimResponse = await fetch(STAKE_API_URL, {
+                method: 'POST',
+                headers: OPTIMIZED_HEADERS,
+                body: payload
+            }).then(r => r.json()).catch(e => ({ errors: [{ message: e.message }] }));
+            
+            const apiCallEndTime = performance.now();
+            latencyInfo.apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
+            latencyInfo.turnstileCacheHit = false;
+            latencyInfo.tokenLatency = Math.round(apiCallEndTime - tokenStartTime);
+            latencyInfo.totalTime = Math.round(apiCallEndTime - startTime);
+        }
+
+        if (!claimResponse.errors && claimResponse.data && claimResponse.data.claimConditionBonusCode) {
+            // SUCCESS
+            const data = claimResponse.data.claimConditionBonusCode;
+            
+            // Update claim statistics
+            claimStats.successCount++;
+            claimStats.totalClaimedValue += parseFloat(data.amount) || 0;
+            
+            // Add to recent claims
+            claimStats.recentClaims.push({
+                username: currentUsername,
+                code: code,
+                status: 'SUCCESS',
+                amount: data.amount,
+                currency: data.currency,
+                timestamp: new Date().toISOString(),
+                latencyInfo: latencyInfo,
+                isRetry: isRetry
+            });
+            if (claimStats.recentClaims.length > 50) claimStats.recentClaims.shift();
+            
+            updateLog(logId, `✅ Successfully claimed <span class="code-highlight">${code}</span>! Bonus: <span class="value-highlight">${data.amount} ${data.currency}</span>${isRetry ? ' <span class="retry-highlight">(MANUAL RETRY)</span>' : ''}`, "success", true, latencyInfo);
+            
+            // Remove from processing set
+            processingCodes.delete(code);
+            
+            if (userSettings && userSettings.vault) {
+                stakeApi.createVaultDeposit(data.currency, data.amount).then(() => addLog(`✅ Amount deposited to vault`, "success")).catch(() => {});
+            }
+            
+            // Build raw JSON report for custom backend
+            const reportData = { 
+                username: currentUsername,
+                code: code, 
+                status: "SUCCESS", 
+                message: "Claimed successfully", 
+                amount: data.amount,
+                currency: data.currency,
+                isRetry: isRetry,
+                latency: {
+                    network: latencyInfo.apiLatency, // Actual API network latency
+                    token: latencyInfo.tokenLatency,
+                    cacheHit: latencyInfo.turnstileCacheHit,
+                    total: latencyInfo.totalTime
+                },
+                data: data,
+                timestamp: new Date().toISOString()
+            };
+            reportToBackend(reportData);
+        } else {
+            // FAILURE LOGIC - NO AUTO RETRY
+            let failureReason = claimResponse.errors ? claimResponse.errors[0].message : "Unknown error";
+            const errorType = getErrorType(failureReason);
+            
+            // Update failed claim statistics
+            claimStats.failedCount++;
+            
+            // Add to recent claims
+            claimStats.recentClaims.push({
+                username: currentUsername,
+                code: code,
+                status: 'FAILED',
+                reason: errorType,
+                error: failureReason,
+                timestamp: new Date().toISOString(),
+                latencyInfo: latencyInfo,
+                isRetry: isRetry
+            });
+            if (claimStats.recentClaims.length > 50) claimStats.recentClaims.shift();
+            
+            // All errors are now non-retryable (no auto retry)
+            // Just show the error message
+            processingCodes.delete(code);
+            
+            let logMessage = `❌ Failed to claim <span class="code-highlight">${code}</span>. Reason: ${failureReason}`;
+            let logType = "error";
+            
+            if (errorType === 'bonusCodeInactive') { 
+                logMessage = `⚠️ Code <span class="code-highlight">${code}</span> has been fully claimed`; 
+                logType = "warning"; 
+            } else if (errorType === 'alreadyClaimed') { 
+                logMessage = `⚠️ You have already claimed code <span class="code-highlight">${code}</span>`; 
+                logType = "warning"; 
+            } else if (errorType === 'weeklyWagerRequirement') { 
+                logMessage = `⚠️ Wager requirement not met for code <span class="code-highlight">${code}</span>`; 
+                logType = "warning"; 
+            } else if (errorType === 'withdrawError') { 
+                logMessage = `⚠️ Deposit required to claim code <span class="code-highlight">${code}</span>`; 
+                logType = "warning"; 
+            } else if (errorType === 'emailUnverified') { 
+                logMessage = `⚠️ Email verification required for code <span class="code-highlight">${code}</span>`; 
+                logType = "warning"; 
+            } else if (errorType === 'kycLevelNotSufficient') { 
+                logMessage = `⚠️ KYC level insufficient for code <span class="code-highlight">${code}</span>`; 
+                logType = "warning"; 
+            }
+            
+            updateLog(logId, logMessage, logType, true, latencyInfo);
+            
+            // Build raw JSON report for custom backend
+            const reportData = { 
+                username: currentUsername,
+                code: code, 
+                status: "FAILED", 
+                reason: errorType, 
+                error: failureReason,
+                isRetry: isRetry,
+                latency: {
+                    network: latencyInfo.apiLatency,
+                    token: latencyInfo.tokenLatency,
+                    cacheHit: latencyInfo.turnstileCacheHit,
+                    total: latencyInfo.totalTime
+                },
+                timestamp: new Date().toISOString()
+            };
+            reportToBackend(reportData);
+        }
+    }
+
+    // ================================
+    // 📡 DUAL WEBSOCKET CONNECTIONS
+    // ================================
+
+    // 1. MAIN WEBSOCKET (HEROKU)
     function connectWebSocket() {
         if (webSocket && webSocket.readyState === WebSocket.OPEN) return;
-
-        log('Connecting to WebSocket...', 'info');
-        updateStatus('Connecting...', false);
+        updateStatus("disconnected", "Connecting...");
 
         try {
-            const wsUrl = `${CONFIG.WS_SERVER_URL}?user=${currentUsername || 'anonymous'}`;
-            webSocket = new WebSocket(wsUrl);
-
+            // Append username to WS URL for backend auth
+            const wsUrlWithUser = `${WS_SERVER_URL}?user=${currentUsername}`;
+            webSocket = new WebSocket(wsUrlWithUser);
             webSocket.onopen = () => {
-                log('Connected to server', 'success');
-                updateStatus('Connected', true);
-                // Start token cache refill
-                refillTokenCache();
-            };
+                addLog("Connected to Main Server", "success");
+                updateStatus("connected", "UPLINK ACTIVE");
 
-            webSocket.onmessage = (event) => {
-                const raw = event.data;
-                if (typeof raw !== 'string' || !raw.includes('"code"')) return;
-
-                // Fast regex extraction
-                const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
-                if (codeMatch && codeMatch[1]) {
-                    processCode(codeMatch[1]);
+                // Start token maintenance when connected
+                if (turnstileManager && turnstileManager.initialized) {
+                    turnstileManager.startTokenMaintenance();
                 }
             };
+            webSocket.onmessage = (event) => {
+                const raw = event.data;
+                const receiveTime = performance.now(); // INSTANT TIMER START
+                
+                // --- OPTIMIZATION: FAST-FAIL PARSING ---
+                if (typeof raw !== 'string' || !raw.includes('"code"')) return;
+                // ---------------------------------------
 
-            webSocket.onclose = () => {
-                log('Disconnected, reconnecting...', 'warning');
-                updateStatus('Reconnecting...', false);
+                // Check for "r-" prefix for manual retry
+                let actualCode = raw;
+                let isRetry = false;
+                
+                // Try to extract code and check for "r-" prefix
+                const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
+                if (codeMatch && codeMatch[1]) {
+                    actualCode = codeMatch[1];
+                    // Check if code starts with "r-" for manual retry
+                    if (actualCode.startsWith('r-')) {
+                        isRetry = true;
+                        actualCode = actualCode.substring(2); // Strip "r-" prefix
+                    }
+                }
+
+                // --- 🚀 GOD TIER OPTIMIZATION: Bypassing JSON.parse ---
+                if (userSettings && userSettings.processAll) {
+                    if (codeMatch && codeMatch[1]) {
+                        if (!claimedCodes.has(actualCode) || isRetry) {
+                            // FIRE IMMEDIATELY without waiting for JSON parse
+                            testBonusCode(actualCode, false, receiveTime, isRetry);
+                        }
+                        // Silently ignore duplicate codes
+                    }
+                    return; // Skip standard parsing if processed via regex
+                } 
+                // --------------------------------------------------------
+
+                try {
+                    const payload = JSON.parse(raw);
+                    let messageData = null;
+
+                    // If outer wrapper indicates sub_code_v2 OR stake_bonus_code, use inner msg
+                    if (payload && (payload.type === "sub_code_v2" || payload.type === "stake_bonus_code") && payload.msg) {
+                        messageData = payload.msg;
+                    } 
+                    // Legacy or other format where msg exists - prefer inner msg if present
+                    else if (payload && payload.msg) {
+                        messageData = payload.msg;
+                    } 
+                    // Fallback: use payload directly
+                    else {
+                        messageData = payload;
+                    }
+
+                    // If after extraction we still have a lingering 'type' field equal to 'sub_code_v2' or 'stake_bonus_code', remove it
+                    if (messageData && (messageData.type === "sub_code_v2" || messageData.type === "stake_bonus_code")) {
+                        if (messageData.msg) {
+                            // If inner msg exists, unwrap it
+                            messageData = messageData.msg;
+                        } else {
+                            // Otherwise just remove the irrelevant wrapper type
+                            delete messageData.type;
+                        }
+                    }
+
+                    if (messageData && messageData.code) {
+                        // Check for "r-" prefix in the code for manual retry
+                        let code = messageData.code;
+                        let isManualRetry = false;
+                        
+                        if (code.startsWith('r-')) {
+                            isManualRetry = true;
+                            code = code.substring(2); // Strip "r-" prefix
+                            messageData.code = code; // Update for further processing
+                        }
+                        
+                        // Check if we should process this code based on user settings
+                        const codeType = getCodeType(messageData);
+                        // If user enabled 'processAll' OR code type is in allowed drops
+                        if (!userSettings.processAll && userSettings.drops && userSettings.drops.includes(codeType)) {
+                            // Check if code is already processed (skip check if it's a retry)
+                            if (!claimedCodes.has(code) || isManualRetry) {
+                                testBonusCode(code, messageData.msgType === 'unck', receiveTime, isManualRetry);
+                            }
+                            // Silently ignore duplicate codes
+                        } else if (!userSettings.processAll) {
+                            addLog(`Skipping code type: ${codeType} (not in user settings)`, "info");
+                        }
+                    }
+                } catch (e) {
+                    // Silent catch for JSON parse errors
+                }
+            };
+            webSocket.onclose = (event) => {
+                updateStatus("disconnected", "Reconnecting...");
                 webSocket = null;
-                setTimeout(connectWebSocket, CONFIG.RECONNECT_DELAY);
+                
+                // Only reconnect if we aren't blocked by auth
+                if (!document.getElementById('kust-subscription-overlay')) {
+                    setTimeout(connectWebSocket, 5000);
+                }
             };
-
             webSocket.onerror = (error) => {
-                log('WebSocket error', 'error');
-                updateStatus('Error', false);
+                // WebSocket errors usually trigger onclose immediately after, so we handle reconnection there
+                console.error("Main WebSocket Error:", error);
             };
 
-        } catch (error) {
-            log(`Connection failed: ${error.message}`, 'error');
-            setTimeout(connectWebSocket, CONFIG.RECONNECT_DELAY);
+        } catch (e) {
+            addLog(`Connection Failed: ${e.message}`, "error");
+            updateStatus("disconnected", "Error");
+            setTimeout(connectWebSocket, 5000);
         }
     }
 
-    // ================================
-    // AUTHORIZATION CHECK
-    // ================================
-    async function checkAuthorization(username) {
-        if (!username) return false;
+    function disconnectWebSocket() {
+        if (webSocket) {
+            webSocket.close();
+            webSocket = null;
+        }
+        if (hh123Socket) {
+            hh123Socket.disconnect();
+            hh123Socket = null;
+        }
+    }
+
+    // 2. REGIONAL WEBSOCKET (HH123 Socket.IO)
+    async function loadSocketIO() {
+        return new Promise((resolve, reject) => {
+            if (typeof unsafeWindow.io !== 'undefined') return resolve();
+            const script = document.createElement('script');
+            script.src = 'https://cdn.socket.io/4.7.4/socket.io.min.js';
+            script.onload = resolve;
+            script.onerror = reject;
+            document.head.appendChild(script);
+        });
+    }
+
+    async function connectRegionalServer() {
+        if (hh123Socket && hh123Socket.connected) return;
 
         try {
-            const result = await httpRequest(`${CONFIG.AUTH_CHECK_URL}?user=@${username}`);
-            if (result.data && result.data.exists === true) {
-                return true;
-            }
-            return false;
-        } catch {
-            // Assume authorized on network error
-            return true;
+            await loadSocketIO();
+            
+            // 1. HTTP Auth to get HH123 Token
+            const loginResText = await new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: `${HH123_URL}/api/login`,
+                    headers: {
+                        'Accept': 'application/json, text/plain, */*',
+                        'Content-Type': 'application/json',
+                        'Origin': 'https://stake.com',
+                        'Referer': 'https://stake.com/settings/offers'
+                    },
+                    data: JSON.stringify({
+                        username: HH123_USERNAME,
+                        platform: 'stake.com',
+                        version: HH123_VERSION
+                    }),
+                    onload: (res) => resolve(res.responseText),
+                    onerror: reject,
+                    ontimeout: reject
+                });
+            });
+
+            const loginData = JSON.parse(loginResText);
+            const token = loginData.data || loginData.token;
+            if (!token) throw new Error("No token returned from Regional Server");
+
+            // 2. Connect via Socket.IO
+            hh123Socket = unsafeWindow.io(HH123_URL, {
+                auth: { token: token, version: HH123_VERSION, locale: 'en' },
+                transports: ['polling'],
+                reconnection: true,
+                reconnectionAttempts: 10,
+                reconnectionDelay: 5000
+            });
+
+            hh123Socket.on('connect', () => {
+                addLog("Connected to Regional Server", "success");
+                hh123Socket.emit('auth', { token: token, username: HH123_USERNAME });
+            });
+
+            const handleRegionalMessage = (data) => {
+                const receiveTime = performance.now(); // INSTANT TIMER START
+                
+                let raw = typeof data === 'string' ? data : JSON.stringify(data);
+                
+                if (typeof raw === 'string' && !raw.includes('"code"')) return;
+
+                // Check for "r-" prefix for manual retry
+                let actualCode = raw;
+                let isRetry = false;
+                
+                // Try to extract code and check for "r-" prefix
+                const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
+                if (codeMatch && codeMatch[1]) {
+                    actualCode = codeMatch[1];
+                    // Check if code starts with "r-" for manual retry
+                    if (actualCode.startsWith('r-')) {
+                        isRetry = true;
+                        actualCode = actualCode.substring(2); // Strip "r-" prefix
+                    }
+                }
+
+                // --- 🚀 GOD TIER OPTIMIZATION: Bypassing JSON.parse ---
+                if (userSettings && userSettings.processAll) {
+                    if (codeMatch && codeMatch[1]) {
+                        if (!claimedCodes.has(actualCode) || isRetry) {
+                            // FIRE IMMEDIATELY
+                            testBonusCode(actualCode, false, receiveTime, isRetry);
+                        }
+                        // Silently ignore duplicate codes
+                    }
+                    return; // Skip standard parsing if processed via regex
+                }
+                // --------------------------------------------------------
+
+                try {
+                    let messageData = null;
+                    if (data && (data.type === "sub_code_v2" || data.type === "stake_bonus_code") && data.msg) {
+                        messageData = data.msg;
+                    } else if (data && data.msg) {
+                        messageData = data.msg;
+                    } else {
+                        messageData = data;
+                    }
+
+                    if (messageData && (messageData.type === "sub_code_v2" || messageData.type === "stake_bonus_code")) {
+                        if (messageData.msg) messageData = messageData.msg;
+                        else delete messageData.type;
+                    }
+
+                    if (messageData && messageData.code) {
+                        // Check for "r-" prefix in the code for manual retry
+                        let code = messageData.code;
+                        let isManualRetry = false;
+                        
+                        if (code.startsWith('r-')) {
+                            isManualRetry = true;
+                            code = code.substring(2); // Strip "r-" prefix
+                            messageData.code = code; // Update for further processing
+                        }
+                        
+                        const codeType = getCodeType(messageData);
+                        if (!userSettings.processAll && userSettings.drops && userSettings.drops.includes(codeType)) {
+                            if (!claimedCodes.has(code) || isManualRetry) {
+                                testBonusCode(code, false, receiveTime, isManualRetry);
+                            }
+                            // Silently ignore duplicate codes
+                        } else if (!userSettings.processAll) {
+                            addLog(`Skipping code type: ${codeType} (not in user settings)`, "info");
+                        }
+                    }
+                } catch (e) {}
+            };
+
+            hh123Socket.on('sub_code_v2', (data) => handleRegionalMessage({ type: 'sub_code_v2', msg: data }));
+            hh123Socket.on('message', handleRegionalMessage);
+            
+            hh123Socket.on('disconnect', () => {
+                // Background reconnect handles itself via Socket.io internal logic
+            });
+
+            // Keepalive specific to this socket
+            setInterval(() => {
+                if (hh123Socket && hh123Socket.connected) {
+                    hh123Socket.emit('ping_from_bot', { ts: Date.now() });
+                }
+            }, 25000);
+
+        } catch (e) {
+            addLog(`Regional Server Connect Failed. Retrying...`, "warning");
+            setTimeout(connectRegionalServer, 10000);
         }
     }
 
+    // Function to determine code type from payload
+    function getCodeType(payload) {
+        let codeType = 'OtherDrops';
+        if (payload.type === 'DailyDrops') {
+            if (payload.amount === 1) {
+                codeType = 'Daily1';
+            } else if (payload.amount === 2) {
+                codeType = 'Daily2';
+            } else if (payload.amount === 3) {
+                codeType = 'Daily3';
+            } else {
+                codeType = 'DailyOther';
+            }
+        } else if (payload.type) {
+            codeType = payload.type;
+        }
+
+        return codeType;
+    }
+
     // ================================
-    // INITIALIZATION
+    // ⏱️ PERIODIC AUTH CHECKER
+    // ================================
+    function startSubscriptionCheck() {
+        // Run check every 60 seconds
+        setInterval(async () => {
+            if (!currentUsername) return;
+
+            const isAuthorized = await checkAuthorization(currentUsername);
+
+            if (!isAuthorized) {
+                // Increment consecutive failures counter
+                consecutiveAuthFailures++;
+                addLog(`Authorization check failed (${consecutiveAuthFailures}/2)`, "warning");
+                
+                // Only show subscription prompt after 2 consecutive failures
+                if (consecutiveAuthFailures >= 2) {
+                    // Not authorized: Kill connection and lock UI
+                    if (webSocket || hh123Socket) {
+                        addLog("Subscription expired. Stopping connection.", "error");
+                        disconnectWebSocket();
+                    }
+                    showSubscriptionPrompt();
+                }
+            } else {
+                // Reset consecutive failures counter on success
+                if (consecutiveAuthFailures > 0) {
+                    addLog("Authorization check passed", "success");
+                }
+                consecutiveAuthFailures = 0;
+                // Authorized: Check if we need to unlock UI
+                if (document.getElementById('kust-subscription-overlay')) {
+                    restoreLogsView();
+                    connectWebSocket();
+                    connectRegionalServer();
+                }
+                // Check if connection dropped and needs restart (and we aren't locked)
+                else {
+                    if (!webSocket || webSocket.readyState === WebSocket.CLOSED) {
+                        connectWebSocket();
+                    }
+                    if (!hh123Socket || !hh123Socket.connected) {
+                        connectRegionalServer();
+                    }
+                }
+            }
+        }, 60000);
+    }
+
+    // ================================
+    // ⚙️ USER SETTINGS
+    // ================================
+    function initUserSettings() {
+        try {
+            // Default settings - all checkboxes checked by default
+            const defaultSettings = {
+                drops: ['Daily1', 'Daily2', 'Daily3', 'DailyOther', 'HighRollers', 'PlaySmarter', 'WeeklyStream', 'OtherDrops'],
+                vault: false,
+                processAll: false, // Added default for new button
+                currency: 'usdt'
+            };
+            // Load saved settings or use defaults
+            userSettings = GM_getValue(FC_USER_SETTINGS) ||
+                defaultSettings;
+
+            // Ensure all required properties exist
+            if (!userSettings.drops) userSettings.drops = defaultSettings.drops;
+            if (!userSettings.vault) userSettings.vault = defaultSettings.vault;
+            if (userSettings.processAll === undefined) userSettings.processAll = defaultSettings.processAll;
+            if (!userSettings.currency) userSettings.currency = defaultSettings.currency;
+            // Set selected currency
+            selectedCurrency = userSettings.currency;
+            // Save settings
+            GM_setValue(FC_USER_SETTINGS, userSettings);
+
+            return userSettings;
+        } catch (error) {
+            addLog(`Error initializing user settings: ${error.message}`, "error");
+            return {
+                drops: ['Daily1', 'Daily2', 'Daily3', 'DailyOther', 'HighRollers', 'PlaySmarter', 'WeeklyStream', 'OtherDrops'],
+                vault: false,
+                processAll: false,
+                currency: 'usdt'
+            };
+        }
+    }
+
+    function saveUserSettings() {
+        try {
+            GM_setValue(FC_USER_SETTINGS, userSettings);
+            addLog("Settings saved", "success");
+        } catch (error) {
+            addLog(`Error saving settings: ${error.message}`, "error");
+        }
+    }
+
+    function updateSettingsUI() {
+        // Update checkboxes based on current settings
+        const checkboxes = document.querySelectorAll('.settings-checkbox');
+        checkboxes.forEach(checkbox => {
+            if (checkbox.id === 'vaultDeposit') {
+                checkbox.checked = userSettings.vault || false;
+            } else if (checkbox.id === 'processAll') {
+                checkbox.checked = userSettings.processAll || false;
+            } else if (checkbox.value) {
+                checkbox.checked = userSettings.drops.includes(checkbox.value);
+            }
+        });
+        // Update currency selection
+        const currencySelect = document.getElementById('currencySelect');
+        if (currencySelect) {
+            currencySelect.value = userSettings.currency || 'usdt';
+        }
+        
+        // Also update network stats if opening
+        updateSettingsStats();
+    }
+
+    // ================================
+    // 🖼️ UI CONSTRUCTION
+    // ================================
+    function createPanel() {
+        // Remove existing panel if any
+        const existing = document.getElementById("kust-panel");
+        if (existing) existing.remove();
+
+        const panel = document.createElement("div");
+        panel.id = "kust-panel";
+        panel.innerHTML = `
+            <div class="kust-header">
+                <div class="kust-header-left">
+                    <div class="kust-title">KUST CLAIMER</div>
+                    <div id="kust-username" class="kust-username">Guest</div>
+                </div>
+                <div class="kust-header-right">
+                    <div id="kust-network-bars" class="network-bars" title="Checking Network...">
+                        <div class="net-bar"></div>
+                        <div class="net-bar"></div>
+                        <div class="net-bar"></div>
+                    </div>
+
+                    <div class="kust-settings-btn" id="kust-settings-btn" title="Settings">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                        </svg>
+                    </div>
+                    <div id="kust-status-badge" class="kust-status disconnected">
+                        <div class="status-dot"></div>
+                        <span id="kust-status-text">Init...</span>
+                    </div>
+                </div>
+            </div>
+            <div class="kust-body">
+                <div id="kust-logs"></div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // ================================
+        // INJECT NEW 3D FLOATING HUD OVERLAY
+        // ================================
+        const overlay = document.createElement("div");
+        overlay.id = "kust-token-overlay";
+        overlay.innerHTML = `
+            <div class="token-3d-icon">⚡</div>
+            <div class="token-3d-text">
+                <span class="token-3d-label">Bypass Ammo</span>
+                <span id="kust-token-count" class="token-3d-value">0/5</span>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        // Create settings modal
+        const settingsModal = document.createElement("div");
+        settingsModal.id = "kust-settings-modal";
+        settingsModal.innerHTML = `
+            <div class="kust-settings-popup">
+                <div class="settings-popup-header">
+                    <div class="settings-popup-title">Settings</div>
+                    <div class="settings-popup-close" id="settings-popup-close">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </div>
+                </div>
+                <div class="settings-popup-content">
+                    
+                    <div class="settings-section">
+                        <div class="settings-section-title">📊 Claim Statistics</div>
+                        <div class="claim-stats-grid">
+                            <div class="claim-stat-item">
+                                <span class="claim-stat-label">Success</span>
+                                <span class="claim-stat-value success" id="stat-success-count">0</span>
+                            </div>
+                            <div class="claim-stat-item">
+                                <span class="claim-stat-label">Failed</span>
+                                <span class="claim-stat-value failed" id="stat-failed-count">0</span>
+                            </div>
+                            <div class="claim-stat-item">
+                                <span class="claim-stat-label">Total Value</span>
+                                <span class="claim-stat-value" id="stat-total-value">$0.00</span>
+                            </div>
+                            <div class="claim-stat-item">
+                                <span class="claim-stat-label">Success Rate</span>
+                                <span class="claim-stat-value" id="stat-success-rate">0%</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <div class="settings-section-title">Network Intelligence</div>
+                        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                            
+                            <div style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
+                                <div style="font-size: 10px; color: var(--kust-accent); text-align: center; margin-bottom: 8px; font-weight: bold; text-transform: uppercase;">Main Server</div>
+                                <div class="net-stats-grid" style="margin-bottom: 0;">
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Latency</span>
+                                        <span class="net-stat-value" id="stat-latency">--ms</span>
+                                    </div>
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Jitter</span>
+                                        <span class="net-stat-value" id="stat-jitter">--ms</span>
+                                    </div>
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Loss (Est)</span>
+                                        <span class="net-stat-value" id="stat-loss">--%</span>
+                                    </div>
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Status</span>
+                                        <span class="net-stat-value" id="stat-server">--</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
+                                <div style="font-size: 10px; color: #3b82f6; text-align: center; margin-bottom: 8px; font-weight: bold; text-transform: uppercase;">Regional Routed</div>
+                                <div class="net-stats-grid" style="margin-bottom: 0;">
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Latency</span>
+                                        <span class="net-stat-value" id="stat-latency-reg">--ms</span>
+                                    </div>
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Jitter</span>
+                                        <span class="net-stat-value" id="stat-jitter-reg">--ms</span>
+                                    </div>
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Loss (Est)</span>
+                                        <span class="net-stat-value" id="stat-loss-reg">--%</span>
+                                    </div>
+                                    <div class="net-stat-item" style="padding: 8px;">
+                                        <span class="net-stat-label">Status</span>
+                                        <span class="net-stat-value" id="stat-server-reg">--</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                        </div>
+                    </div>
+                
+                    <div class="settings-section">
+                        <div class="settings-section-title">Code Types to Claim</div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="processAll" class="settings-checkbox">
+                            <label for="processAll" class="settings-label" style="color: #00E701; font-weight: bold;">Process ALL Codes (Ignore Filters)</label>
+                        </div>
+                        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin-bottom: 15px;">
+
+                        <div class="settings-option">
+                            <input type="checkbox" id="daily1" class="settings-checkbox" value="Daily1" checked>
+                            <label for="daily1" class="settings-label">Daily $1</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="daily2" class="settings-checkbox" value="Daily2" checked>
+                            <label for="daily2" class="settings-label">Daily $2</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="daily3" class="settings-checkbox" value="Daily3" checked>
+                            <label for="daily3" class="settings-label">Daily $3</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="dailyOther" class="settings-checkbox" value="DailyOther" checked>
+                            <label for="dailyOther" class="settings-label">Daily Other</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="highRollers" class="settings-checkbox" value="HighRollers" checked>
+                            <label for="highRollers" class="settings-label">High Rollers</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="weeklyStream" class="settings-checkbox" value="WeeklyStream" checked>
+                            <label for="weeklyStream" class="settings-label">Weekly Stream Drops</label>
+                        </div>
+                        <div class="settings-option">
+                               <input type="checkbox" id="playSmarter" class="settings-checkbox" value="PlaySmarter" checked>
+                            <label for="playSmarter" class="settings-label">Play Smarter Drops</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="otherDrops" class="settings-checkbox" value="OtherDrops" checked>
+                            <label for="otherDrops" class="settings-label">Other Drops</label>
+                        </div>
+                    </div>
+             
+                    <div class="settings-section">
+                        <div class="settings-section-title">Claim Settings</div>
+                        <div class="settings-option">
+                            <input type="checkbox" id="vaultDeposit" class="settings-checkbox">
+                            <label for="vaultDeposit" class="settings-label">Deposit to Vault</label>
+                        </div>
+                        <div class="settings-option">
+                            <label for="currencySelect" class="settings-label">Currency:</label>
+                        </div>
+                        <select id="currencySelect" class="settings-select">
+                            <option value="btc">BTC</option>
+                            <option value="eth">ETH</option>
+                            <option value="ltc">LTC</option>
+                            <option value="usdt" selected>USDT</option>
+                            <option value="sol">SOL</option>
+                            <option value="doge">DOGE</option>
+                            <option value="xrp">XRP</option>
+                            <option value="trx">TRX</option>
+                            <option value="eos">EOS</option>
+                            <option value="bnb">BNB</option>
+                            <option value="usdc">USDC</option>
+                            <option value="dai">DAI</option>
+                            <option value="link">LINK</option>
+                            <option value="shib">SHIB</option>
+                            <option value="uni">UNI</option>
+                            <option value="pol">POL</option>
+                            <option value="trump">TRUMP</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(settingsModal);
+
+        // Settings button click handler
+        document.getElementById('kust-settings-btn').addEventListener('click', () => {
+            const settingsModal = document.getElementById('kust-settings-modal');
+            settingsModal.classList.add('open');
+
+            // Update UI when opening settings
+            updateSettingsUI();
+        });
+        // Settings modal close button
+        document.getElementById('settings-popup-close').addEventListener('click', () => {
+            document.getElementById('kust-settings-modal').classList.remove('open');
+        });
+        // Close modal when clicking outside
+        document.getElementById('kust-settings-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'kust-settings-modal') {
+                document.getElementById('kust-settings-modal').classList.remove('open');
+            }
+        });
+        // Settings checkboxes
+        const settingsCheckboxes = document.querySelectorAll('.settings-checkbox');
+        settingsCheckboxes.forEach(checkbox => {
+            checkbox.addEventListener('change', () => {
+                if (!userSettings.drops) userSettings.drops = [];
+
+                if (checkbox.id === 'vaultDeposit') {
+                    userSettings.vault = checkbox.checked;
+                } else if (checkbox.id === 'processAll') {
+                    userSettings.processAll = checkbox.checked;
+                } else if (checkbox.value) {
+                    if (checkbox.checked && !userSettings.drops.includes(checkbox.value)) {
+                        userSettings.drops.push(checkbox.value);
+                    } else if (!checkbox.checked && userSettings.drops.includes(checkbox.value)) {
+                        const index = userSettings.drops.indexOf(checkbox.value);
+                        userSettings.drops.splice(index, 1);
+                    }
+                }
+                saveUserSettings();
+            });
+        });
+        // Currency select
+        document.getElementById('currencySelect').addEventListener('change', (e) => {
+            selectedCurrency = e.target.value;
+            userSettings.currency = selectedCurrency;
+            saveUserSettings();
+        });
+        // Drag Logic
+        const header = panel.querySelector('.kust-header');
+        let isDragging = false, startX, startY, initialLeft, initialTop;
+
+        header.addEventListener('mousedown', (e) => {
+            if (e.target.closest('.kust-settings-btn')) return;
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = panel.getBoundingClientRect();
+            initialLeft = rect.left;
+            initialTop = rect.top;
+            panel.style.transition = 'none';
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            panel.style.top = `${initialTop + dy}px`;
+            panel.style.left = `${initialLeft + dx}px`;
+            panel.style.right = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            panel.style.transition = 'opacity 0.3s ease';
+        });
+    }
+
+    // ================================
+    // 🌐 REMOTE CONFIG FETCHER
+    // ================================
+    async function fetchRemoteConfig() {
+        return new Promise((resolve, reject) => {
+            updateStatus("disconnected", "Fetching server list...");
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: REMOTE_CONFIG_URL,
+                timeout: 10000,
+                headers: { "Content-Type": "application/json" },
+                onload: (res) => {
+                    try {
+                        const config = JSON.parse(res.responseText);
+                        // The worker returns 'wssUrl' (best one) and 'authUrl' (default)
+                        if (config.wssUrl && config.authUrl) {
+                            WS_SERVER_URL = config.wssUrl;
+                            AUTH_CHECK_URL = config.authUrl;
+                            if (config.regionalUrl) {
+                                HH123_URL = config.regionalUrl;
+                            }
+                            addLog(`nodes list loaded ✨: ${config.meta && config.meta.selected_node_stats !== "Fallback Mode" ? "Optimized" : "Default"}`, "success");
+                            resolve(true);
+                        } else {
+                            reject("Invalid Config Structure");
+                        }
+                    } catch (e) {
+                        reject("Config Parse Error");
+                    }
+                },
+                onerror: () => reject("Config Network Error"),
+                ontimeout: () => reject("Config Timeout")
+            });
+        });
+    }
+
+    // ================================
+    // 🔥 INITIALIZATION
     // ================================
     async function init() {
-        log('=== KUST CLAIMER LITE v3.0 ===', 'info');
-        log('Starting...', 'info');
+        // --- OPTIMIZATION: PRE-WARM CONNECTIONS ---
+        const preconnect = document.createElement('link');
+        preconnect.rel = 'preconnect';
+        preconnect.href = CURRENT_MIRROR;
+        preconnect.crossOrigin = 'anonymous';
+        document.head.appendChild(preconnect);
+        // ------------------------------------------
 
-        // Validate session token
-        if (!CONFIG.SESSION_TOKEN) {
-            log('ERROR: SESSION_TOKEN not set in CONFIG!', 'error');
-            log('Please set your Stake session token before running.', 'error');
-            return;
+        createPanel();
+        addLog("Kust Claimer v2.5 Initialized (Raw JSON Reporting - Manual Retry via r- prefix)", "info");
+        
+        // 🔥 START TURNSTILE EARLY
+        // Give the token cache huge breathing room to fill up before anything else executes
+        turnstileManager.initialize();
+
+        // Fetch remote configuration
+        try {
+            await fetchRemoteConfig();
+        } catch (e) {
+            addLog(`⚠️ Config Fetch Failed: ${e}. Using default servers.`, "warning");
+            // WS_SERVER_URL and AUTH_CHECK_URL retain their default values defined at the top
         }
 
-        // Check authorization
-        const isAuthorized = await checkAuthorization(currentUsername);
-        if (!isAuthorized) {
-            log('Authorization failed. Check your subscription.', 'error');
-            updateStatus('Unauthorized', false);
-            return;
-        }
+        updateStatus("disconnected", "Fetching User...");
+        
+        // Start AGGRESSIVE WSS Network Stats Polling (runs every 2s)
+        setInterval(activePingCheck, 2000);
+        setInterval(activeRegionalPingCheck, 2000);
+        activePingCheck(); // Initial check
+        activeRegionalPingCheck();
+        
+        // Start Token Power-Up UI Polling for the new 3D Overlay
+        setInterval(updateTokenUI, 500);
 
-        log('Authorized. Connecting...', 'success');
+        // 1. Initialize user settings
+        initUserSettings();
+        // 2. Get Username
+        currentUsername = await getStakeUserFromAPI();
+        if (currentUsername) {
+            
+            // 🚀 GOD TIER OPTIMIZATION: Pre-build the fetch headers once session is known
+            OPTIMIZED_HEADERS = {
+                'Content-Type': 'application/json',
+                'x-access-token': currentSession,
+                'x-operation-name': 'ClaimConditionBonusCode',
+                'x-operation-type': 'query',
+                'Origin': CURRENT_MIRROR,
+                'Referer': window.location.href
+            };
 
-        // Connect to WebSocket
-        connectWebSocket();
-
-        // Print stats periodically
-        setInterval(() => {
-            log(`Stats: ${claimStats.success} claimed, ${claimStats.failed} failed, $${claimStats.totalValue.toFixed(2)} total`, 'info');
-        }, 60000); // Every minute
-    }
-
-    // ================================
-    // ENTRY POINT
-    // ================================
-    // Check if running in browser or Node.js
-    if (typeof window !== 'undefined') {
-        // Browser environment
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', createGUI);
+            updateUsername(currentUsername);
+            // 3. (TurnstileManager already initialized above to gain buffer time)
+            
+            // 4. Check Authorization
+            const isAuthorized = await checkAuthorization(currentUsername);
+            // 5. Start Periodic Check (runs every 60s)
+            startSubscriptionCheck();
+            if (isAuthorized) {
+                // Initialize both sockets in parallel
+                connectWebSocket();
+                connectRegionalServer();
+            } else {
+                // Not authorized: Show subscription prompt immediately (no grace period)
+                showSubscriptionPrompt();
+            }
         } else {
-            createGUI();
+            addLog("Cannot proceed without a valid Stake username. Please log in.", "error");
+            updateStatus("disconnected", "Login Req.");
         }
-    } else {
-        // Node.js environment (would need WebSocket polyfill)
-        console.log('Node.js environment detected.');
-        console.log('Note: This script requires a browser environment with Turnstile support.');
-        // init(); // Uncomment if you have proper polyfills
     }
 
-    // Export for manual control
-    window.KustClaimer = {
-        init,
-        processCode,
-        claimStats,
-        CONFIG,
-        setSession: (token) => { CONFIG.SESSION_TOKEN = token; },
-        setUsername: (name) => { currentUsername = name; }
-    };
+    // Clear claimed codes periodically
+    setInterval(() => {
+        claimedCodes.clear(); // Set clear method
+        processingCodes.clear(); // Also clear processing set
+    }, 3 * 60 * 1000);
+    // Clear every 3 minutes
 
+    // Start
+    init();
 })();

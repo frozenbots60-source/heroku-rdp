@@ -2,23 +2,20 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Add Mozilla PPA and set priorities to bypass Snap
-RUN apt-get update && apt-get install -y software-properties-common gnupg wget ca-certificates && \
-    add-apt-repository -y ppa:mozillateam/ppa
-
-RUN echo 'Package: firefox* \n\
-Pin: release o=LP-PPA-mozillateam \n\
-Pin-Priority: 1001' > /etc/apt/preferences.d/mozilla-firefox
-
-# 2. Install dependencies (Removed 'geckodriver' from this list)
+# 1. Install dependencies (Added curl/bzip2 for the manual Firefox Dev install)
 RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    gnupg \
+    wget \
+    curl \
+    bzip2 \
+    ca-certificates \
     xvfb \
     fluxbox \
     x11vnc \
     novnc \
     websockify \
     supervisor \
-    firefox \
     python3 \
     python3-pip \
     fonts-liberation \
@@ -49,13 +46,19 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libxtst6 \
     libgbm1 \
-    ca-certificates \
     lsb-release \
     unzip \
     && apt-get clean
 
+# --- NEW SECTION: Install Firefox Developer Edition ---
+# We download the official binary and link it so the system sees it as 'firefox'
+RUN wget -q "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -O /tmp/firefox-dev.tar.bz2 \
+    && tar -xjf /tmp/firefox-dev.tar.bz2 -C /opt \
+    && ln -s /opt/firefox/firefox /usr/bin/firefox \
+    && rm /tmp/firefox-dev.tar.bz2
+# ------------------------------------------------------
+
 # --- NEW SECTION: Install Geckodriver Manually ---
-# We download the latest version from Mozilla's GitHub
 RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
     && tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin \
     && rm /tmp/geckodriver.tar.gz
@@ -66,12 +69,13 @@ RUN pip3 install selenium
 # --------------------------------
 
 # --- FIREFOX CONFIGURATION (FIX: Allow Unsigned Extensions) ---
-# This is required for the "Normal Firefox" method to load your script extension
-RUN mkdir -p /usr/lib/firefox/browser/defaults/preferences/ && \
-    echo 'pref("general.config.filename", "mozilla.cfg");' > /usr/lib/firefox/browser/defaults/preferences/autoconfig.js && \
-    echo 'pref("general.config.obscure_value", 0);' >> /usr/lib/firefox/browser/defaults/preferences/autoconfig.js && \
-    echo '//' > /usr/lib/firefox/mozilla.cfg && \
-    echo 'lockPref("xpinstall.signatures.required", false);' >> /usr/lib/firefox/mozilla.cfg
+# For Developer Edition, these files live in /opt/firefox
+RUN mkdir -p /opt/firefox/browser/defaults/preferences/ && \
+    echo 'pref("general.config.filename", "mozilla.cfg");' > /opt/firefox/browser/defaults/preferences/autoconfig.js && \
+    echo 'pref("general.config.obscure_value", 0);' >> /opt/firefox/browser/defaults/preferences/autoconfig.js && \
+    echo '//' > /opt/firefox/mozilla.cfg && \
+    echo 'lockPref("xpinstall.signatures.required", false);' >> /opt/firefox/mozilla.cfg && \
+    echo 'lockPref("extensions.checkCompatibility.nightly", false);' >> /opt/firefox/mozilla.cfg
 # --------------------------------------------------------------
 
 # 2b. Set /tmp to be globally writable (Sticky Bit) 

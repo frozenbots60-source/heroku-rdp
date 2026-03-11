@@ -51,8 +51,8 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean
 
 # --- NEW SECTION: Install Firefox Developer Edition ---
-# We download the official binary and link it so the system sees it as 'firefox'
-RUN wget -q "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -O /tmp/firefox-dev.tar.bz2 \
+# Using curl -L to handle Mozilla's redirects properly
+RUN curl -L "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -o /tmp/firefox-dev.tar.bz2 \
     && tar -xjf /tmp/firefox-dev.tar.bz2 -C /opt \
     && ln -s /opt/firefox/firefox /usr/bin/firefox \
     && rm /tmp/firefox-dev.tar.bz2

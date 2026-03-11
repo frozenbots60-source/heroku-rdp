@@ -3,23 +3,20 @@ import os
 import subprocess
 import sys
 import shutil
+import json
+import zipfile
 
 # ================================
 # CONFIGURATION
 # ================================
-# Paths
 WORKDIR = "/app"
 EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
 PROFILE_DIR = "/tmp/firefox-profile"
 
-# Firefox System Paths (Standard Ubuntu locations)
-FIREFOX_CFG_PATH = "/usr/lib/firefox/mozilla.cfg"
-AUTOCONFIG_JS_PATH = "/usr/lib/firefox/defaults/pref/autoconfig.js"
-
-def verify_extension():
-    """Verifies that the claimer folder and manifest exist."""
+def prepare_sideload_extension():
+    """Zips the claimer folder and places it in the profile's extension directory."""
     print("=" * 60, flush=True)
-    print("[EXTENSION SETUP] Verifying extension directory...", flush=True)
+    print("[EXTENSION SETUP] Preparing extension for sideloading...", flush=True)
     print("=" * 60, flush=True)
 
     if not os.path.exists(EXTENSION_DIR):
@@ -28,42 +25,40 @@ def verify_extension():
 
     manifest_path = os.path.join(EXTENSION_DIR, "manifest.json")
     if not os.path.exists(manifest_path):
-        print(f"[EXTENSION SETUP] ❌ ERROR: manifest.json not found inside {EXTENSION_DIR}!", flush=True)
+        print(f"[EXTENSION SETUP] ❌ ERROR: manifest.json not found in {EXTENSION_DIR}!", flush=True)
         sys.exit(1)
 
-    print(f"[EXTENSION SETUP] ✓ Extension folder ready at: {EXTENSION_DIR}", flush=True)
-    print("=" * 60, flush=True)
-
-def setup_autoconfig():
-    """
-    Writes the AutoConfig files that force Firefox to install the extension.
-    This is the most reliable method for containerized environments.
-    """
-    print("[MAIN] Writing AutoConfig files...", flush=True)
-    
-    # 1. Write autoconfig.js (Tells Firefox to read mozilla.cfg)
-    autoconfig_content = """pref("general.config.filename", "mozilla.cfg");
-pref("general.config.obscure_value", 0);
-"""
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(AUTOCONFIG_JS_PATH), exist_ok=True)
-    
-    with open(AUTOCONFIG_JS_PATH, "w") as f:
-        f.write(autoconfig_content)
-
-    # 2. Write mozilla.cfg (The actual script to load extension)
-    # We use a safe variable name to avoid path issues
-    cfg_content = f"""//
-try {{
-    var extPath = "{EXTENSION_DIR}";
-    Components.utils.import("resource://gre/modules/Addons.jsm");
-    AddonManager.installAddonFromLocation(extPath);
-}} catch(e) {{}}
-"""
-    with open(FIREFOX_CFG_PATH, "w") as f:
-        f.write(cfg_content)
+    # 1. Get the extension ID from manifest
+    try:
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
         
-    print("[MAIN] ✓ AutoConfig files written.", flush=True)
+        # Sideloading requires an ID. Fallback if missing.
+        ext_id = manifest.get("browser_specific_settings", {}).get("gecko", {}).get("id")
+        if not ext_id:
+            ext_id = "kust-claimer@local.host"
+            print(f"[EXTENSION SETUP] ⚠️ No Gecko ID found. Using fallback: {ext_id}", flush=True)
+    except Exception as e:
+        print(f"[EXTENSION SETUP] ❌ ERROR reading manifest: {e}", flush=True)
+        sys.exit(1)
+
+    # 2. Create the extensions directory inside the profile
+    ext_dest_path = os.path.join(PROFILE_DIR, "extensions")
+    os.makedirs(ext_dest_path, exist_ok=True)
+
+    # 3. Zip the folder into {id}.xpi
+    xpi_file = os.path.join(ext_dest_path, f"{ext_id}.xpi")
+    
+    with zipfile.ZipFile(xpi_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(EXTENSION_DIR):
+            for file in files:
+                file_path = os.path.join(root, file)
+                # Create relative path for the zip
+                arcname = os.path.relpath(file_path, EXTENSION_DIR)
+                zipf.write(file_path, arcname)
+
+    print(f"[EXTENSION SETUP] ✓ Extension packed and sideloaded: {ext_id}.xpi", flush=True)
+    print("=" * 60, flush=True)
 
 def main():
     print("\n" + "=" * 60, flush=True)
@@ -77,46 +72,35 @@ def main():
     time.sleep(5)
     print("[MAIN] ✓ Xvfb should be ready", flush=True)
 
-    # 1. Verify the extension folder exists
-    verify_extension()
-
-    # 2. Setup AutoConfig (Force load extension from /app/claimer)
-    setup_autoconfig()
-
-    # 3. Create Clean Profile Directory
+    # 1. Create Clean Profile Directory
     if os.path.exists(PROFILE_DIR):
         shutil.rmtree(PROFILE_DIR)
     os.makedirs(PROFILE_DIR)
 
-    # 4. Write Preferences
+    # 2. Prepare and Sideload Extension
+    prepare_sideload_extension()
+
+    # 3. Write Preferences (CRITICAL for auto-enabling sideloaded extensions)
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     print(f"[MAIN] Writing Firefox preferences...", flush=True)
     
-    prefs_content = f"""
-    // Extension settings
+    prefs_content = """
+    // Extension logic
     user_pref("xpinstall.signatures.required", false);
-    user_pref("extensions.autoDisableScopes", 0);
+    user_pref("extensions.autoDisableScopes", 0); // Auto-enable sideloaded addons
     user_pref("extensions.enabledScopes", 15);
-    
-    // Developer mode settings
-    user_pref("devtools.chrome.enabled", true);
-    user_pref("devtools.debugger.remote-enabled", true);
-    user_pref("devtools.debugger.prompt-connection", false);
-    
-    // Extension debugging
-    user_pref("extensions.sdk.console.logLevel", "all");
-    user_pref("browser.dom.window.dump.enabled", true);
-    user_pref("javascript.options.showInConsole", true);
-    user_pref("extensions.logging.enabled", true);
+    user_pref("extensions.startupScanScopes", 15);
     
     // Anti-detection
     user_pref("dom.webdriver.enabled", false);
-    user_pref("general.appname.override", "Netscape");
-    user_pref("general.appversion.override", "5.0 (Windows)");
-    user_pref("general.platform.override", "Win32");
-    user_pref("general.oscpu.override", "Windows NT 10.0; Win64; x64");
+    user_pref("usePrivilegedMozillaProcess", true);
     
-    // STARTUP - Go straight to Stake
+    // Developer mode / Debugging
+    user_pref("devtools.chrome.enabled", true);
+    user_pref("extensions.logging.enabled", true);
+    user_pref("browser.dom.window.dump.enabled", true);
+    
+    // STARTUP
     user_pref("browser.startup.homepage", "https://stake.com/settings/offers");
     user_pref("browser.startup.page", 1);
     user_pref("browser.startup.homepage_override.mstone", "ignore");
@@ -126,7 +110,7 @@ def main():
         f.write(prefs_content)
     print("[MAIN] ✓ Preferences written.", flush=True)
 
-    # 5. Launch Firefox
+    # 4. Launch Firefox
     print("\n" + "=" * 60, flush=True)
     print("[MAIN] 🚀 Starting Firefox...", flush=True)
     print("=" * 60, flush=True)
@@ -136,7 +120,7 @@ def main():
         "--display=:0",
         f"--profile={PROFILE_DIR}",
         "--no-remote",
-        "--no-sandbox"  # CRITICAL: Fixes the EPERM/Sandbox error
+        "--no-sandbox" 
     ]
     
     print(f"[MAIN] Firefox command: {' '.join(cmd)}", flush=True)
@@ -149,7 +133,7 @@ def main():
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print(f"  Target URL: https://stake.com/settings/offers", flush=True)
+    print("  Target URL: https://stake.com/settings/offers")
     print("=" * 60 + "\n", flush=True)
     
     try:

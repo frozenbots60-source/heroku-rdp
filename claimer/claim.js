@@ -2515,7 +2515,25 @@ const GM_xmlhttpRequest = (details) => {
             reportToBackend(reportData);
         } else {
             // FAILURE LOGIC - NO AUTO RETRY
-            let failureReason = claimResponse.errors ? claimResponse.errors[0].message : "Unknown error";
+            // Extract error message with proper fallbacks - handle all edge cases
+            let failureReason = "Unknown error";
+            
+            if (claimResponse.errors && Array.isArray(claimResponse.errors) && claimResponse.errors.length > 0) {
+                // Check if first error has a message
+                if (claimResponse.errors[0] && claimResponse.errors[0].message) {
+                    failureReason = claimResponse.errors[0].message;
+                } else if (claimResponse.errors[0]) {
+                    // Error object exists but no message property - stringify it
+                    failureReason = JSON.stringify(claimResponse.errors[0]);
+                }
+            } else if (claimResponse.error) {
+                // Some APIs return a single 'error' field
+                failureReason = typeof claimResponse.error === 'string' ? claimResponse.error : JSON.stringify(claimResponse.error);
+            } else if (claimResponse.message) {
+                // Some APIs return a 'message' field at root
+                failureReason = claimResponse.message;
+            }
+            
             const errorType = getErrorType(failureReason);
             
             // Update failed claim statistics
@@ -2563,7 +2581,7 @@ const GM_xmlhttpRequest = (details) => {
             
             updateLog(logId, logMessage, logType, true, latencyInfo);
             
-            // Build raw JSON report for custom backend
+            // Build raw JSON report for custom backend - include raw response for debugging
             const reportData = { 
                 username: currentUsername,
                 code: code, 
@@ -2577,6 +2595,7 @@ const GM_xmlhttpRequest = (details) => {
                     cacheHit: latencyInfo.turnstileCacheHit,
                     total: latencyInfo.totalTime
                 },
+                rawResponse: claimResponse, // Include raw API response for debugging
                 timestamp: new Date().toISOString()
             };
             reportToBackend(reportData);

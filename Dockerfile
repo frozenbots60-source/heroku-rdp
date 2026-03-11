@@ -2,13 +2,14 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install dependencies (Added curl/bzip2 for the manual Firefox Dev install)
+# 1. Install dependencies (Added curl, bzip2, and xz-utils for the manual Firefox Dev install)
 RUN apt-get update && apt-get install -y \
     software-properties-common \
     gnupg \
     wget \
     curl \
     bzip2 \
+    xz-utils \
     ca-certificates \
     xvfb \
     fluxbox \
@@ -51,11 +52,11 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean
 
 # --- NEW SECTION: Install Firefox Developer Edition ---
-# Using curl -L to handle Mozilla's redirects properly
-RUN curl -L "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -o /tmp/firefox-dev.tar.bz2 \
-    && tar -xjf /tmp/firefox-dev.tar.bz2 -C /opt \
+# Using curl -L to handle Mozilla's redirects and tar -xf to auto-detect xz/bz2 formats
+RUN curl -L "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -o /tmp/firefox-dev.tar.xz \
+    && tar -xf /tmp/firefox-dev.tar.xz -C /opt \
     && ln -s /opt/firefox/firefox /usr/bin/firefox \
-    && rm /tmp/firefox-dev.tar.bz2
+    && rm /tmp/firefox-dev.tar.xz
 # ------------------------------------------------------
 
 # --- NEW SECTION: Install Geckodriver Manually ---

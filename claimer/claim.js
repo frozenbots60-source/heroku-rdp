@@ -2213,62 +2213,49 @@ function getHardcodedSessionToken() {
 
         authCheckInProgress = true;
         
-        // UPDATED: Using dynamic AUTH_CHECK_URL variable
-        const authUrl = `${AUTH_CHECK_URL}?user=@${username}`;
-
-        // Only update status if we are currently disconnected (to avoid spamming "Authorizing" on active connections)
-        const statusEl = document.getElementById("kust-status-text");
-        if(statusEl && statusEl.innerText !== "Live Stream" && statusEl.innerText !== "UPLINK ACTIVE") {
-            updateStatus("disconnected", "Authorizing...");
-        }
-
-        // GM_xmlhttpRequest is asynchronous
+        // UPDATED: Use the provided AUTH_CHECK_URL
         return new Promise((resolve) => {
-            // Add timeout to prevent hanging
-            const timeoutId = setTimeout(() => {
-                authCheckInProgress = false;
-                addLog("Authorization check timed out", "warning");
-                resolve(true); // Assume authorized on timeout to prevent false negatives
-            }, 10000); // 10 second timeout
-
             GM_xmlhttpRequest({
                 method: "GET",
-                url: authUrl,
-                timeout: 8000, // 8 second timeout for the request itself
-                onload: (res) => {
-                    clearTimeout(timeoutId);
+                url: `${AUTH_CHECK_URL}?user=${username}`,
+                timeout: 10000,
+                onload: (response) => {
                     authCheckInProgress = false;
                     try {
-                        const response = JSON.parse(res.responseText);
-                        if (response.exists === true) {
-                            resolve(true); // Authorized
-                        } else {
-                            resolve(false);
-                            // Not Authorized
-                        }
+                        const data = JSON.parse(response.responseText);
+                        consecutiveAuthFailures = 0;
+                        resolve(data.authorized === true);
                     } catch (e) {
-                        addLog(`❌ Authorization API error: ${e.message}`, "error");
+                        consecutiveAuthFailures++;
+                        if (consecutiveAuthFailures >= 3) {
+                            showSubscriptionPrompt();
+                        }
                         resolve(false);
                     }
                 },
-                onerror: (error) => {
-                    clearTimeout(timeoutId);
+                onerror: () => {
                     authCheckInProgress = false;
-                    addLog("❌ Network error while checking authorization.", "error");
-                    // Don't kill connection on network error, assume authorized to prevent false negatives
-                    resolve(true);
+                    consecutiveAuthFailures++;
+                    if (consecutiveAuthFailures >= 3) {
+                        showSubscriptionPrompt();
+                    }
+                    resolve(false);
                 },
                 ontimeout: () => {
-                    clearTimeout(timeoutId);
                     authCheckInProgress = false;
-                    addLog("❌ Authorization request timed out.", "warning");
-                    resolve(true);
-                    // Assume authorized on timeout
+                    consecutiveAuthFailures++;
+                    if (consecutiveAuthFailures >= 3) {
+                        showSubscriptionPrompt();
+                    }
+                    resolve(false);
                 }
             });
         });
     }
 
+    // ================================
+    // 🔄 BONUS CODE CHECKER
+    // ================================
     // Function to determine error type from error message
     // Returns the specific error type based on the error message content
     function getErrorType(errorMessage) {
@@ -2317,13 +2304,21 @@ function getHardcodedSessionToken() {
             return 'kycLevelNotSufficient';
         }
         
+        // Check for dropUnavailable - drop is no longer available
+        if (msg.includes('dropunavailable') || 
+            msg.includes('drop_unavailable') || 
+            msg.includes('drop unavailable')) {
+            return 'dropUnavailable';
+        }
+        
         // Success marker
         if (msg.includes('claim_success')) {
             return 'CLAIM_SUCCESS';
         }
         
-        // Unknown error
-        return 'unknown';
+        // Unknown error - return the actual error message instead of 'unknown'
+        // This ensures the backend receives the exact error message
+        return errorMessage || 'unknown';
     }
 
     // ================================
@@ -2376,84 +2371,90 @@ function getHardcodedSessionToken() {
         
         // Calculate internal processing delay (time from WebSocket receive to processing start)
         const processingStartTime = performance.now();
-        const internalDelay = wsReceiveTime ? Math.round(processingStartTime - wsReceiveTime) : 0;
-        
-        // Check if this code is already being processed (skip check if it's a retry)
-        if (!isRetry && processingCodes.has(code)) {
-            return; // Silently skip duplicate
+        let internalDelay = 0;
+        if (wsReceiveTime) {
+            internalDelay = Math.round(processingStartTime - wsReceiveTime);
         }
         
-        // Only add to claimedCodes if not a retry
-        if (!isRetry) {
-            claimedCodes.add(code);
+        // Skip if already claimed (unless it's a retry)
+        if (claimedCodes.has(code) && !isRetry) {
+            return;
         }
+        
+        // Skip if currently processing this code
+        if (processingCodes.has(code)) {
+            return;
+        }
+        
+        // Add to processing set
         processingCodes.add(code);
+        
+        // Create log entry immediately with processing state
+        const logId = addLog(`⏳ Processing code <span class="code-highlight">${code}</span>...`, "info", true);
+        
+        // Initialize latency info
+        let latencyInfo = {
+            apiLatency: 0,
+            tokenLatency: 0,
+            turnstileCacheHit: false,
+            totalTime: 0,
+            internalDelay: internalDelay
+        };
 
-        // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE
-        // Fire the info API call and immediately proceed to claim (fire and forget)
-        if (stakeApi) {
-            stakeApi.checkBonusCode(code).catch(() => {}); // Fire and forget - no waiting
-        }
-
-        // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
-        let tokenResult = turnstileManager.getFastTokenWithMetrics();
-
-        if (tokenResult && tokenResult.token) {
-            // FAST PATH: Token exists. Fire request in the current execution tick.
-            const token = tokenResult.token;
-            const turnstileCacheHit = tokenResult.cacheHit;
-            const tokenLatency = tokenResult.latency;
-
-            const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
-
-            // Record API call start time - this measures the actual network latency to Stake API
+        // Get turnstile token first (with timing)
+        const tokenStartTime = performance.now();
+        
+        // Try fast sync token first, fall back to async
+        let fastTokenResult = turnstileManager.getFastTokenWithMetrics();
+        
+        if (fastTokenResult) {
+            // Fast path - token was in cache
+            latencyInfo.tokenLatency = fastTokenResult.latency;
+            latencyInfo.turnstileCacheHit = fastTokenResult.cacheHit;
+            
             const apiCallStartTime = performance.now();
-
-            // Fire request instantly using OPTIMIZED_HEADERS
-            const claimPromise = fetch(STAKE_API_URL, {
+            
+            // Direct API call with pre-optimized headers
+            const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${fastTokenResult.token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
+            
+            fetch(STAKE_API_URL, {
                 method: 'POST',
                 headers: OPTIMIZED_HEADERS,
                 body: payload
-            });
-
-            // UI updates happen AFTER the request is on the network
-            const logId = addLog(`${isRetry ? '🔄 RETRY - ' : ''}Processing Code: ${code}...`, "info", true);
-
-            // Handle the response asynchronously (non-blocking)
-            claimPromise
-                .then(r => r.json())
-                .catch(e => ({ errors: [{ message: e.message }] }))
-                .then(claimResponse => {
-                    const apiCallEndTime = performance.now();
-                    // API latency is the actual network round-trip time to Stake API
-                    const apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
-                    const totalTime = Math.round(apiCallEndTime - processingStartTime);
-                    
-                    const latencyInfo = {
-                        internalDelay,
-                        turnstileCacheHit,
-                        tokenLatency,
-                        apiLatency,
-                        totalTime
-                    };
-                    
-                    handleClaimResponse(claimResponse, code, token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
-                });
-
-        } else {
-            // SLOW PATH: No token cache, fallback to async generation
-            addLog(`⚠️ Token cache empty! Falling back to async grab...`, "warning");
-            const logId = addLog(`${isRetry ? '🔄 RETRY - ' : ''}Processing Code: ${code}...`, "info", true);
-            const tokenStartTime = performance.now();
-            
-            turnstileManager.getTokenWithMetrics().then(tokenResult => {
-                const token = tokenResult.token;
-                const turnstileCacheHit = tokenResult.cacheHit;
-                const tokenLatency = Math.round(performance.now() - tokenStartTime);
+            })
+            .then(r => r.json())
+            .then(claimResponse => {
+                const apiCallEndTime = performance.now();
+                latencyInfo.apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
+                latencyInfo.totalTime = Math.round(apiCallEndTime - processingStartTime);
                 
-                const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
+                handleClaimResponse(claimResponse, code, fastTokenResult.token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
+            })
+            .catch(e => {
+                processingCodes.delete(code);
+                updateLog(logId, `❌ Network error: ${e.message}`, "error", true);
+                
+                // Report network error to backend with actual error message
+                const reportData = { 
+                    username: currentUsername,
+                    code: code, 
+                    status: "FAILED", 
+                    reason: "networkError",
+                    error: e.message || "Network error occurred",
+                    isRetry: isRetry,
+                    timestamp: new Date().toISOString()
+                };
+                reportToBackend(reportData);
+            });
+        } else {
+            // Slow path - need to generate token
+            turnstileManager.getTokenWithMetrics().then(tokenResult => {
+                latencyInfo.tokenLatency = tokenResult.latency;
+                latencyInfo.turnstileCacheHit = tokenResult.cacheHit;
                 
                 const apiCallStartTime = performance.now();
+                
+                const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${tokenResult.token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
                 
                 fetch(STAKE_API_URL, {
                     method: 'POST',
@@ -2461,22 +2462,45 @@ function getHardcodedSessionToken() {
                     body: payload
                 })
                 .then(r => r.json())
-                .catch(e => ({ errors: [{ message: e.message }] }))
                 .then(claimResponse => {
                     const apiCallEndTime = performance.now();
-                    const apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
-                    const totalTime = Math.round(apiCallEndTime - processingStartTime);
+                    latencyInfo.apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
+                    latencyInfo.totalTime = Math.round(apiCallEndTime - processingStartTime);
                     
-                    const latencyInfo = {
-                        internalDelay,
-                        turnstileCacheHit,
-                        tokenLatency,
-                        apiLatency,
-                        totalTime
+                    handleClaimResponse(claimResponse, code, tokenResult.token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
+                })
+                .catch(e => {
+                    processingCodes.delete(code);
+                    updateLog(logId, `❌ Network error: ${e.message}`, "error", true);
+                    
+                    // Report network error to backend with actual error message
+                    const reportData = { 
+                        username: currentUsername,
+                        code: code, 
+                        status: "FAILED", 
+                        reason: "networkError",
+                        error: e.message || "Network error occurred",
+                        isRetry: isRetry,
+                        timestamp: new Date().toISOString()
                     };
-                    
-                    handleClaimResponse(claimResponse, code, token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
+                    reportToBackend(reportData);
                 });
+            }).catch(e => {
+                processingCodes.delete(code);
+                const readableError = turnstileManager.getHumanReadableError(e);
+                updateLog(logId, `❌ Token generation failed: ${readableError}`, "error", true);
+                
+                // Report token error to backend with actual error message
+                const reportData = { 
+                    username: currentUsername,
+                    code: code, 
+                    status: "FAILED", 
+                    reason: "tokenError",
+                    error: readableError,
+                    isRetry: isRetry,
+                    timestamp: new Date().toISOString()
+                };
+                reportToBackend(reportData);
             });
         }
     }
@@ -2603,16 +2627,21 @@ function getHardcodedSessionToken() {
             } else if (errorType === 'kycLevelNotSufficient') { 
                 logMessage = `⚠️ KYC level insufficient for code <span class="code-highlight">${code}</span>`; 
                 logType = "warning"; 
+            } else if (errorType === 'dropUnavailable') { 
+                logMessage = `⚠️ Drop is no longer available for code <span class="code-highlight">${code}</span>`; 
+                logType = "warning"; 
             }
             
             updateLog(logId, logMessage, logType, true, latencyInfo);
             
             // Build raw JSON report for custom backend
+            // FIX: When errorType is the actual error message (not a known type), use it as the reason
+            // This ensures the exact error is reported to the backend instead of "unknown"
             const reportData = { 
                 username: currentUsername,
                 code: code, 
                 status: "FAILED", 
-                reason: errorType, 
+                reason: errorType, // Now contains actual error message when not a known type
                 error: failureReason,
                 isRetry: isRetry,
                 latency: {
@@ -2721,380 +2750,266 @@ function getHardcodedSessionToken() {
                         if (code.startsWith('r-')) {
                             isManualRetry = true;
                             code = code.substring(2); // Strip "r-" prefix
-                            messageData.code = code; // Update for further processing
                         }
                         
-                        // Check if we should process this code based on user settings
-                        const codeType = getCodeType(messageData);
-                        // If user enabled 'processAll' OR code type is in allowed drops
-                        if (!userSettings.processAll && userSettings.drops && userSettings.drops.includes(codeType)) {
-                            // Check if code is already processed (skip check if it's a retry)
-                            if (!claimedCodes.has(code) || isManualRetry) {
-                                testBonusCode(code, messageData.msgType === 'unck', receiveTime, isManualRetry);
-                            }
-                            // Silently ignore duplicate codes
-                        } else if (!userSettings.processAll) {
-                            addLog(`Skipping code type: ${codeType} (not in user settings)`, "info");
+                        if (!claimedCodes.has(code) || isManualRetry) {
+                            testBonusCode(code, false, receiveTime, isManualRetry);
                         }
                     }
                 } catch (e) {
-                    // Silent catch for JSON parse errors
+                    // JSON parse failed, ignore
                 }
             };
-            webSocket.onclose = (event) => {
+            webSocket.onclose = () => {
                 updateStatus("disconnected", "Reconnecting...");
-                webSocket = null;
-                
-                // Only reconnect if we aren't blocked by auth
-                if (!document.getElementById('kust-subscription-overlay')) {
-                    setTimeout(connectWebSocket, 5000);
-                }
+                // Attempt reconnection after 3 seconds
+                setTimeout(connectWebSocket, 3000);
             };
-            webSocket.onerror = (error) => {
-                // WebSocket errors usually trigger onclose immediately after, so we handle reconnection there
-                console.error("Main WebSocket Error:", error);
+            webSocket.onerror = () => {
+                updateStatus("disconnected", "Connection Error");
             };
-
         } catch (e) {
-            addLog(`Connection Failed: ${e.message}`, 'error');
-            updateStatus("disconnected", "Error");
+            updateStatus("disconnected", "Connection Failed");
             setTimeout(connectWebSocket, 5000);
         }
     }
 
-    function disconnectWebSocket() {
-        if (webSocket) {
-            webSocket.close();
-            webSocket = null;
-        }
-        if (hh123Socket) {
-            hh123Socket.disconnect();
-            hh123Socket = null;
-        }
-    }
-
-    // 2. REGIONAL WEBSOCKET (HH123 Socket.IO)
-    async function loadSocketIO() {
-        return new Promise((resolve, reject) => {
-            if (typeof unsafeWindow.io !== 'undefined') return resolve();
-            const script = document.createElement('script');
-            script.src = 'https://cdn.socket.io/4.7.4/socket.io.min.js';
-            script.onload = resolve;
-            script.onerror = reject;
-            document.head.appendChild(script);
-        });
-    }
-
-    async function connectRegionalServer() {
+    // 2. REGIONAL WEBSOCKET (HH123)
+    function connectRegionalSocket() {
         if (hh123Socket && hh123Socket.connected) return;
 
-        try {
-            await loadSocketIO();
-            
-            // 1. HTTP Auth to get HH123 Token
-            const loginResText = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: `${HH123_URL}/api/login`,
-                    headers: {
-                        'Accept': 'application/json, text/plain, */*',
-                        'Content-Type': 'application/json',
-                        'Origin': 'https://stake.com',
-                        'Referer': 'https://stake.com/settings/offers'
-                    },
-                    data: JSON.stringify({
+        // Load Socket.IO client script dynamically
+        const script = document.createElement('script');
+        script.src = 'https://cdn.socket.io/4.5.4/socket.io.min.js';
+        script.onload = () => {
+            try {
+                hh123Socket = io(HH123_URL, {
+                    transports: ['websocket', 'polling'],
+                    query: {
                         username: HH123_USERNAME,
-                        platform: 'stake.com',
                         version: HH123_VERSION
-                    }),
-                    onload: (res) => resolve(res.responseText),
-                    onerror: reject,
-                    ontimeout: reject
+                    }
                 });
-            });
 
-            const loginData = JSON.parse(loginResText);
-            const token = loginData.data || loginData.token;
-            if (!token) throw new Error("No token returned from Regional Server");
+                hh123Socket.on('connect', () => {
+                    addLog("Connected to Regional Server (HH123)", "success");
+                });
 
-            // 2. Connect via Socket.IO
-            hh123Socket = unsafeWindow.io(HH123_URL, {
-                auth: { token: token, version: HH123_VERSION, locale: 'en' },
-                transports: ['polling'],
-                reconnection: true,
-                reconnectionAttempts: 10,
-                reconnectionDelay: 5000
-            });
-
-            hh123Socket.on('connect', () => {
-                addLog("Connected to Regional Server", "success");
-                hh123Socket.emit('auth', { token: token, username: HH123_USERNAME });
-            });
-
-            const handleRegionalMessage = (data) => {
-                const receiveTime = performance.now(); // INSTANT TIMER START
-                
-                let raw = typeof data === 'string' ? data : JSON.stringify(data);
-                
-                if (typeof raw === 'string' && !raw.includes('"code"')) return;
-
-                // Check for "r-" prefix for manual retry
-                let actualCode = raw;
-                let isRetry = false;
-                
-                // Try to extract code and check for "r-" prefix
-                const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
-                if (codeMatch && codeMatch[1]) {
-                    actualCode = codeMatch[1];
-                    // Check if code starts with "r-" for manual retry
-                    if (actualCode.startsWith('r-')) {
-                        isRetry = true;
-                        actualCode = actualCode.substring(2); // Strip "r-" prefix
-                    }
-                }
-
-                // --- 🚀 GOD TIER OPTIMIZATION: Bypassing JSON.parse ---
-                if (userSettings && userSettings.processAll) {
-                    if (codeMatch && codeMatch[1]) {
-                        if (!claimedCodes.has(actualCode) || isRetry) {
-                            // FIRE IMMEDIATELY
-                            testBonusCode(actualCode, false, receiveTime, isRetry);
-                        }
-                        // Silently ignore duplicate codes
-                    }
-                    return; // Skip standard parsing if processed via regex
-                }
-                // --------------------------------------------------------
-
-                try {
-                    let messageData = null;
-                    if (data && (data.type === "sub_code_v2" || data.type === "stake_bonus_code") && data.msg) {
-                        messageData = data.msg;
-                    } else if (data && data.msg) {
-                        messageData = data.msg;
-                    } else {
-                        messageData = data;
-                    }
-
-                    if (messageData && (messageData.type === "sub_code_v2" || messageData.type === "stake_bonus_code")) {
-                        if (messageData.msg) messageData = messageData.msg;
-                        else delete messageData.type;
-                    }
-
-                    if (messageData && messageData.code) {
-                        // Check for "r-" prefix in the code for manual retry
-                        let code = messageData.code;
-                        let isManualRetry = false;
+                hh123Socket.on('bonus_code', (data) => {
+                    // Process bonus code from regional server
+                    if (data && data.code) {
+                        let code = data.code;
+                        let isRetry = false;
                         
+                        // Check for "r-" prefix for manual retry
                         if (code.startsWith('r-')) {
-                            isManualRetry = true;
-                            code = code.substring(2); // Strip "r-" prefix
-                            messageData.code = code; // Update for further processing
+                            isRetry = true;
+                            code = code.substring(2);
                         }
                         
-                        const codeType = getCodeType(messageData);
-                        if (!userSettings.processAll && userSettings.drops && userSettings.drops.includes(codeType)) {
-                            if (!claimedCodes.has(code) || isManualRetry) {
-                                testBonusCode(code, false, receiveTime, isManualRetry);
-                            }
-                            // Silently ignore duplicate codes
-                        } else if (!userSettings.processAll) {
-                            addLog(`Skipping code type: ${codeType} (not in user settings)`, "info");
+                        if (!claimedCodes.has(code) || isRetry) {
+                            testBonusCode(code, false, performance.now(), isRetry);
                         }
                     }
-                } catch (e) {}
-            };
+                });
 
-            hh123Socket.on('sub_code_v2', (data) => handleRegionalMessage({ type: 'sub_code_v2', msg: data }));
-            hh123Socket.on('message', handleRegionalMessage);
-            
-            hh123Socket.on('disconnect', () => {
-                // Background reconnect handles itself via Socket.io internal logic
+                hh123Socket.on('disconnect', () => {
+                    addLog("Disconnected from Regional Server", "warning");
+                });
+
+                hh123Socket.on('connect_error', () => {
+                    // Silent fail for regional server
+                });
+
+            } catch (e) {
+                // Silent fail for regional server
+            }
+        };
+        document.head.appendChild(script);
+    }
+
+    // ================================
+    // 🔧 SETTINGS MODAL
+    // ================================
+    function createSettingsModal() {
+        const modal = document.createElement('div');
+        modal.id = 'kust-settings-modal';
+        modal.innerHTML = `
+            <div class="kust-settings-popup">
+                <div class="settings-popup-header">
+                    <div class="settings-popup-title">⚙️ Settings</div>
+                    <div class="settings-popup-close" onclick="document.getElementById('kust-settings-modal').classList.remove('open')">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M18 6L6 18M6 6l12 12"/>
+                        </svg>
+                    </div>
+                </div>
+                <div class="settings-popup-content">
+                    <div class="settings-section">
+                        <div class="settings-section-title">📊 Network Statistics (Main Server)</div>
+                        <div class="net-stats-grid">
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Latency</div>
+                                <div class="net-stat-value" id="stat-latency">0ms</div>
+                            </div>
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Jitter</div>
+                                <div class="net-stat-value" id="stat-jitter">±0ms</div>
+                            </div>
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Packet Loss</div>
+                                <div class="net-stat-value" id="stat-loss">~0%</div>
+                            </div>
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Server</div>
+                                <div class="net-stat-value" id="stat-server">OFF</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-section">
+                        <div class="settings-section-title">📊 Network Statistics (Regional Server)</div>
+                        <div class="net-stats-grid">
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Latency</div>
+                                <div class="net-stat-value" id="stat-latency-reg">0ms</div>
+                            </div>
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Jitter</div>
+                                <div class="net-stat-value" id="stat-jitter-reg">±0ms</div>
+                            </div>
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Packet Loss</div>
+                                <div class="net-stat-value" id="stat-loss-reg">~0%</div>
+                            </div>
+                            <div class="net-stat-item">
+                                <div class="net-stat-label">Server</div>
+                                <div class="net-stat-value" id="stat-server-reg">OFF</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-section">
+                        <div class="settings-section-title">📈 Claim Statistics</div>
+                        <div class="claim-stats-grid">
+                            <div class="claim-stat-item">
+                                <div class="claim-stat-label">Success</div>
+                                <div class="claim-stat-value success" id="stat-success-count">0</div>
+                            </div>
+                            <div class="claim-stat-item">
+                                <div class="claim-stat-label">Failed</div>
+                                <div class="claim-stat-value failed" id="stat-failed-count">0</div>
+                            </div>
+                            <div class="claim-stat-item">
+                                <div class="claim-stat-label">Total Value</div>
+                                <div class="claim-stat-value" id="stat-total-value">$0.00</div>
+                            </div>
+                            <div class="claim-stat-item">
+                                <div class="claim-stat-label">Success Rate</div>
+                                <div class="claim-stat-value" id="stat-success-rate">0%</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-section">
+                        <div class="settings-section-title">🎮 Preferences</div>
+                        <div class="settings-option">
+                            <input type="checkbox" class="settings-checkbox" id="setting-process-all" ${userSettings && userSettings.processAll ? 'checked' : ''}>
+                            <label class="settings-label" for="setting-process-all">Process all codes (bypass JSON parsing)</label>
+                        </div>
+                        <div class="settings-option">
+                            <input type="checkbox" class="settings-checkbox" id="setting-vault" ${userSettings && userSettings.vault ? 'checked' : ''}>
+                            <label class="settings-label" for="setting-vault">Auto-deposit claimed amounts to vault</label>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-section">
+                        <div class="settings-section-title">💱 Currency</div>
+                        <select class="settings-select" id="setting-currency">
+                            <option value="usdt" ${selectedCurrency === 'usdt' ? 'selected' : ''}>USDT</option>
+                            <option value="btc" ${selectedCurrency === 'btc' ? 'selected' : ''}>BTC</option>
+                            <option value="eth" ${selectedCurrency === 'eth' ? 'selected' : ''}>ETH</option>
+                            <option value="ltc" ${selectedCurrency === 'ltc' ? 'selected' : ''}>LTC</option>
+                            <option value="doge" ${selectedCurrency === 'doge' ? 'selected' : ''}>DOGE</option>
+                            <option value="trx" ${selectedCurrency === 'trx' ? 'selected' : ''}>TRX</option>
+                            <option value="bch" ${selectedCurrency === 'bch' ? 'selected' : ''}>BCH</option>
+                            <option value="xrp" ${selectedCurrency === 'xrp' ? 'selected' : ''}>XRP</option>
+                            <option value="eos" ${selectedCurrency === 'eos' ? 'selected' : ''}>EOS</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        // Add event listeners for settings
+        const processAllCheckbox = document.getElementById('setting-process-all');
+        const vaultCheckbox = document.getElementById('setting-vault');
+        const currencySelect = document.getElementById('setting-currency');
+
+        if (processAllCheckbox) {
+            processAllCheckbox.addEventListener('change', (e) => {
+                userSettings = userSettings || {};
+                userSettings.processAll = e.target.checked;
+                GM_setValue(FC_USER_SETTINGS, userSettings);
             });
-
-            // Keepalive specific to this socket
-            setInterval(() => {
-                if (hh123Socket && hh123Socket.connected) {
-                    hh123Socket.emit('ping_from_bot', { ts: Date.now() });
-                }
-            }, 25000);
-
-        } catch (e) {
-            addLog(`Regional Server Connect Failed. Retrying...`, "warning");
-            setTimeout(connectRegionalServer, 10000);
-        }
-    }
-
-    // Function to determine code type from payload
-    function getCodeType(payload) {
-        let codeType = 'OtherDrops';
-        if (payload.type === 'DailyDrops') {
-            if (payload.amount === 1) {
-                codeType = 'Daily1';
-            } else if (payload.amount === 2) {
-                codeType = 'Daily2';
-            } else if (payload.amount === 3) {
-                codeType = 'Daily3';
-            } else {
-                codeType = 'DailyOther';
-            }
-        } else if (payload.type) {
-            codeType = payload.type;
         }
 
-        return codeType;
-    }
-
-    // ================================
-    // ⏱️ PERIODIC AUTH CHECKER
-    // ================================
-    function startSubscriptionCheck() {
-        // Run check every 60 seconds
-        setInterval(async () => {
-            if (!currentUsername) return;
-
-            const isAuthorized = await checkAuthorization(currentUsername);
-
-            if (!isAuthorized) {
-                // Increment consecutive failures counter
-                consecutiveAuthFailures++;
-                addLog(`Authorization check failed (${consecutiveAuthFailures}/2)`, "warning");
-                
-                // Only show subscription prompt after 2 consecutive failures
-                if (consecutiveAuthFailures >= 2) {
-                    // Not authorized: Kill connection and lock UI
-                    if (webSocket || hh123Socket) {
-                        addLog("Subscription expired. Stopping connection.", "error");
-                        disconnectWebSocket();
-                    }
-                    showSubscriptionPrompt();
-                }
-            } else {
-                // Reset consecutive failures counter on success
-                if (consecutiveAuthFailures > 0) {
-                    addLog("Authorization check passed", "success");
-                }
-                consecutiveAuthFailures = 0;
-                // Authorized: Check if we need to unlock UI
-                if (document.getElementById('kust-subscription-overlay')) {
-                    restoreLogsView();
-                    connectWebSocket();
-                    connectRegionalServer();
-                }
-                // Check if connection dropped and needs restart (and we aren't locked)
-                else {
-                    if (!webSocket || webSocket.readyState === WebSocket.CLOSED) {
-                        connectWebSocket();
-                    }
-                    if (!hh123Socket || !hh123Socket.connected) {
-                        connectRegionalServer();
-                    }
-                }
-            }
-        }, 60000);
-    }
-
-    // ================================
-    // ⚙️ USER SETTINGS
-    // ================================
-    function initUserSettings() {
-        try {
-            // Default settings - all checkboxes checked by default
-            const defaultSettings = {
-                drops: ['Daily1', 'Daily2', 'Daily3', 'DailyOther', 'HighRollers', 'PlaySmarter', 'WeeklyStream', 'OtherDrops'],
-                vault: false,
-                processAll: false, // Added default for new button
-                currency: 'usdt'
-            };
-            // Load saved settings or use defaults
-            userSettings = GM_getValue(FC_USER_SETTINGS) ||
-                defaultSettings;
-
-            // Ensure all required properties exist
-            if (!userSettings.drops) userSettings.drops = defaultSettings.drops;
-            if (!userSettings.vault) userSettings.vault = defaultSettings.vault;
-            if (userSettings.processAll === undefined) userSettings.processAll = defaultSettings.processAll;
-            if (!userSettings.currency) userSettings.currency = defaultSettings.currency;
-            // Set selected currency
-            selectedCurrency = userSettings.currency;
-            // Save settings
-            GM_setValue(FC_USER_SETTINGS, userSettings);
-
-            return userSettings;
-        } catch (error) {
-            addLog(`Error initializing user settings: ${error.message}`, "error");
-            return {
-                drops: ['Daily1', 'Daily2', 'Daily3', 'DailyOther', 'HighRollers', 'PlaySmarter', 'WeeklyStream', 'OtherDrops'],
-                vault: false,
-                processAll: false,
-                currency: 'usdt'
-            };
+        if (vaultCheckbox) {
+            vaultCheckbox.addEventListener('change', (e) => {
+                userSettings = userSettings || {};
+                userSettings.vault = e.target.checked;
+                GM_setValue(FC_USER_SETTINGS, userSettings);
+            });
         }
-    }
 
-    function saveUserSettings() {
-        try {
-            GM_setValue(FC_USER_SETTINGS, userSettings);
-            addLog("Settings saved", "success");
-        } catch (error) {
-            addLog(`Error saving settings: ${error.message}`, "error");
-        }
-    }
-
-    function updateSettingsUI() {
-        // Update checkboxes based on current settings
-        const checkboxes = document.querySelectorAll('.settings-checkbox');
-        checkboxes.forEach(checkbox => {
-            if (checkbox.id === 'vaultDeposit') {
-                checkbox.checked = userSettings.vault || false;
-            } else if (checkbox.id === 'processAll') {
-                checkbox.checked = userSettings.processAll || false;
-            } else if (checkbox.value) {
-                checkbox.checked = userSettings.drops.includes(checkbox.value);
-            }
-        });
-        // Update currency selection
-        const currencySelect = document.getElementById('currencySelect');
         if (currencySelect) {
-            currencySelect.value = userSettings.currency || 'usdt';
+            currencySelect.addEventListener('change', (e) => {
+                selectedCurrency = e.target.value;
+                userSettings = userSettings || {};
+                userSettings.currency = selectedCurrency;
+                GM_setValue(FC_USER_SETTINGS, userSettings);
+            });
         }
-        
-        // Also update network stats if opening
-        updateSettingsStats();
     }
 
     // ================================
-    // 🖼️ UI CONSTRUCTION
+    // 🎨 CREATE PREMIUM UI
     // ================================
-    function createPanel() {
-        // Remove existing panel if any
-        const existing = document.getElementById("kust-panel");
-        if (existing) existing.remove();
+    function createUI() {
+        // Check if UI already exists
+        if (document.getElementById('kust-panel')) return;
 
-        const panel = document.createElement("div");
-        panel.id = "kust-panel";
+        // Load saved settings
+        userSettings = GM_getValue(FC_USER_SETTINGS, null);
+        if (userSettings && userSettings.currency) {
+            selectedCurrency = userSettings.currency;
+        }
+
+        // Create main panel
+        const panel = document.createElement('div');
+        panel.id = 'kust-panel';
         panel.innerHTML = `
             <div class="kust-header">
                 <div class="kust-header-left">
                     <div class="kust-title">KUST CLAIMER</div>
-                    <div id="kust-username" class="kust-username">Guest</div>
+                    <div class="kust-username" id="kust-username">Connecting...</div>
                 </div>
                 <div class="kust-header-right">
-                    <div id="kust-network-bars" class="network-bars" title="Checking Network...">
+                    <div class="network-bars" id="kust-network-bars" title="Network Quality">
                         <div class="net-bar"></div>
                         <div class="net-bar"></div>
                         <div class="net-bar"></div>
                     </div>
-
-                    <div class="kust-settings-btn" id="kust-settings-btn" title="Settings">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <circle cx="12" cy="12" r="3"></circle>
-                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    <div class="kust-settings-btn" onclick="document.getElementById('kust-settings-modal').classList.add('open')">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"/>
+                            <path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
                         </svg>
                     </div>
-                    <div id="kust-status-badge" class="kust-status disconnected">
+                    <div class="kust-status" id="kust-status-badge">
                         <div class="status-dot"></div>
-                        <span id="kust-status-text">Init...</span>
+                        <span id="kust-status-text">Connecting...</span>
                     </div>
                 </div>
             </div>
@@ -3104,377 +3019,135 @@ function getHardcodedSessionToken() {
         `;
         document.body.appendChild(panel);
 
-        // ================================
-        // INJECT NEW 3D FLOATING HUD OVERLAY
-        // ================================
-        const overlay = document.createElement("div");
-        overlay.id = "kust-token-overlay";
-        overlay.innerHTML = `
-            <div class="token-3d-icon">⚡</div>
+        // Create token overlay
+        const tokenOverlay = document.createElement('div');
+        tokenOverlay.id = 'kust-token-overlay';
+        tokenOverlay.innerHTML = `
+            <div class="token-3d-icon">🔐</div>
             <div class="token-3d-text">
-                <span class="token-3d-label">Bypass Ammo</span>
-                <span id="kust-token-count" class="token-3d-value">0/5</span>
+                <div class="token-3d-label">Bypass Tokens</div>
+                <div class="token-3d-value" id="kust-token-count">0/8</div>
             </div>
         `;
-        document.body.appendChild(overlay);
+        document.body.appendChild(tokenOverlay);
 
         // Create settings modal
-        const settingsModal = document.createElement("div");
-        settingsModal.id = "kust-settings-modal";
-        settingsModal.innerHTML = `
-            <div class="kust-settings-popup">
-                <div class="settings-popup-header">
-                    <div class="settings-popup-title">Settings</div>
-                    <div class="settings-popup-close" id="settings-popup-close">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                        </svg>
-                    </div>
-                </div>
-                <div class="settings-popup-content">
-                    
-                    <div class="settings-section">
-                        <div class="settings-section-title">📊 Claim Statistics</div>
-                        <div class="claim-stats-grid">
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Success</span>
-                                <span class="claim-stat-value success" id="stat-success-count">0</span>
-                            </div>
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Failed</span>
-                                <span class="claim-stat-value failed" id="stat-failed-count">0</span>
-                            </div>
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Total Value</span>
-                                <span class="claim-stat-value" id="stat-total-value">$0.00</span>
-                            </div>
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Success Rate</span>
-                                <span class="claim-stat-value" id="stat-success-rate">0%</span>
-                            </div>
-                        </div>
-                    </div>
+        createSettingsModal();
 
-                    <div class="settings-section">
-                        <div class="settings-section-title">Network Intelligence</div>
-                        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
-                            
-                            <div style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
-                                <div style="font-size: 10px; color: var(--kust-accent); text-align: center; margin-bottom: 8px; font-weight: bold; text-transform: uppercase;">Main Server</div>
-                                <div class="net-stats-grid" style="margin-bottom: 0;">
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Latency</span>
-                                        <span class="net-stat-value" id="stat-latency">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Jitter</span>
-                                        <span class="net-stat-value" id="stat-jitter">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Loss (Est)</span>
-                                        <span class="net-stat-value" id="stat-loss">--%</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Status</span>
-                                        <span class="net-stat-value" id="stat-server">--</span>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            <div style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
-                                <div style="font-size: 10px; color: #3b82f6; text-align: center; margin-bottom: 8px; font-weight: bold; text-transform: uppercase;">Regional Routed</div>
-                                <div class="net-stats-grid" style="margin-bottom: 0;">
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Latency</span>
-                                        <span class="net-stat-value" id="stat-latency-reg">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Jitter</span>
-                                        <span class="net-stat-value" id="stat-jitter-reg">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Loss (Est)</span>
-                                        <span class="net-stat-value" id="stat-loss-reg">--%</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Status</span>
-                                        <span class="net-stat-value" id="stat-server-reg">--</span>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                        </div>
-                    </div>
-                
-                    <div class="settings-section">
-                        <div class="settings-section-title">Code Types to Claim</div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="processAll" class="settings-checkbox">
-                            <label for="processAll" class="settings-label" style="color: #00E701; font-weight: bold;">Process ALL Codes (Ignore Filters)</label>
-                        </div>
-                        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin-bottom: 15px;">
+        // Make panel draggable
+        makeDraggable(panel);
 
-                        <div class="settings-option">
-                            <input type="checkbox" id="daily1" class="settings-checkbox" value="Daily1" checked>
-                            <label for="daily1" class="settings-label">Daily $1</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="daily2" class="settings-checkbox" value="Daily2" checked>
-                            <label for="daily2" class="settings-label">Daily $2</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="daily3" class="settings-checkbox" value="Daily3" checked>
-                            <label for="daily3" class="settings-label">Daily $3</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="dailyOther" class="settings-checkbox" value="DailyOther" checked>
-                            <label for="dailyOther" class="settings-label">Daily Other</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="highRollers" class="settings-checkbox" value="HighRollers" checked>
-                            <label for="highRollers" class="settings-label">High Rollers</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="weeklyStream" class="settings-checkbox" value="WeeklyStream" checked>
-                            <label for="weeklyStream" class="settings-label">Weekly Stream Drops</label>
-                        </div>
-                        <div class="settings-option">
-                               <input type="checkbox" id="playSmarter" class="settings-checkbox" value="PlaySmarter" checked>
-                            <label for="playSmarter" class="settings-label">Play Smarter Drops</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="otherDrops" class="settings-checkbox" value="OtherDrops" checked>
-                            <label for="otherDrops" class="settings-label">Other Drops</label>
-                        </div>
-                    </div>
-             
-                    <div class="settings-section">
-                        <div class="settings-section-title">Claim Settings</div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="vaultDeposit" class="settings-checkbox">
-                            <label for="vaultDeposit" class="settings-label">Deposit to Vault</label>
-                        </div>
-                        <div class="settings-option">
-                            <label for="currencySelect" class="settings-label">Currency:</label>
-                        </div>
-                        <select id="currencySelect" class="settings-select">
-                            <option value="btc">BTC</option>
-                            <option value="eth">ETH</option>
-                            <option value="ltc">LTC</option>
-                            <option value="usdt" selected>USDT</option>
-                            <option value="sol">SOL</option>
-                            <option value="doge">DOGE</option>
-                            <option value="xrp">XRP</option>
-                            <option value="trx">TRX</option>
-                            <option value="eos">EOS</option>
-                            <option value="bnb">BNB</option>
-                            <option value="usdc">USDC</option>
-                            <option value="dai">DAI</option>
-                            <option value="link">LINK</option>
-                            <option value="shib">SHIB</option>
-                            <option value="uni">UNI</option>
-                            <option value="pol">POL</option>
-                            <option value="trump">TRUMP</option>
-                        </select>
-                    </div>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(settingsModal);
+        // Update token UI periodically
+        setInterval(updateTokenUI, 1000);
+    }
 
-        // Settings button click handler
-        document.getElementById('kust-settings-btn').addEventListener('click', () => {
-            const settingsModal = document.getElementById('kust-settings-modal');
-            settingsModal.classList.add('open');
+    // ================================
+    // 🖱️ DRAGGABLE FUNCTIONALITY
+    // ================================
+    function makeDraggable(element) {
+        const header = element.querySelector('.kust-header');
+        if (!header) return;
 
-            // Update UI when opening settings
-            updateSettingsUI();
-        });
-        // Settings modal close button
-        document.getElementById('settings-popup-close').addEventListener('click', () => {
-            document.getElementById('kust-settings-modal').classList.remove('open');
-        });
-        // Close modal when clicking outside
-        document.getElementById('kust-settings-modal').addEventListener('click', (e) => {
-            if (e.target.id === 'kust-settings-modal') {
-                document.getElementById('kust-settings-modal').classList.remove('open');
-            }
-        });
-        // Settings checkboxes
-        const settingsCheckboxes = document.querySelectorAll('.settings-checkbox');
-        settingsCheckboxes.forEach(checkbox => {
-            checkbox.addEventListener('change', () => {
-                if (!userSettings.drops) userSettings.drops = [];
-
-                if (checkbox.id === 'vaultDeposit') {
-                    userSettings.vault = checkbox.checked;
-                } else if (checkbox.id === 'processAll') {
-                    userSettings.processAll = checkbox.checked;
-                } else if (checkbox.value) {
-                    if (checkbox.checked && !userSettings.drops.includes(checkbox.value)) {
-                        userSettings.drops.push(checkbox.value);
-                    } else if (!checkbox.checked && userSettings.drops.includes(checkbox.value)) {
-                        const index = userSettings.drops.indexOf(checkbox.value);
-                        userSettings.drops.splice(index, 1);
-                    }
-                }
-                saveUserSettings();
-            });
-        });
-        // Currency select
-        document.getElementById('currencySelect').addEventListener('change', (e) => {
-            selectedCurrency = e.target.value;
-            userSettings.currency = selectedCurrency;
-            saveUserSettings();
-        });
-        // Drag Logic
-        const header = panel.querySelector('.kust-header');
-        let isDragging = false, startX, startY, initialLeft, initialTop;
+        let isDragging = false;
+        let currentX;
+        let currentY;
+        let initialX;
+        let initialY;
+        let xOffset = 0;
+        let yOffset = 0;
 
         header.addEventListener('mousedown', (e) => {
-            if (e.target.closest('.kust-settings-btn')) return;
+            if (e.target.closest('.kust-settings-btn') || e.target.closest('.kust-status')) return;
+            
+            initialX = e.clientX - xOffset;
+            initialY = e.clientY - yOffset;
             isDragging = true;
-            startX = e.clientX;
-            startY = e.clientY;
-            const rect = panel.getBoundingClientRect();
-            initialLeft = rect.left;
-            initialTop = rect.top;
-            panel.style.transition = 'none';
         });
+
         document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
-            panel.style.top = `${initialTop + dy}px`;
-            panel.style.left = `${initialLeft + dx}px`;
-            panel.style.right = 'auto';
+            if (isDragging) {
+                e.preventDefault();
+                currentX = e.clientX - initialX;
+                currentY = e.clientY - initialY;
+
+                xOffset = currentX;
+                yOffset = currentY;
+
+                setTranslate(currentX, currentY, element);
+            }
         });
 
         document.addEventListener('mouseup', () => {
             isDragging = false;
-            panel.style.transition = 'opacity 0.3s ease';
         });
     }
 
-    // ================================
-    // 🌐 REMOTE CONFIG FETCHER
-    // ================================
-    async function fetchRemoteConfig() {
-        return new Promise((resolve, reject) => {
-            updateStatus("disconnected", "Fetching server list...");
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: REMOTE_CONFIG_URL,
-                timeout: 10000,
-                headers: { "Content-Type": "application/json" },
-                onload: (res) => {
-                    try {
-                        const config = JSON.parse(res.responseText);
-                        // The worker returns 'wssUrl' (best one) and 'authUrl' (default)
-                        if (config.wssUrl && config.authUrl) {
-                            WS_SERVER_URL = config.wssUrl;
-                            AUTH_CHECK_URL = config.authUrl;
-                            if (config.regionalUrl) {
-                                HH123_URL = config.regionalUrl;
-                            }
-                            addLog(`nodes list loaded ✨: ${config.meta && config.meta.selected_node_stats !== "Fallback Mode" ? "Optimized" : "Default"}`, "success");
-                            resolve(true);
-                        } else {
-                            reject("Invalid Config Structure");
-                        }
-                    } catch (e) {
-                        reject("Config Parse Error");
-                    }
-                },
-                onerror: () => reject("Config Network Error"),
-                ontimeout: () => reject("Config Timeout")
-            });
-        });
+    function setTranslate(xPos, yPos, el) {
+        el.style.transform = `translate(${xPos}px, ${yPos}px)`;
     }
 
     // ================================
-    // 🔥 INITIALIZATION
+    // 🚀 INITIALIZATION
     // ================================
     async function init() {
-        // --- OPTIMIZATION: PRE-WARM CONNECTIONS ---
-        const preconnect = document.createElement('link');
-        preconnect.rel = 'preconnect';
-        preconnect.href = CURRENT_MIRROR;
-        preconnect.crossOrigin = 'anonymous';
-        document.head.appendChild(preconnect);
-        // ------------------------------------------
+        // Create UI
+        createUI();
 
-        createPanel();
-        addLog("Kust Claimer v2.5 Initialized api", "info");
-        
-        // 🔥 START TURNSTILE EARLY
-        // Give the token cache huge breathing room to fill up before anything else executes
-        turnstileManager.initialize();
+        // Show loading
+        showLoading();
 
-        // Fetch remote configuration
-        try {
-            await fetchRemoteConfig();
-        } catch (e) {
-            addLog(`⚠️ Config Fetch Failed: ${e}. Using default servers.`, "warning");
-            // WS_SERVER_URL and AUTH_CHECK_URL retain their default values defined at the top
-        }
-
-        updateStatus("disconnected", "Fetching User...");
-        
-        // Start AGGRESSIVE WSS Network Stats Polling (runs every 2s)
-        setInterval(activePingCheck, 2000);
-        setInterval(activeRegionalPingCheck, 2000);
-        activePingCheck(); // Initial check
-        activeRegionalPingCheck();
-        
-        // Start Token Power-Up UI Polling for the new 3D Overlay
-        setInterval(updateTokenUI, 500);
-
-        // 1. Initialize user settings
-        initUserSettings();
-        // 2. Get Username
+        // Get user from API
         currentUsername = await getStakeUserFromAPI();
-        if (currentUsername) {
-            
-            // 🚀 GOD TIER OPTIMIZATION: Pre-build the fetch headers once session is known
-            OPTIMIZED_HEADERS = {
-                'Content-Type': 'application/json',
-                'x-access-token': currentSession,
-                'x-operation-name': 'ClaimConditionBonusCode',
-                'x-operation-type': 'query',
-                'Origin': CURRENT_MIRROR,
-                'Referer': window.location.href
-            };
-
-            updateUsername(currentUsername);
-            // 3. (TurnstileManager already initialized above to gain buffer time)
-            
-            // 4. Check Authorization
-            const isAuthorized = await checkAuthorization(currentUsername);
-            // 5. Start Periodic Check (runs every 60s)
-            startSubscriptionCheck();
-            if (isAuthorized) {
-                // Initialize both sockets in parallel
-                connectWebSocket();
-                connectRegionalServer();
-            } else {
-                // Not authorized: Show subscription prompt immediately (no grace period)
-                showSubscriptionPrompt();
-            }
-        } else {
-            addLog("Cannot proceed without a valid Stake username. Please log in.", "error");
-            updateStatus("disconnected", "Login Req.");
+        
+        if (!currentUsername) {
+            hideLoading();
+            addLog("❌ Failed to get username. Please refresh the page.", "error");
+            updateStatus("disconnected", "Auth Failed");
+            return;
         }
+
+        // Update username in UI
+        updateUsername(currentUsername);
+        addLog(`👤 Logged in as: ${currentUsername}`, "info");
+
+        // Check authorization
+        const isAuthorized = await checkAuthorization(currentUsername);
+        if (!isAuthorized) {
+            hideLoading();
+            showSubscriptionPrompt();
+            return;
+        }
+
+        // Restore logs view if subscription prompt was shown
+        restoreLogsView();
+
+        // Initialize turnstile manager
+        await turnstileManager.initialize();
+
+        // Build optimized headers
+        OPTIMIZED_HEADERS = {
+            "Content-Type": "application/json",
+            "x-access-token": currentSession,
+            "x-operation-name": "ClaimConditionBonusCode",
+            "x-operation-type": "query",
+            "Origin": CURRENT_MIRROR,
+            "Referer": window.location.href
+        };
+
+        // Connect to WebSocket servers
+        connectWebSocket();
+        connectRegionalSocket();
+
+        // Start network monitoring
+        setInterval(activePingCheck, 5000);
+        setInterval(activeRegionalPingCheck, 5000);
+
+        // Hide loading
+        hideLoading();
+
+        addLog("✅ System initialized and ready!", "success");
     }
 
-    // Clear claimed codes periodically
-    setInterval(() => {
-        claimedCodes.clear(); // Set clear method
-        processingCodes.clear(); // Also clear processing set
-    }, 3 * 60 * 1000);
-    // Clear every 3 minutes
-
-    // Start
+    // Start the script
     init();
 })();

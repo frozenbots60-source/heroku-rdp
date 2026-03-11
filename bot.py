@@ -3,105 +3,35 @@ import os
 import subprocess
 import sys
 import shutil
-import zipfile
-import json
 
 # ================================
 # CONFIGURATION
 # ================================
-SESSION_TOKEN = os.environ.get('SESSION_TOKEN', '6b4aa7c720e25ec7189a624d3e769979b07d3b3fc9ae65036559f81fb0694bc5e5ecf80bbd82ed7329e32de67887aab2')
-USERNAME = "kustxoxo"
-
 # Paths
 WORKDIR = "/app"
-SOURCE_XPI = os.path.join(WORKDIR, "claimer.xpi")
-EXTENSION_DIR = os.path.join(WORKDIR, "kust_extension")
+EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
 PROFILE_DIR = "/tmp/firefox-profile"
 
 # Firefox System Paths (Standard Ubuntu locations)
 FIREFOX_CFG_PATH = "/usr/lib/firefox/mozilla.cfg"
 AUTOCONFIG_JS_PATH = "/usr/lib/firefox/defaults/pref/autoconfig.js"
 
-def setup_extension():
-    """Unpacks XPI, injects token, and prepares the extension folder."""
+def verify_extension():
+    """Verifies that the claimer folder and manifest exist."""
     print("=" * 60, flush=True)
-    print("[EXTENSION SETUP] Starting extension setup...", flush=True)
+    print("[EXTENSION SETUP] Verifying extension directory...", flush=True)
     print("=" * 60, flush=True)
 
-    # 1. Check if source XPI exists
-    if not os.path.exists(SOURCE_XPI):
-        print(f"[EXTENSION SETUP] ❌ ERROR: {SOURCE_XPI} not found!", flush=True)
+    if not os.path.exists(EXTENSION_DIR):
+        print(f"[EXTENSION SETUP] ❌ ERROR: Directory {EXTENSION_DIR} not found!", flush=True)
         sys.exit(1)
 
-    # 2. Create a clean extension directory
-    if os.path.exists(EXTENSION_DIR):
-        shutil.rmtree(EXTENSION_DIR)
-    os.makedirs(EXTENSION_DIR)
-    print(f"[EXTENSION SETUP] Created extension directory: {EXTENSION_DIR}", flush=True)
-
-    # 3. Unpack the XPI
-    print(f"[EXTENSION SETUP] Unpacking {SOURCE_XPI}...", flush=True)
-    try:
-        with zipfile.ZipFile(SOURCE_XPI, 'r') as zip_ref:
-            zip_ref.extractall(EXTENSION_DIR)
-        print("[EXTENSION SETUP] ✓ Unpacked successfully.", flush=True)
-    except Exception as e:
-        print(f"[EXTENSION SETUP] ❌ ERROR unpacking: {e}", flush=True)
-        sys.exit(1)
-
-    # 4. Force ID in Manifest (Required for auto-loading)
     manifest_path = os.path.join(EXTENSION_DIR, "manifest.json")
-    try:
-        with open(manifest_path, "r") as f:
-            manifest = json.load(f)
-        
-        # Define our specific ID
-        ext_id = "kust-claimer@bot.com"
-        
-        # Add browser_specific_settings if not present
-        if "browser_specific_settings" not in manifest:
-            manifest["browser_specific_settings"] = {}
-        if "gecko" not in manifest["browser_specific_settings"]:
-            manifest["browser_specific_settings"]["gecko"] = {}
-            
-        manifest["browser_specific_settings"]["gecko"]["id"] = ext_id
-        
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2)
-            
-        print(f"[EXTENSION SETUP] ✓ Forced extension ID in manifest: {ext_id}", flush=True)
-    except Exception as e:
-        print(f"[EXTENSION SETUP] ⚠️ Warning: Could not modify manifest.json: {e}", flush=True)
+    if not os.path.exists(manifest_path):
+        print(f"[EXTENSION SETUP] ❌ ERROR: manifest.json not found inside {EXTENSION_DIR}!", flush=True)
+        sys.exit(1)
 
-    # 5. Process the JS script (Inject Token and Username)
-    js_files = [f for f in os.listdir(EXTENSION_DIR) if f.endswith('.js') and 'background' not in f.lower()]
-    
-    if not js_files:
-        print("[EXTENSION SETUP] ⚠️ Warning: No content script found to inject.", flush=True)
-    else:
-        # Inject into the first found content script
-        target_js = js_files[0]
-        js_path = os.path.join(EXTENSION_DIR, target_js)
-        
-        print(f"[EXTENSION SETUP] Injecting config into: {target_js}", flush=True)
-
-        with open(js_path, "r") as f:
-            script_content = f.read()
-        
-        inject_config = f"""
-    // --- AUTO INJECTED CONFIG ---
-    window.KustClaimerConfig = {{ SESSION_TOKEN: '{SESSION_TOKEN}', USERNAME: '{USERNAME}' }};
-    // ----------------------------
-    """
-        
-        final_script = inject_config + script_content
-        
-        with open(js_path, "w") as f:
-            f.write(final_script)
-        
-        print(f"[EXTENSION SETUP] ✓ Token and Username injected.", flush=True)
-    
-    print("\n[EXTENSION SETUP] ✓ Extension setup complete!", flush=True)
+    print(f"[EXTENSION SETUP] ✓ Extension folder ready at: {EXTENSION_DIR}", flush=True)
     print("=" * 60, flush=True)
 
 def setup_autoconfig():
@@ -141,23 +71,22 @@ def main():
     print("=" * 60, flush=True)
     print(f"Working Directory: {WORKDIR}", flush=True)
     print(f"Profile Directory: {PROFILE_DIR}", flush=True)
-    print(f"Session Token: {SESSION_TOKEN[:20]}...", flush=True)
-    print(f"Username: {USERNAME}", flush=True)
     print("=" * 60 + "\n", flush=True)
     
     print("[MAIN] Waiting for Xvfb...", flush=True)
     time.sleep(5)
     print("[MAIN] ✓ Xvfb should be ready", flush=True)
 
-    # 1. Setup the extension
-    setup_extension()
+    # 1. Verify the extension folder exists
+    verify_extension()
 
-    # 2. Setup AutoConfig (Force load extension)
+    # 2. Setup AutoConfig (Force load extension from /app/claimer)
     setup_autoconfig()
 
-    # 3. Create Profile Directory
-    if not os.path.exists(PROFILE_DIR):
-        os.makedirs(PROFILE_DIR)
+    # 3. Create Clean Profile Directory
+    if os.path.exists(PROFILE_DIR):
+        shutil.rmtree(PROFILE_DIR)
+    os.makedirs(PROFILE_DIR)
 
     # 4. Write Preferences
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
@@ -207,11 +136,12 @@ def main():
         "--display=:0",
         f"--profile={PROFILE_DIR}",
         "--no-remote",
-        "--no-sandbox"  # CRITICAL: Fixes the EPERM/Sandbox error on Heroku
+        "--no-sandbox"  # CRITICAL: Fixes the EPERM/Sandbox error
     ]
     
     print(f"[MAIN] Firefox command: {' '.join(cmd)}", flush=True)
 
+    # Pass the DISPLAY environment variable so it renders on your VNC screen
     process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
     
     print("\n" + "=" * 60, flush=True)
@@ -220,7 +150,6 @@ def main():
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
     print(f"  Target URL: https://stake.com/settings/offers", flush=True)
-    print(f"  Session Token: {SESSION_TOKEN[:20]}...", flush=True)
     print("=" * 60 + "\n", flush=True)
     
     try:

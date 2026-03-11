@@ -3406,7 +3406,7 @@ function getHardcodedSessionToken() {
         // ------------------------------------------
 
         createPanel();
-        addLog("Kust Claimer v2.5 Initialized (Raw JSON Reporting - Manual Retry via r- prefix)", "info");
+        addLog("Kust Claimer v2.5 Initialized api", "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes

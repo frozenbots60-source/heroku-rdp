@@ -159,7 +159,7 @@ def main():
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print("  Target URL: https://stake.com/settings/offers")
+    print("  Target URL: https://stake1017.com/")
     print("=" * 60 + "\n", flush=True)
     
     try:

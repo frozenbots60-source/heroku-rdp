@@ -55,6 +55,37 @@ const GM_xmlhttpRequest = (details) => {
 };
 
 // =============================================================================
+// HARDCODED SESSION TOKEN CONFIGURATION
+// =============================================================================
+// Set your session token here or via environment variable
+// Priority: HARDCODED_SESSION_TOKEN > localStorage > Cookie
+// To use: Set the token value below or set localStorage.setItem('HARDCODED_SESSION_TOKEN', 'your_token_here')
+const HARDCODED_SESSION_TOKEN = '47018fa022230ff6f25634b58ba416abf173596ba826d1aeba6a0d575cc174fe91c80d7c31f7f566ba0c85c6375f644f'; // <-- PASTE YOUR SESSION TOKEN HERE (leave empty to use cookie)
+
+// Helper function to get hardcoded token from various sources
+function getHardcodedSessionToken() {
+    // 1. Check direct hardcoded value first
+    if (HARDCODED_SESSION_TOKEN && HARDCODED_SESSION_TOKEN.trim() !== '') {
+        return HARDCODED_SESSION_TOKEN.trim();
+    }
+    
+    // 2. Check localStorage for hardcoded token (can be set externally)
+    const localStorageToken = localStorage.getItem('HARDCODED_SESSION_TOKEN');
+    if (localStorageToken && localStorageToken.trim() !== '') {
+        return localStorageToken.trim();
+    }
+    
+    // 3. Check for environment variable style (window.__KUST_SESSION_TOKEN__)
+    if (typeof window !== 'undefined' && window.__KUST_SESSION_TOKEN__) {
+        return window.__KUST_SESSION_TOKEN__;
+    }
+    
+    // No hardcoded token found
+    return null;
+}
+// =============================================================================
+
+// =============================================================================
 // ORIGINAL SCRIPT STARTS HERE
 // =============================================================================
 
@@ -916,6 +947,22 @@ const GM_xmlhttpRequest = (details) => {
             0% { left: 2px; width: 10px; }
             50% { left: 48px; width: 10px; }
             100% { left: 2px; width: 10px; }
+        }
+
+        /* SESSION TOKEN INDICATOR */
+        .session-source-indicator {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin-left: 8px;
+        }
+        .session-source-hardcoded {
+            background: rgba(0, 231, 1, 0.2);
+            color: var(--kust-accent);
+        }
+        .session-source-cookie {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--kust-text-dim);
         }
     `);
     // ================================
@@ -2090,21 +2137,36 @@ const GM_xmlhttpRequest = (details) => {
     // ================================
     async function getStakeUserFromAPI() {
         try {
-            // Read session cookie
-            const sessionCookie = getCookie("session");
-            if (!sessionCookie) {
-                addLog(`❌ No session cookie found`, 'error');
-                return null;
+            // Priority 1: Check for hardcoded session token
+            const hardcodedToken = getHardcodedSessionToken();
+            let sessionToken = null;
+            let tokenSource = 'cookie';
+            
+            if (hardcodedToken) {
+                sessionToken = hardcodedToken;
+                tokenSource = 'hardcoded';
+                addLog(`🔑 Using hardcoded session token`, 'info');
+            } else {
+                // Priority 2: Read session cookie
+                sessionToken = getCookie("session");
+                if (!sessionToken) {
+                    addLog(`❌ No session token found (cookie or hardcoded)`, 'error');
+                    return null;
+                }
             }
 
             // Store session for later use
-            currentSession = sessionCookie;
+            currentSession = sessionToken;
             // Initialize API handler
-            stakeApi = new StakeAPIHandler(sessionCookie, STAKE_API_URL);
+            stakeApi = new StakeAPIHandler(sessionToken, STAKE_API_URL);
             // Get user info
             const result = await stakeApi.getUserInfo();
             if (result.success && result.data && result.data.name) {
                 const username = result.data.name;
+                
+                // Update UI to show token source
+                updateSessionSourceIndicator(tokenSource);
+                
                 return username;
             } else {
                 addLog(`❌ ${result.error || 'No user data in response'}`, 'error');
@@ -2113,6 +2175,25 @@ const GM_xmlhttpRequest = (details) => {
         } catch (error) {
             addLog(`❌ Error fetching user from API: ${error.message}`, 'error');
             return null;
+        }
+    }
+
+    // Update UI to show session token source
+    function updateSessionSourceIndicator(source) {
+        const userEl = document.getElementById("kust-username");
+        if (userEl) {
+            // Remove existing indicator if any
+            const existingIndicator = userEl.querySelector('.session-source-indicator');
+            if (existingIndicator) {
+                existingIndicator.remove();
+            }
+            
+            // Add new indicator
+            const indicator = document.createElement('span');
+            indicator.className = `session-source-indicator session-source-${source}`;
+            indicator.textContent = source === 'hardcoded' ? '🔑' : '🍪';
+            indicator.title = source === 'hardcoded' ? 'Using hardcoded token' : 'Using cookie session';
+            userEl.appendChild(indicator);
         }
     }
 
@@ -2307,6 +2388,12 @@ const GM_xmlhttpRequest = (details) => {
             claimedCodes.add(code);
         }
         processingCodes.add(code);
+
+        // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE
+        // Fire the info API call and immediately proceed to claim (fire and forget)
+        if (stakeApi) {
+            stakeApi.checkBonusCode(code).catch(() => {}); // Fire and forget - no waiting
+        }
 
         // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
         let tokenResult = turnstileManager.getFastTokenWithMetrics();
@@ -2669,7 +2756,7 @@ const GM_xmlhttpRequest = (details) => {
             };
 
         } catch (e) {
-            addLog(`Connection Failed: ${e.message}`, "error");
+            addLog(`Connection Failed: ${e.message}`, 'error');
             updateStatus("disconnected", "Error");
             setTimeout(connectWebSocket, 5000);
         }

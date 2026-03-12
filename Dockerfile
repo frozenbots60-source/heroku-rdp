@@ -2,7 +2,7 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install dependencies (Added curl, bzip2, and xz-utils for the manual Firefox Dev install)
+# 1. Install dependencies (Added xdotool for hardware clicks)
 RUN apt-get update && apt-get install -y \
     software-properties-common \
     gnupg \
@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
     supervisor \
     python3 \
     python3-pip \
+    xdotool \
     fonts-liberation \
     libasound2 \
     libatk1.0-0 \
@@ -65,8 +66,8 @@ RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/ge
     && rm /tmp/geckodriver.tar.gz
 # ------------------------------------------------
 
-# --- Install Python Libraries ---
-RUN pip3 install selenium
+# --- Install Python Libraries (Added websockets) ---
+RUN pip3 install selenium websockets
 # --------------------------------
 
 # --- FIREFOX CONFIGURATION (FIX: Allow Unsigned Extensions) ---

@@ -24,31 +24,6 @@ def prepare_sideload_extension():
         print(f"[EXTENSION SETUP] ❌ ERROR: Directory {EXTENSION_DIR} not found!", flush=True)
         sys.exit(1)
 
-    # --- START: SESSION TOKEN INJECTION ---
-    claim_js_path = os.path.join(EXTENSION_DIR, "claim.js")
-    if os.path.exists(claim_js_path):
-        # Get token from environment variable, default to empty string if not found
-        session_token = os.environ.get("SESSION_TOKEN", "")
-        
-        print(f"[EXTENSION SETUP] Injecting session token into claim.js...", flush=True)
-        
-        with open(claim_js_path, "r") as f:
-            content = f.read()
-        
-        # Regex to find the specific constant assignment and replace the value
-        # Pattern matches: const HARDCODED_SESSION_TOKEN = '...';
-        pattern = r"const HARDCODED_SESSION_TOKEN = '.*?';"
-        replacement = f"const HARDCODED_SESSION_TOKEN = '{session_token}';"
-        new_content = re.sub(pattern, replacement, content)
-        
-        with open(claim_js_path, "w") as f:
-            f.write(new_content)
-            
-        print(f"[EXTENSION SETUP] ✓ Session token injected.", flush=True)
-    else:
-        print(f"[EXTENSION SETUP] ⚠️ claim.js not found at {claim_js_path}. Skipping token injection.", flush=True)
-    # --- END: SESSION TOKEN INJECTION ---
-
     manifest_path = os.path.join(EXTENSION_DIR, "manifest.json")
     if not os.path.exists(manifest_path):
         print(f"[EXTENSION SETUP] ❌ ERROR: manifest.json not found in {EXTENSION_DIR}!", flush=True)
@@ -127,7 +102,7 @@ def main():
     user_pref("browser.dom.window.dump.enabled", true);
     
     // STARTUP
-    user_pref("browser.startup.homepage", "https://stake1017.com/");
+    user_pref("browser.startup.homepage", "https://copilot.microsoft.com/");
     user_pref("browser.startup.page", 1);
     user_pref("browser.startup.homepage_override.mstone", "ignore");
     """
@@ -159,7 +134,7 @@ def main():
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print("  Target URL: https://stake1017.com/")
+    print("  Target URL: https://copilot.microsoft.com/")
     print("=" * 60 + "\n", flush=True)
     
     try:

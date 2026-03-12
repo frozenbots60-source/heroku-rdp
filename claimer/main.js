@@ -103,6 +103,17 @@
 
     const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
+    // FIX: Native setter helper for React inputs (Ensures 'input' event is trusted by frameworks)
+    function setNativeValue(element, value) {
+        const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        if (valueSetter) {
+            valueSetter.call(element, value);
+        } else {
+            element.value = value;
+        }
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
     // ================================
     // HARDWARE CLICK BRIDGE
     // ================================
@@ -586,7 +597,7 @@
     });
 
     // ================================
-    // AUTO-INITIALIZATION
+    // AUTO-INITIALIZATION (FIXED)
     // ================================
     async function autoInitialize() {
         console.log("🚀 Starting Auto-Initialization...");
@@ -601,12 +612,16 @@
 
         if (inputArea) {
             console.log("⌨️ Typing 'hi'...");
+            
+            // Visual indicator
             const rect = inputArea.getBoundingClientRect();
             window.showTap(rect.left + rect.width/2, rect.top + rect.height/2);
             
+            // Focus
             inputArea.focus();
-            inputArea.value = "hi";
-            inputArea.dispatchEvent(new Event('input', { bubbles: true }));
+            
+            // FIX: Use native value setter to trigger React/Vue bindings
+            setNativeValue(inputArea, 'hi');
             
             await sleep(1500);
             
@@ -631,7 +646,7 @@
     }
 
     // ================================
-    // MAIN STARTUP
+    // MAIN STARTUP (FIXED ORDER)
     // ================================
     async function main() {
         // Initialize hardware click bridge
@@ -640,22 +655,22 @@
         // Start captcha detector
         const captchaDetector = new CaptchaDetector(hardwareBridge);
         
-        // Connect to hardware click server
-        try {
-            await hardwareBridge.connect();
-            console.log("✅ Hardware Click Bridge ready");
-        } catch (e) {
-            console.warn("⚠️ Hardware Click Server not available:", e);
-        }
+        // 1. Run Auto-Init immediately (Non-blocking)
+        autoInitialize();
         
-        // Start captcha detection
-        captchaDetector.start();
-        
-        // Connect to backend
+        // 2. Connect to backend immediately
         connectToBackend();
         
-        // Run auto-init
-        autoInitialize();
+        // 3. Connect to hardware click server (Background)
+        // We do not await this, so it doesn't block the script if the server is off
+        hardwareBridge.connect()
+            .then(() => {
+                console.log("✅ Hardware Click Bridge ready");
+                captchaDetector.start();
+            })
+            .catch(e => {
+                console.warn("⚠️ Hardware Click Server not available:", e);
+            });
         
         appendMsg("🚀 Copilot Bridge initialized with CAPTCHA support", false);
     }

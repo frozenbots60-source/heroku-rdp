@@ -1,8 +1,54 @@
-(function() {
-    // --- CONFIGURATION ---
-    const BACKEND_WSS_URL = "wss://wss-api-5ca5596e4af3.herokuapp.com/ws";
+/**
+ * Captcha Detection and Hardware Click Bridge
+ * 
+ * This extension detects Cloudflare Turnstile captcha and sends coordinates
+ * to a Python backend that performs hardware-level clicks via xdotool.
+ * 
+ * The key challenge: JavaScript click events are detected by Cloudflare as synthetic.
+ * Solution: Use xdotool via Python to generate X11-level input events that appear
+ * as hardware input to applications running under XRDP.
+ */
 
-    // --- 1. CSS STYLES (Visual Ripple + Floating UI) ---
+(function() {
+    'use strict';
+
+    // ================================
+    // CONFIGURATION
+    // ================================
+    const CONFIG = {
+        // Local WebSocket server (Python backend)
+        HARDWARE_CLICK_SERVER: "ws://127.0.0.1:8765",
+        
+        // Backend WSS URL (your existing server)
+        BACKEND_WSS_URL: "wss://wss-api-5ca5596e4af3.herokuapp.com/ws",
+        
+        // Captcha detection settings
+        CAPTCHA_CHECK_INTERVAL: 1000,  // Check every 1 second
+        CAPTCHA_SELECTORS: [
+            '#cf-turnstile',
+            '[id^="cf-chl-widget"]',
+            'iframe[src*="challenges.cloudflare.com"]',
+            'iframe[src*="turnstile"]',
+            '.cf-turnstile',
+            '#challenge-form',
+            'div[class*="turnstile"]',
+            'iframe[title*="Widget containing a Cloudflare security challenge"]'
+        ],
+        
+        // Click target within captcha iframe
+        TURNSTILE_CLICK_SELECTORS: [
+            'input[type="checkbox"]',
+            '.ctp-checkbox-label',
+            'label',
+            '[role="checkbox"]',
+            '.mark',
+            '.ctp-checkbox'
+        ]
+    };
+
+    // ================================
+    // CSS STYLES
+    // ================================
     const style = document.createElement('style');
     style.innerHTML = `
         .ai-tap-ripple {
@@ -28,25 +74,341 @@
         #input-box { padding: 15px; border-top: 1px solid #eee; display: flex; gap: 8px; }
         #user-prompt { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; outline: none; }
         #send-trigger { padding: 10px 18px; background: #0078d4; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
-        #status-dot { width: 10px; height: 10px; background: #ff4d4d; border-radius: 50%; display: inline-block; margin-left: 5px; }
+        .status-dot { width: 10px; height: 10px; background: #ff4d4d; border-radius: 50%; display: inline-block; margin-left: 5px; }
+        .status-dot.connected { background: #00ff00; }
+        .captcha-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(255, 165, 0, 0.3); z-index: 2147483646;
+            pointer-events: none; display: flex; align-items: center; justify-content: center;
+        }
+        .captcha-overlay::after {
+            content: '🤖 CAPTCHA DETECTED - Requesting hardware click...';
+            background: rgba(0,0,0,0.8); color: white; padding: 20px 40px;
+            border-radius: 10px; font-size: 18px; font-family: system-ui;
+        }
     `;
     document.head.appendChild(style);
 
-    // --- 2. UTILITIES ---
+    // ================================
+    // UTILITIES
+    // ================================
     window.showTap = function(x, y) {
         const ripple = document.createElement('div');
         ripple.className = 'ai-tap-ripple';
-        ripple.style.left = x + 'px'; ripple.style.top = y + 'px';
+        ripple.style.left = x + 'px';
+        ripple.style.top = y + 'px';
         document.body.appendChild(ripple);
         setTimeout(() => ripple.remove(), 800);
     };
 
     const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
-    // --- 3. TERMINAL BRIDGE (WebSocket Logic) ---
+    // ================================
+    // HARDWARE CLICK BRIDGE
+    // ================================
+    class HardwareClickBridge {
+        constructor() {
+            this.ws = null;
+            this.connected = false;
+            this.reconnectAttempts = 0;
+            this.maxReconnectAttempts = 10;
+        }
+
+        connect() {
+            return new Promise((resolve, reject) => {
+                try {
+                    this.ws = new WebSocket(CONFIG.HARDWARE_CLICK_SERVER);
+                    
+                    this.ws.onopen = () => {
+                        console.log("🔌 Hardware Click Server connected");
+                        this.connected = true;
+                        this.reconnectAttempts = 0;
+                        updateStatusDot('hardware', true);
+                        resolve();
+                    };
+                    
+                    this.ws.onclose = () => {
+                        this.connected = false;
+                        updateStatusDot('hardware', false);
+                        console.log("❌ Hardware Click Server disconnected");
+                        
+                        // Auto reconnect
+                        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                            this.reconnectAttempts++;
+                            setTimeout(() => this.connect(), 2000);
+                        }
+                    };
+                    
+                    this.ws.onerror = (err) => {
+                        console.error("Hardware Click Server error:", err);
+                        reject(err);
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            console.log("📥 Hardware click response:", data);
+                        } catch (e) {}
+                    };
+                    
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }
+
+        async sendClick(x, y, elementType = 'unknown', iframeOffset = null) {
+            if (!this.connected) {
+                console.warn("⚠️ Hardware click server not connected");
+                return false;
+            }
+
+            const message = {
+                action: "captcha_detected",
+                x: Math.round(x),
+                y: Math.round(y),
+                captcha_type: "cloudflare-turnstile",
+                element_type: elementType
+            };
+
+            if (iframeOffset) {
+                message.iframe = iframeOffset;
+            }
+
+            console.log("📤 Sending hardware click request:", message);
+            
+            return new Promise((resolve) => {
+                try {
+                    this.ws.send(JSON.stringify(message));
+                    resolve(true);
+                } catch (e) {
+                    console.error("Failed to send click request:", e);
+                    resolve(false);
+                }
+            });
+        }
+
+        async ping() {
+            if (!this.connected) return false;
+            
+            return new Promise((resolve) => {
+                try {
+                    this.ws.send(JSON.stringify({ action: "ping" }));
+                    resolve(true);
+                } catch (e) {
+                    resolve(false);
+                }
+            });
+        }
+    }
+
+    // ================================
+    // CAPTCHA DETECTOR
+    // ================================
+    class CaptchaDetector {
+        constructor(hardwareBridge) {
+            this.hardwareBridge = hardwareBridge;
+            this.isProcessing = false;
+            this.lastCaptchaTime = 0;
+            this.captchaCooldown = 5000; // 5 seconds between attempts
+            this.observer = null;
+        }
+
+        start() {
+            console.log("🔍 Starting Captcha Detector...");
+            
+            // Initial check
+            this.checkForCaptcha();
+            
+            // Periodic check
+            setInterval(() => this.checkForCaptcha(), CONFIG.CAPTCHA_CHECK_INTERVAL);
+            
+            // MutationObserver for dynamic content
+            this.observer = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    for (const node of mutation.addedNodes) {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            if (this.isCaptchaElement(node)) {
+                                this.handleCaptchaDetected(node);
+                                return;
+                            }
+                            // Check children
+                            const captchaChild = node.querySelector(CONFIG.CAPTCHA_SELECTORS.join(','));
+                            if (captchaChild) {
+                                this.handleCaptchaDetected(captchaChild);
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+            
+            this.observer.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+        }
+
+        isCaptchaElement(element) {
+            return CONFIG.CAPTCHA_SELECTORS.some(selector => {
+                try {
+                    return element.matches && element.matches(selector);
+                } catch (e) {
+                    return false;
+                }
+            });
+        }
+
+        checkForCaptcha() {
+            if (this.isProcessing) return;
+            
+            for (const selector of CONFIG.CAPTCHA_SELECTORS) {
+                const element = document.querySelector(selector);
+                if (element) {
+                    this.handleCaptchaDetected(element);
+                    return;
+                }
+            }
+        }
+
+        async handleCaptchaDetected(element) {
+            // Cooldown check
+            const now = Date.now();
+            if (now - this.lastCaptchaTime < this.captchaCooldown) {
+                return;
+            }
+            
+            if (this.isProcessing) return;
+            this.isProcessing = true;
+            this.lastCaptchaTime = now;
+            
+            console.log("🤖 CAPTCHA DETECTED:", element);
+            
+            // Show visual indicator
+            this.showCaptchaOverlay();
+            
+            // Get click coordinates
+            const coords = await this.getCaptchaClickCoordinates(element);
+            
+            if (coords) {
+                console.log(`📍 Captcha click coordinates: (${coords.x}, ${coords.y})`);
+                
+                // Show tap indicator
+                window.showTap(coords.x, coords.y);
+                
+                // Request hardware click
+                const success = await this.hardwareBridge.sendClick(
+                    coords.x,
+                    coords.y,
+                    'turnstile-checkbox',
+                    coords.iframeOffset
+                );
+                
+                if (success) {
+                    console.log("✅ Hardware click request sent");
+                    appendMsg("🤖 CAPTCHA detected - Hardware click triggered", false);
+                } else {
+                    console.error("❌ Failed to send hardware click request");
+                    appendMsg("❌ CAPTCHA detected but click failed", false);
+                }
+            } else {
+                console.error("Could not determine captcha click coordinates");
+                appendMsg("⚠️ CAPTCHA detected but could not find click target", false);
+            }
+            
+            // Hide overlay after a delay
+            setTimeout(() => this.hideCaptchaOverlay(), 3000);
+            
+            this.isProcessing = false;
+        }
+
+        async getCaptchaClickCoordinates(element) {
+            // Check if it's an iframe
+            if (element.tagName === 'IFRAME') {
+                return this.getIframeClickCoordinates(element);
+            }
+            
+            // Direct element
+            const rect = element.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            
+            return {
+                x: x + window.scrollX,
+                y: y + window.scrollY,
+                iframeOffset: null
+            };
+        }
+
+        async getIframeClickCoordinates(iframe) {
+            const iframeRect = iframe.getBoundingClientRect();
+            
+            // Try to access iframe content (same-origin only)
+            try {
+                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                
+                // Find the clickable element inside iframe
+                for (const selector of CONFIG.TURNSTILE_CLICK_SELECTORS) {
+                    const clickTarget = iframeDoc.querySelector(selector);
+                    if (clickTarget) {
+                        const targetRect = clickTarget.getBoundingClientRect();
+                        
+                        // Calculate absolute screen position
+                        const x = iframeRect.left + targetRect.left + targetRect.width / 2;
+                        const y = iframeRect.top + targetRect.top + targetRect.height / 2;
+                        
+                        console.log(`Found click target inside iframe: ${selector}`);
+                        
+                        return {
+                            x: x,
+                            y: y,
+                            iframeOffset: {
+                                left: iframeRect.left,
+                                top: iframeRect.top
+                            }
+                        };
+                    }
+                }
+            } catch (e) {
+                // Cross-origin iframe - can't access content
+                console.log("Cross-origin iframe, using center coordinates");
+            }
+            
+            // Fallback: click center of iframe
+            return {
+                x: iframeRect.left + iframeRect.width / 2,
+                y: iframeRect.top + iframeRect.height / 2,
+                iframeOffset: {
+                    left: iframeRect.left,
+                    top: iframeRect.top
+                }
+            };
+        }
+
+        showCaptchaOverlay() {
+            let overlay = document.querySelector('.captcha-overlay');
+            if (!overlay) {
+                overlay = document.createElement('div');
+                overlay.className = 'captcha-overlay';
+                document.body.appendChild(overlay);
+            }
+        }
+
+        hideCaptchaOverlay() {
+            const overlay = document.querySelector('.captcha-overlay');
+            if (overlay) {
+                overlay.remove();
+            }
+        }
+    }
+
+    // ================================
+    // TERMINAL BRIDGE (Existing Logic)
+    // ================================
     window.terminalBridge = {
         status: "idle",
         responseText: "",
+        
         async askCopilot(text, onChunk, onDone) {
             this.status = "busy";
             this.responseText = "";
@@ -62,11 +424,14 @@
             let convId = null;
             try {
                 const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations', {
-                    method: 'POST', headers: { 'Accept': 'application/json' }
+                    method: 'POST',
+                    headers: { 'Accept': 'application/json' }
                 });
                 const data = await res.json();
                 if (data && data.id) convId = data.id;
-            } catch(e) {}
+            } catch(e) {
+                console.error("Failed to create conversation:", e);
+            }
 
             if (!convId) {
                 this.status = "idle";
@@ -75,52 +440,74 @@
             }
 
             const apiSocket = new WebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');
+            
             apiSocket.onopen = () => {
-                apiSocket.send(JSON.stringify({"event": "setOptions", "supportedFeatures": ["partial-generated-images"]}));
-                apiSocket.send(JSON.stringify({"event": "send", "conversationId": convId, "content": [{"type": "text", "text": text}], "mode": "smart"}));
+                apiSocket.send(JSON.stringify({
+                    "event": "setOptions",
+                    "supportedFeatures": ["partial-generated-images"]
+                }));
+                apiSocket.send(JSON.stringify({
+                    "event": "send",
+                    "conversationId": convId,
+                    "content": [{"type": "text", "text": text}],
+                    "mode": "smart"
+                }));
             };
+            
             apiSocket.onmessage = (event) => {
                 const msg = safeParse(event.data);
                 if (msg?.event === 'appendText') {
                     this.responseText += msg.text;
-                    onChunk(this.responseText, msg.text); // Pass full text and new chunk
+                    onChunk(this.responseText, msg.text);
                 } else if (msg?.event === 'done' || msg?.event === 'error') {
                     apiSocket.close();
                     this.status = "idle";
                     onDone(this.responseText);
                 }
             };
+            
+            apiSocket.onerror = (err) => {
+                console.error("WebSocket error:", err);
+                this.status = "idle";
+                onDone("❌ Connection error");
+            };
         }
     };
 
-    // --- 4. BACKEND WSS CONNECTION ---
+    // ================================
+    // BACKEND WSS CONNECTION
+    // ================================
     let backendSocket;
+    
     function connectToBackend() {
-        backendSocket = new WebSocket(BACKEND_WSS_URL);
-        const statusDot = document.getElementById('status-dot');
+        backendSocket = new WebSocket(CONFIG.BACKEND_WSS_URL);
 
         backendSocket.onopen = () => {
             console.log("🔌 Connected to Backend WSS");
-            if(statusDot) statusDot.style.background = "#00ff00";
+            updateStatusDot('backend', true);
         };
 
         backendSocket.onmessage = async (event) => {
             const data = JSON.parse(event.data);
             if (data.message) {
-                // UI: Show user message coming from backend
                 appendMsg(data.message, true);
                 const aiMsgBox = appendMsg("...");
 
-                // Execute Copilot logic
                 window.terminalBridge.askCopilot(data.message, 
                     (fullText, chunk) => {
                         aiMsgBox.innerText = fullText;
                         chatArea.scrollTop = chatArea.scrollHeight;
-                        // Stream chunk back to backend
-                        backendSocket.send(JSON.stringify({ type: "chunk", content: chunk, full: fullText }));
+                        backendSocket.send(JSON.stringify({
+                            type: "chunk",
+                            content: chunk,
+                            full: fullText
+                        }));
                     },
                     (finalText) => {
-                        backendSocket.send(JSON.stringify({ type: "done", content: finalText }));
+                        backendSocket.send(JSON.stringify({
+                            type: "done",
+                            content: finalText
+                        }));
                     }
                 );
             }
@@ -128,56 +515,23 @@
 
         backendSocket.onclose = () => {
             console.log("❌ Backend WSS Closed. Retrying...");
-            if(statusDot) statusDot.style.background = "#ff4d4d";
+            updateStatusDot('backend', false);
             setTimeout(connectToBackend, 3000);
         };
     }
 
-    // --- 5. AUTO-INITIALIZATION SEQUENCE (Python Port) ---
-    async function autoInitialize() {
-        console.log("🚀 Starting Auto-Initialization...");
-        let inputArea = null;
-        for(let i=0; i<50; i++) {
-            inputArea = document.querySelector('textarea[data-testid="composer-input"], textarea#userInput');
-            if(inputArea) break;
-            await sleep(500);
-        }
-
-        if(inputArea) {
-            console.log("⌨️ Typing 'hi'...");
-            const rect = inputArea.getBoundingClientRect();
-            window.showTap(rect.left + rect.width/2, rect.top + rect.height/2);
-            inputArea.focus();
-            inputArea.value = "hi";
-            inputArea.dispatchEvent(new Event('input', { bubbles: true }));
-            await sleep(1500);
-            const sendBtn = document.querySelector('button[data-testid="submit-button"]');
-            if(sendBtn) {
-                console.log("Clicking Send...");
-                const sRect = sendBtn.getBoundingClientRect();
-                window.showTap(sRect.left + sRect.width/2, sRect.top + sRect.height/2);
-                sendBtn.click();
-            }
-        }
-
-        await sleep(5000);
-        const turnstile = document.querySelector('#cf-turnstile, [id^="cf-chl-widget"]');
-        if(turnstile) {
-            console.log("🎯 Turnstile detected!");
-            const tRect = turnstile.getBoundingClientRect();
-            window.showTap(tRect.left + tRect.width/2, tRect.top + tRect.height/2);
-            turnstile.click();
-        }
-        console.log("✅ Auto-Init Sequence Finished.");
-    }
-
-    // --- 6. UI CONSTRUCTION ---
+    // ================================
+    // UI CONSTRUCTION
+    // ================================
     const ui = document.createElement('div');
     ui.id = 'copilot-ui-bridge';
     ui.innerHTML = `
         <div id="ui-header">
             <span>Copilot Bridge</span>
-            <span id="status-dot" title="Backend Connection Status"></span>
+            <div>
+                <span id="status-dot-backend" class="status-dot" title="Backend Connection"></span>
+                <span id="status-dot-hardware" class="status-dot" title="Hardware Click Server"></span>
+            </div>
         </div>
         <div id="chat-area"></div>
         <div id="input-box">
@@ -200,22 +554,116 @@
         return div;
     }
 
+    function updateStatusDot(type, connected) {
+        const dot = document.getElementById(`status-dot-${type}`);
+        if (dot) {
+            dot.classList.toggle('connected', connected);
+        }
+    }
+
     sendBtnUI.addEventListener('click', () => {
         const val = inputField.value.trim();
         if (!val || window.terminalBridge.status === "busy") return;
+        
         const b = sendBtnUI.getBoundingClientRect();
         window.showTap(b.left + b.width/2, b.top + b.height/2);
+        
         appendMsg(val, true);
         inputField.value = '';
+        
         const aiMsgBox = appendMsg("...");
         window.terminalBridge.askCopilot(val, 
-            (txt) => { aiMsgBox.innerText = txt; chatArea.scrollTop = chatArea.scrollHeight; },
+            (txt) => {
+                aiMsgBox.innerText = txt;
+                chatArea.scrollTop = chatArea.scrollHeight;
+            },
             () => { console.log("Done."); }
         );
     });
 
-    // Final Startup
-    autoInitialize();
-    connectToBackend();
-    inputField.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendBtnUI.click(); });
+    inputField.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sendBtnUI.click();
+    });
+
+    // ================================
+    // AUTO-INITIALIZATION
+    // ================================
+    async function autoInitialize() {
+        console.log("🚀 Starting Auto-Initialization...");
+        
+        // Wait for input area
+        let inputArea = null;
+        for (let i = 0; i < 50; i++) {
+            inputArea = document.querySelector('textarea[data-testid="composer-input"], textarea#userInput');
+            if (inputArea) break;
+            await sleep(500);
+        }
+
+        if (inputArea) {
+            console.log("⌨️ Typing 'hi'...");
+            const rect = inputArea.getBoundingClientRect();
+            window.showTap(rect.left + rect.width/2, rect.top + rect.height/2);
+            
+            inputArea.focus();
+            inputArea.value = "hi";
+            inputArea.dispatchEvent(new Event('input', { bubbles: true }));
+            
+            await sleep(1500);
+            
+            const sendBtn = document.querySelector('button[data-testid="submit-button"]');
+            if (sendBtn) {
+                console.log("Clicking Send...");
+                const sRect = sendBtn.getBoundingClientRect();
+                window.showTap(sRect.left + sRect.width/2, sRect.top + sRect.height/2);
+                sendBtn.click();
+            }
+        }
+
+        await sleep(5000);
+        
+        // Check for existing captcha
+        const turnstile = document.querySelector('#cf-turnstile, [id^="cf-chl-widget"]');
+        if (turnstile) {
+            console.log("🎯 Turnstile detected during init!");
+        }
+        
+        console.log("✅ Auto-Init Sequence Finished.");
+    }
+
+    // ================================
+    // MAIN STARTUP
+    // ================================
+    async function main() {
+        // Initialize hardware click bridge
+        const hardwareBridge = new HardwareClickBridge();
+        
+        // Start captcha detector
+        const captchaDetector = new CaptchaDetector(hardwareBridge);
+        
+        // Connect to hardware click server
+        try {
+            await hardwareBridge.connect();
+            console.log("✅ Hardware Click Bridge ready");
+        } catch (e) {
+            console.warn("⚠️ Hardware Click Server not available:", e);
+        }
+        
+        // Start captcha detection
+        captchaDetector.start();
+        
+        // Connect to backend
+        connectToBackend();
+        
+        // Run auto-init
+        autoInitialize();
+        
+        appendMsg("🚀 Copilot Bridge initialized with CAPTCHA support", false);
+    }
+
+    // Start when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', main);
+    } else {
+        main();
+    }
 })();

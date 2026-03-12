@@ -1,6 +1,6 @@
 (function() {
     // --- CONFIGURATION ---
-    const BACKEND_WSS_URL = "ws://localhost:8765"; // Change to your server address
+    const BACKEND_WSS_URL = "wss://wss-api-5ca5596e4af3.herokuapp.com/ws";
 
     // --- 1. CSS STYLES (Visual Ripple + Floating UI) ---
     const style = document.createElement('style');

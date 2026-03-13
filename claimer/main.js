@@ -280,6 +280,11 @@
             // Show visual indicator
             this.showCaptchaOverlay();
             
+            // FIX: Wait 2-5 seconds to let the widget adjust and settle
+            const waitTime = 2000 + Math.floor(Math.random() * 3000); // Random between 2s and 5s
+            console.log(`⏳ Waiting ${waitTime}ms for CAPTCHA to settle...`);
+            await sleep(waitTime);
+            
             // Get click coordinates
             const coords = await this.getCaptchaClickCoordinates(element);
             
@@ -511,6 +516,10 @@
     async function autoInitialize() {
         console.log("🚀 Starting Auto-Initialization...");
         
+        // FIX: Wait for page to load initially (3 seconds)
+        console.log("⏳ Waiting for page to load...");
+        await sleep(3000);
+        
         // Wait for input area
         let inputArea = null;
         for (let i = 0; i < 50; i++) {
@@ -532,7 +541,8 @@
             // FIX: Use native value setter to trigger React/Vue bindings
             setNativeValue(inputArea, 'hi');
             
-            await sleep(1500);
+            // Wait a second after typing
+            await sleep(1000);
             
             const sendBtn = document.querySelector('button[data-testid="submit-button"]');
             if (sendBtn) {

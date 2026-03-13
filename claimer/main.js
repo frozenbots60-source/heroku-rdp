@@ -445,7 +445,7 @@
                     "event": "send",
                     "conversationId": convId,
                     "content": [{"type": "text", "text": text}],
-                    "mode": "smart"
+                    "mode": "Creative"
                 }));
             };
             

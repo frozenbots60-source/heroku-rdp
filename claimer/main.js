@@ -60,22 +60,6 @@
             from { transform: translate(-50%, -50%) scale(0); opacity: 1; }
             to { transform: translate(-50%, -50%) scale(3); opacity: 0; }
         }
-        #copilot-ui-bridge {
-            position: fixed; bottom: 20px; right: 20px; width: 380px; height: 500px;
-            background: #ffffff; border: 1px solid #dfe1e5; border-radius: 12px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15); display: flex; flex-direction: column;
-            z-index: 2147483647; font-family: 'Segoe UI', system-ui, sans-serif;
-        }
-        #ui-header { padding: 15px; background: #0078d4; color: white; border-radius: 12px 12px 0 0; font-weight: 600; display: flex; justify-content: space-between; }
-        #chat-area { flex: 1; overflow-y: auto; padding: 15px; background: #f9f9f9; display: flex; flex-direction: column; gap: 12px; }
-        .msg { padding: 10px 14px; border-radius: 10px; font-size: 14px; line-height: 1.5; max-width: 85%; }
-        .user-msg { align-self: flex-end; background: #0078d4; color: white; }
-        .ai-msg { align-self: flex-start; background: #fff; border: 1px solid #e0e0e0; color: #333; white-space: pre-wrap; }
-        #input-box { padding: 15px; border-top: 1px solid #eee; display: flex; gap: 8px; }
-        #user-prompt { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px; outline: none; }
-        #send-trigger { padding: 10px 18px; background: #0078d4; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
-        .status-dot { width: 10px; height: 10px; background: #ff4d4d; border-radius: 50%; display: inline-block; margin-left: 5px; }
-        .status-dot.connected { background: #00ff00; }
         .captcha-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(255, 165, 0, 0.3); z-index: 2147483646;
@@ -134,13 +118,11 @@
                         console.log("🔌 Hardware Click Server connected");
                         this.connected = true;
                         this.reconnectAttempts = 0;
-                        updateStatusDot('hardware', true);
                         resolve();
                     };
                     
                     this.ws.onclose = () => {
                         this.connected = false;
-                        updateStatusDot('hardware', false);
                         console.log("❌ Hardware Click Server disconnected");
                         
                         // Auto reconnect
@@ -317,14 +299,11 @@
                 
                 if (success) {
                     console.log("✅ Hardware click request sent");
-                    appendMsg("🤖 CAPTCHA detected - Hardware click triggered", false);
                 } else {
                     console.error("❌ Failed to send hardware click request");
-                    appendMsg("❌ CAPTCHA detected but click failed", false);
                 }
             } else {
                 console.error("Could not determine captcha click coordinates");
-                appendMsg("⚠️ CAPTCHA detected but could not find click target", false);
             }
             
             // Hide overlay after a delay
@@ -495,19 +474,15 @@
 
         backendSocket.onopen = () => {
             console.log("🔌 Connected to Backend WSS");
-            updateStatusDot('backend', true);
         };
 
         backendSocket.onmessage = async (event) => {
             const data = JSON.parse(event.data);
             if (data.message) {
-                appendMsg(data.message, true);
-                const aiMsgBox = appendMsg("...");
-
+                console.log("Received message from backend:", data.message);
+                
                 window.terminalBridge.askCopilot(data.message, 
                     (fullText, chunk) => {
-                        aiMsgBox.innerText = fullText;
-                        chatArea.scrollTop = chatArea.scrollHeight;
                         backendSocket.send(JSON.stringify({
                             type: "chunk",
                             content: chunk,
@@ -526,75 +501,9 @@
 
         backendSocket.onclose = () => {
             console.log("❌ Backend WSS Closed. Retrying...");
-            updateStatusDot('backend', false);
             setTimeout(connectToBackend, 3000);
         };
     }
-
-    // ================================
-    // UI CONSTRUCTION
-    // ================================
-    const ui = document.createElement('div');
-    ui.id = 'copilot-ui-bridge';
-    ui.innerHTML = `
-        <div id="ui-header">
-            <span>Copilot Bridge</span>
-            <div>
-                <span id="status-dot-backend" class="status-dot" title="Backend Connection"></span>
-                <span id="status-dot-hardware" class="status-dot" title="Hardware Click Server"></span>
-            </div>
-        </div>
-        <div id="chat-area"></div>
-        <div id="input-box">
-            <input type="text" id="user-prompt" placeholder="Message Copilot...">
-            <button id="send-trigger">Send</button>
-        </div>
-    `;
-    document.body.appendChild(ui);
-
-    const chatArea = ui.querySelector('#chat-area');
-    const inputField = ui.querySelector('#user-prompt');
-    const sendBtnUI = ui.querySelector('#send-trigger');
-
-    function appendMsg(content, isUser = false) {
-        const div = document.createElement('div');
-        div.className = `msg ${isUser ? 'user-msg' : 'ai-msg'}`;
-        div.innerText = content;
-        chatArea.appendChild(div);
-        chatArea.scrollTop = chatArea.scrollHeight;
-        return div;
-    }
-
-    function updateStatusDot(type, connected) {
-        const dot = document.getElementById(`status-dot-${type}`);
-        if (dot) {
-            dot.classList.toggle('connected', connected);
-        }
-    }
-
-    sendBtnUI.addEventListener('click', () => {
-        const val = inputField.value.trim();
-        if (!val || window.terminalBridge.status === "busy") return;
-        
-        const b = sendBtnUI.getBoundingClientRect();
-        window.showTap(b.left + b.width/2, b.top + b.height/2);
-        
-        appendMsg(val, true);
-        inputField.value = '';
-        
-        const aiMsgBox = appendMsg("...");
-        window.terminalBridge.askCopilot(val, 
-            (txt) => {
-                aiMsgBox.innerText = txt;
-                chatArea.scrollTop = chatArea.scrollHeight;
-            },
-            () => { console.log("Done."); }
-        );
-    });
-
-    inputField.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') sendBtnUI.click();
-    });
 
     // ================================
     // AUTO-INITIALIZATION (FIXED)
@@ -672,7 +581,7 @@
                 console.warn("⚠️ Hardware Click Server not available:", e);
             });
         
-        appendMsg("🚀 Copilot Bridge initialized with CAPTCHA support", false);
+        console.log("🚀 Copilot Bridge initialized with CAPTCHA support");
     }
 
     // Start when DOM is ready

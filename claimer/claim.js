@@ -59,10 +59,10 @@ const GM_xmlhttpRequest = (details) => {
 // =============================================================================
 
 // ==UserScript==
-// @name         kust-code-claimer
+// @name         kust-code-claimer-lite
 // @namespace    http://tampermonkey.net/
-// @version      2.5
-// @description  Premium WebSocket listener & Auto Bonus Claimer for Stake.com (Dual Server Support) - Raw JSON Reporting
+// @version      2.5-lite
+// @description  Lightweight WebSocket listener & Auto Bonus Claimer for Stake.com (Optimized for VPS/XRDP)
 // @author       Kust
 // @match        *://*stake*/settings/offers*
 // @grant        GM_addStyle
@@ -211,157 +211,99 @@ const GM_xmlhttpRequest = (details) => {
     };
 
     // ================================
-    // 🎨 PREMIUM UI STYLES
+    // 🎨 LIGHTWEIGHT UI STYLES (VPS/XRDP OPTIMIZED)
     // ================================
     GM_addStyle(`
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
-
+        /* Lightweight Base - No backdrop-filter, no heavy shadows, minimal animations */
+        
         :root {
-            --kust-bg: rgba(12, 12, 14, 0.95);
-            --kust-border: rgba(255, 255, 255, 0.1);
-            --kust-accent: #00E701; /* Stake Green */
-            --kust-accent-glow: rgba(0, 231, 1, 0.3);
+            --kust-bg: #0c0c0e;
+            --kust-border: #333;
+            --kust-accent: #00E701;
             --kust-text: #E0E0E0;
             --kust-text-dim: #858585;
             --kust-success: #00E701;
             --kust-error: #FF4D4D;
             --kust-warning: #FFC107;
-            --kust-header-bg: rgba(255, 255, 255, 0.03);
-            --kust-settings-bg: rgba(20, 20, 24, 0.98);
+            --kust-header-bg: #1a1a1a;
+            --kust-settings-bg: #141418;
         }
 
         #kust-panel {
             position: fixed !important;
-            top: 50px; /* Movable */
-            right: 50px; /* Movable */
-            width: 380px !important;
-            height: 520px !important;
+            top: 50px;
+            right: 50px;
+            width: 360px !important;
+            height: 480px !important;
             background: var(--kust-bg);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
             border: 1px solid var(--kust-border);
-            border-radius: 16px;
-            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
             z-index: 2147483647 !important;
-            /* Max Z-Index */
             display: flex !important;
             flex-direction: column;
-            font-family: 'Inter', sans-serif;
+            font-family: Arial, sans-serif;
             color: var(--kust-text);
             overflow: hidden;
-            transition: opacity 0.3s ease;
             user-select: none;
             opacity: 1 !important;
         }
 
-        /* 3D FLOATING TOKEN OVERLAY */
+        /* SIMPLIFIED TOKEN OVERLAY - No 3D transforms */
         #kust-token-overlay {
             position: fixed;
-            left: -5px;
+            left: 0px;
             bottom: 40px;
-            /* Fixed blurriness with translateZ and font smoothing */
-            transform: perspective(800px) rotateY(15deg) translateZ(0); 
-            transform-origin: left center;
-            background: linear-gradient(135deg, rgba(20, 20, 24, 0.95) 0%, rgba(10, 10, 12, 0.98) 100%);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-left: 4px solid var(--kust-accent);
-            padding: 16px 24px;
-            border-radius: 0 16px 16px 0;
-            box-shadow: 20px 20px 40px rgba(0, 0, 0, 0.8), 
-                        inset 2px 2px 10px rgba(255, 255, 255, 0.05),
-                        5px 0 15px rgba(0, 231, 1, 0.1);
+            background: #141418;
+            border: 1px solid var(--kust-border);
+            border-left: 3px solid var(--kust-accent);
+            padding: 12px 16px;
+            border-radius: 0 8px 8px 0;
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: 12px;
             z-index: 2147483646;
-            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            font-family: 'Inter', sans-serif;
+            font-family: Arial, sans-serif;
             color: white;
             user-select: none;
             cursor: help;
-            
-            /* Anti-aliasing for clear text */
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
-            backface-visibility: hidden;
         }
 
-        #kust-token-overlay:hover {
-            transform: perspective(800px) rotateY(0deg) scale(1.02) translateZ(0);
-            left: 0px;
-            box-shadow: 25px 25px 50px rgba(0, 0, 0, 0.9), 
-                        inset 2px 2px 10px rgba(255, 255, 255, 0.1),
-                        10px 0 25px rgba(0, 231, 1, 0.2);
-            border-left-width: 6px;
+        .token-icon {
+            font-size: 20px;
         }
 
-        .token-3d-icon {
-            font-size: 28px;
-            filter: drop-shadow(0 0 10px rgba(0, 231, 1, 0.5));
-            animation: float-icon 3s ease-in-out infinite;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        .token-3d-text {
+        .token-text {
             display: flex;
             flex-direction: column;
         }
 
-        .token-3d-label {
+        .token-label {
             font-size: 10px;
-            font-weight: 800;
+            font-weight: bold;
             color: var(--kust-text-dim);
-            letter-spacing: 1.5px;
             text-transform: uppercase;
-            -webkit-font-smoothing: antialiased;
         }
 
-        .token-3d-value {
-            font-size: 24px;
-            font-weight: 800;
+        .token-value {
+            font-size: 18px;
+            font-weight: bold;
             color: var(--kust-accent);
-            font-family: 'JetBrains Mono', monospace;
-            text-shadow: 0 0 15px rgba(0, 231, 1, 0.4);
-            letter-spacing: -1px;
-            transition: all 0.3s ease;
-            -webkit-font-smoothing: antialiased;
+            font-family: monospace;
         }
 
-        /* Overlay States */
-        #kust-token-overlay.charging .token-3d-icon {
-            animation: pulse-spin 1.5s linear infinite;
-        }
-        
-        #kust-token-overlay.charging .token-3d-value {
+        /* Overlay States - Simple color changes only */
+        #kust-token-overlay.charging .token-value {
             color: var(--kust-warning);
-            text-shadow: 0 0 15px rgba(255, 193, 7, 0.4);
         }
         #kust-token-overlay.charging {
             border-left-color: var(--kust-warning);
         }
 
-        #kust-token-overlay.depleted .token-3d-icon {
-            filter: grayscale(1) opacity(0.5);
-            animation: none;
-        }
-        
-        #kust-token-overlay.depleted .token-3d-value {
+        #kust-token-overlay.depleted .token-value {
             color: var(--kust-error);
-            text-shadow: 0 0 15px rgba(255, 77, 77, 0.4);
         }
         #kust-token-overlay.depleted {
             border-left-color: var(--kust-error);
-        }
-
-        @keyframes float-icon {
-            0%, 100% { transform: translateY(0); }
-            50% { transform: translateY(-5px); }
-        }
-
-        @keyframes pulse-spin {
-            0% { transform: scale(1) rotate(0deg); opacity: 1; }
-            50% { transform: scale(1.2) rotate(180deg); opacity: 0.7; }
-            100% { transform: scale(1) rotate(360deg); opacity: 1; }
         }
 
         /* HEADER */
@@ -369,7 +311,7 @@ const GM_xmlhttpRequest = (details) => {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 16px 20px;
+            padding: 12px 16px;
             background: var(--kust-header-bg);
             border-bottom: 1px solid var(--kust-border);
             cursor: grab;
@@ -386,31 +328,30 @@ const GM_xmlhttpRequest = (details) => {
         }
 
         .kust-title {
-            font-size: 14px;
-            font-weight: 800;
+            font-size: 13px;
+            font-weight: bold;
             text-transform: uppercase;
             letter-spacing: 1px;
             color: #fff;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
         }
 
         .kust-title::before {
             content: '';
-            display: block;
-            width: 8px;
-            height: 8px;
+            display: inline-block;
+            width: 6px;
+            height: 6px;
             background: var(--kust-accent);
             border-radius: 50%;
-            box-shadow: 0 0 10px var(--kust-accent);
         }
 
         .kust-username {
             font-size: 11px;
             color: var(--kust-text-dim);
-            font-family: 'JetBrains Mono', monospace;
-            margin-left: 16px; /* Align with text start */
+            font-family: monospace;
+            margin-left: 12px;
         }
         .kust-username.active {
             color: var(--kust-accent);
@@ -421,91 +362,81 @@ const GM_xmlhttpRequest = (details) => {
             align-items: center;
         }
         
-        /* NETWORK BARS */
+        /* NETWORK BARS - Simple, no animations */
         .network-bars {
             display: flex;
             align-items: flex-end;
-            gap: 3px;
-            height: 16px;
-            margin-right: 15px;
+            gap: 2px;
+            height: 14px;
+            margin-right: 12px;
             padding-bottom: 2px;
-            opacity: 0.8;
             cursor: help;
         }
         
         .net-bar {
-            width: 3px;
-            border-radius: 2px;
-            background: rgba(255,255,255,0.15);
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            width: 4px;
+            border-radius: 1px;
+            background: #444;
         }
         
-        .net-bar:nth-child(1) { height: 6px; }
-        .net-bar:nth-child(2) { height: 10px; }
-        .net-bar:nth-child(3) { height: 14px; }
+        .net-bar:nth-child(1) { height: 5px; }
+        .net-bar:nth-child(2) { height: 9px; }
+        .net-bar:nth-child(3) { height: 13px; }
         
-        /* Network Quality States */
+        /* Network Quality States - Simple solid colors */
         .net-good .net-bar {
             background: var(--kust-accent);
-            box-shadow: 0 0 6px var(--kust-accent);
         }
         
         .net-med .net-bar:nth-child(1),
         .net-med .net-bar:nth-child(2) {
             background: var(--kust-warning);
-            box-shadow: 0 0 6px var(--kust-warning);
         }
         .net-med .net-bar:nth-child(3) {
-            background: rgba(255,255,255,0.1);
-            box-shadow: none;
+            background: #444;
         }
         
         .net-bad .net-bar:nth-child(1) {
             background: var(--kust-error);
-            box-shadow: 0 0 6px var(--kust-error);
         }
         .net-bad .net-bar:nth-child(2),
         .net-bad .net-bar:nth-child(3) {
-            background: rgba(255,255,255,0.1);
-            box-shadow: none;
+            background: #444;
         }
 
         /* STATUS BADGE */
         .kust-status {
-            font-size: 11px;
-            font-weight: 600;
-            padding: 4px 10px;
-            border-radius: 20px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            font-size: 10px;
+            font-weight: bold;
+            padding: 3px 8px;
+            border-radius: 4px;
+            background: #222;
+            border: 1px solid #444;
             display: flex;
             align-items: center;
-            gap: 6px;
-            transition: all 0.3s ease;
+            gap: 5px;
         }
 
         .status-dot {
-            width: 6px;
-            height: 6px;
+            width: 5px;
+            height: 5px;
             border-radius: 50%;
             background: #666;
         }
 
         .kust-status.connected {
-            border-color: rgba(0, 231, 1, 0.2);
+            border-color: #004400;
             color: var(--kust-accent);
-            background: rgba(0, 231, 1, 0.05);
+            background: #001a00;
         }
         .kust-status.connected .status-dot {
             background: var(--kust-accent);
-            box-shadow: 0 0 8px var(--kust-accent);
-            animation: pulse 2s infinite;
         }
 
         .kust-status.disconnected {
-            border-color: rgba(255, 77, 77, 0.2);
+            border-color: #440000;
             color: var(--kust-error);
-            background: rgba(255, 77, 77, 0.05);
+            background: #1a0000;
         }
         .kust-status.disconnected .status-dot {
             background: var(--kust-error);
@@ -514,7 +445,7 @@ const GM_xmlhttpRequest = (details) => {
         /* LOGS CONTAINER */
         .kust-body {
             flex: 1;
-            padding: 16px;
+            padding: 12px;
             overflow-y: hidden;
             position: relative;
             display: flex;
@@ -525,39 +456,31 @@ const GM_xmlhttpRequest = (details) => {
             flex: 1;
             overflow-y: auto;
             padding-right: 4px;
-            scroll-behavior: smooth;
         }
 
-        /* SCROLLBAR */
+        /* SCROLLBAR - Simple */
         #kust-logs::-webkit-scrollbar { width: 4px; }
-        #kust-logs::-webkit-scrollbar-track { background: transparent; }
-        #kust-logs::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
-        #kust-logs::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.4); }
+        #kust-logs::-webkit-scrollbar-track { background: #1a1a1a; }
+        #kust-logs::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
 
-        /* LOG ENTRY */
+        /* LOG ENTRY - No animations */
         .log-entry {
-            margin-bottom: 10px;
-            padding: 12px;
-            border-radius: 8px;
-            background: rgba(255, 255, 255, 0.03);
+            margin-bottom: 8px;
+            padding: 10px;
+            border-radius: 4px;
+            background: #1a1a1a;
             border: 1px solid transparent;
-            font-size: 12px;
-            line-height: 1.5;
-            animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-            transition: transform 0.2s;
-        }
-
-        .log-entry:hover {
-            background: rgba(255, 255, 255, 0.05);
+            font-size: 11px;
+            line-height: 1.4;
         }
 
         .log-header {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 4px;
-            font-size: 10px;
+            margin-bottom: 3px;
+            font-size: 9px;
             color: var(--kust-text-dim);
-            font-family: 'JetBrains Mono', monospace;
+            font-family: monospace;
         }
 
         .log-content {
@@ -565,24 +488,24 @@ const GM_xmlhttpRequest = (details) => {
             word-break: break-all;
         }
 
-        /* LOG VARIANTS */
-        .log-info { border-left: 3px solid #3b82f6; }
+        /* LOG VARIANTS - Simple border colors */
+        .log-info { border-left: 2px solid #3b82f6; }
         .log-success {
-            border-left: 3px solid var(--kust-success);
-            background: linear-gradient(90deg, rgba(0, 231, 1, 0.05) 0%, transparent 100%);
+            border-left: 2px solid var(--kust-success);
+            background: #0a1a0a;
         }
         .log-error {
-            border-left: 3px solid var(--kust-error);
-            background: linear-gradient(90deg, rgba(255, 77, 77, 0.05) 0%, transparent 100%);
+            border-left: 2px solid var(--kust-error);
+            background: #1a0a0a;
         }
-        .log-warning { border-left: 3px solid var(--kust-warning); }
+        .log-warning { border-left: 2px solid var(--kust-warning); }
 
         .code-highlight {
-            font-family: 'JetBrains Mono', monospace;
+            font-family: monospace;
             color: var(--kust-accent);
-            background: rgba(0, 231, 1, 0.1);
-            padding: 2px 6px;
-            border-radius: 4px;
+            background: #0a1a0a;
+            padding: 1px 4px;
+            border-radius: 2px;
             font-weight: bold;
         }
 
@@ -598,86 +521,66 @@ const GM_xmlhttpRequest = (details) => {
 
         /* LATENCY BREAKDOWN STYLES */
         .latency-breakdown {
-            font-size: 10px;
+            font-size: 9px;
             color: var(--kust-text-dim);
-            margin-top: 6px;
-            font-family: 'JetBrains Mono', monospace;
-            border-top: 1px solid rgba(255, 255, 255, 0.05);
-            padding-top: 6px;
+            margin-top: 5px;
+            font-family: monospace;
+            border-top: 1px solid #333;
+            padding-top: 5px;
         }
 
         .latency-item {
             display: inline-block;
-            margin-right: 6px;
+            margin-right: 5px;
             margin-bottom: 2px;
-            padding: 2px 6px;
-            border-radius: 4px;
-            background: rgba(255, 255, 255, 0.05);
+            padding: 1px 4px;
+            border-radius: 2px;
+            background: #222;
         }
 
         .latency-network { color: #3b82f6; }
         .latency-turnstile { color: #a855f7; }
         .latency-api { color: #10b981; }
         .latency-total { color: #FFD700; font-weight: bold; }
-        .latency-cache-hit { color: #00E701; background: rgba(0, 231, 1, 0.1); }
-        .latency-cache-miss { color: #FFC107; background: rgba(255, 193, 7, 0.1); }
-
-        /* ANIMATIONS */
-        @keyframes pulse {
-            0% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.5; transform: scale(1.2); }
-            100% { opacity: 1; transform: scale(1); }
-        }
-
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
+        .latency-cache-hit { color: #00E701; background: #0a1a0a; }
+        .latency-cache-miss { color: #FFC107; background: #1a1a0a; }
 
         /* SETTINGS BUTTON */
         .kust-settings-btn {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            width: 22px;
+            height: 22px;
+            border-radius: 4px;
+            background: #333;
+            border: 1px solid #444;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            transition: all 0.2s;
-            margin-right: 10px;
+            margin-right: 8px;
         }
 
         .kust-settings-btn:hover {
-            background: rgba(255, 255, 255, 0.2);
-            transform: rotate(90deg);
+            background: #444;
         }
 
         .kust-settings-btn svg {
-            width: 14px;
-            height: 14px;
+            width: 12px;
+            height: 12px;
             fill: var(--kust-text);
         }
 
-        /* SETTINGS POPUP MODAL */
+        /* SETTINGS POPUP MODAL - No animations */
         #kust-settings-modal {
             position: fixed;
             top: 0;
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0, 0, 0, 0.7);
+            background: rgba(0, 0, 0, 0.8);
             z-index: 2147483648;
             display: none;
             align-items: center;
             justify-content: center;
-            animation: fadeIn 0.3s ease;
         }
 
         #kust-settings-modal.open {
@@ -685,103 +588,94 @@ const GM_xmlhttpRequest = (details) => {
         }
 
         .kust-settings-popup {
-            width: 500px;
-            max-height: 85vh;
+            width: 460px;
+            max-height: 80vh;
             background: var(--kust-settings-bg);
-            border-radius: 16px;
+            border-radius: 8px;
             border: 1px solid var(--kust-border);
-            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8);
             overflow: hidden;
             display: flex;
             flex-direction: column;
-            animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
         }
 
         .settings-popup-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 16px 20px;
+            padding: 12px 16px;
             border-bottom: 1px solid var(--kust-border);
+            background: #1a1a1a;
         }
 
         .settings-popup-title {
-            font-size: 16px;
-            font-weight: 700;
+            font-size: 14px;
+            font-weight: bold;
             text-transform: uppercase;
-            letter-spacing: 1px;
             color: #fff;
         }
 
         .settings-popup-close {
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            background: rgba(255, 77, 77, 0.1);
-            border: 1px solid rgba(255, 77, 77, 0.2);
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            background: #331111;
+            border: 1px solid #441111;
             display: flex;
             align-items: center;
             justify-content: center;
             cursor: pointer;
-            transition: all 0.2s;
         }
 
         .settings-popup-close:hover {
-            background: rgba(255, 77, 77, 0.2);
-            transform: scale(1.1);
+            background: #441111;
         }
 
         .settings-popup-close svg {
-            width: 16px;
-            height: 16px;
+            width: 14px;
+            height: 14px;
             fill: var(--kust-text);
         }
 
         .settings-popup-content {
             flex: 1;
-            padding: 20px;
+            padding: 16px;
             overflow-y: auto;
         }
 
         .settings-section {
-            margin-bottom: 25px;
+            margin-bottom: 20px;
         }
 
         .settings-section-title {
-            font-size: 14px;
-            font-weight: 700;
+            font-size: 12px;
+            font-weight: bold;
             color: var(--kust-accent);
-            margin-bottom: 15px;
+            margin-bottom: 12px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
         }
 
         .settings-option {
             display: flex;
             align-items: center;
-            margin-bottom: 15px;
-            padding: 12px 15px;
-            border-radius: 10px;
-            background: rgba(255, 255, 255, 0.05);
-            transition: all 0.2s;
+            margin-bottom: 10px;
+            padding: 8px 10px;
+            border-radius: 4px;
+            background: #1a1a1a;
         }
 
         .settings-option:hover {
-            background: rgba(255, 255, 255, 0.08);
-            transform: translateY(-2px);
+            background: #222;
         }
 
         .settings-checkbox {
-            width: 20px;
-            height: 20px;
+            width: 16px;
+            height: 16px;
             appearance: none;
-            background: rgba(255, 255, 255, 0.1);
-            border: 2px solid rgba(255, 255, 255, 0.2);
-            border-radius: 5px;
-            margin-right: 15px;
-            position: relative;
+            background: #222;
+            border: 1px solid #444;
+            border-radius: 3px;
+            margin-right: 10px;
             cursor: pointer;
-            transition: all 0.2s;
         }
 
         .settings-checkbox:checked {
@@ -790,68 +684,63 @@ const GM_xmlhttpRequest = (details) => {
         }
 
         .settings-checkbox:checked::after {
-            content: '';
-            position: absolute;
-            top: 2px;
-            left: 6px;
-            width: 6px;
-            height: 12px;
-            border: solid white;
-            border-width: 0 2px 2px 0;
-            transform: rotate(45deg);
+            content: '✓';
+            display: block;
+            text-align: center;
+            color: #000;
+            font-size: 11px;
+            font-weight: bold;
+            line-height: 14px;
         }
 
         .settings-label {
             flex: 1;
-            font-size: 14px;
+            font-size: 12px;
             color: var(--kust-text);
             cursor: pointer;
         }
 
         .settings-select {
             width: 100%;
-            padding: 12px 15px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 2px solid rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
+            padding: 8px 10px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 4px;
             color: var(--kust-text);
-            font-family: 'Inter', sans-serif;
-            font-size: 14px;
-            margin-top: 10px;
-            transition: all 0.2s;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            margin-top: 8px;
         }
 
         .settings-select:hover {
-            background: rgba(255, 255, 255, 0.08);
-            border-color: rgba(255, 255, 255, 0.2);
+            background: #222;
+            border-color: #555;
         }
 
         .settings-select:focus {
             outline: none;
             border-color: var(--kust-accent);
-            box-shadow: 0 0 0 3px rgba(0, 231, 1, 0.2);
         }
 
-        /* Fixed dropdown options styling */
         .settings-select option {
             background: #1a1a1a;
             color: var(--kust-text);
-            padding: 8px;
+            padding: 6px;
         }
         
-        /* NEW: Network Stats Grid in Settings */
+        /* Network Stats Grid in Settings */
         .net-stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-bottom: 10px;
+            gap: 6px;
+            margin-bottom: 8px;
         }
         
         .net-stat-item {
-            background: rgba(0,0,0,0.3);
-            border: 1px solid rgba(255,255,255,0.05);
-            border-radius: 8px;
-            padding: 12px;
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 4px;
+            padding: 8px;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -859,18 +748,17 @@ const GM_xmlhttpRequest = (details) => {
         }
         
         .net-stat-label {
-            font-size: 10px;
+            font-size: 9px;
             color: var(--kust-text-dim);
             text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 4px;
+            margin-bottom: 2px;
         }
         
         .net-stat-value {
-            font-size: 14px;
-            font-weight: 800;
+            font-size: 12px;
+            font-weight: bold;
             color: #fff;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: monospace;
         }
         
         .stat-good { color: var(--kust-success) !important; }
@@ -881,42 +769,41 @@ const GM_xmlhttpRequest = (details) => {
         .claim-stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 8px;
-            margin-bottom: 10px;
+            gap: 6px;
+            margin-bottom: 8px;
         }
 
         .claim-stat-item {
-            background: rgba(0,0,0,0.3);
-            border: 1px solid rgba(255,255,255,0.05);
-            border-radius: 8px;
-            padding: 10px;
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 4px;
+            padding: 8px;
             text-align: center;
         }
 
         .claim-stat-label {
-            font-size: 9px;
+            font-size: 8px;
             color: var(--kust-text-dim);
             text-transform: uppercase;
-            letter-spacing: 1px;
         }
 
         .claim-stat-value {
-            font-size: 18px;
-            font-weight: 800;
-            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            font-weight: bold;
+            font-family: monospace;
         }
 
         .claim-stat-value.success { color: var(--kust-success); }
         .claim-stat-value.failed { color: var(--kust-error); }
 
-        /* LOADING ANIMATION */
+        /* LOADING ANIMATION - Simple */
         .loading-container {
             position: absolute;
             top: 0;
             left: 0;
             right: 0;
             bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
+            background: rgba(0, 0, 0, 0.8);
             display: flex;
             align-items: center;
             justify-content: center;
@@ -924,29 +811,103 @@ const GM_xmlhttpRequest = (details) => {
         }
 
         .loading {
-            width: 60px;
-            height: 10px;
-            background-color: #2f4553;
-            border-radius: 5px;
-            position: relative;
+            width: 100px;
+            height: 4px;
+            background: #333;
+            border-radius: 2px;
             overflow: hidden;
         }
 
         .loading-animation {
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            right: 2px;
-            bottom: 2px;
-            background-color: #a1c8f3;
-            border-radius: 3px;
-            animation: loading 1.5s infinite ease-in-out;
+            width: 30%;
+            height: 100%;
+            background: var(--kust-accent);
         }
 
-        @keyframes loading {
-            0% { left: 2px; width: 10px; }
-            50% { left: 48px; width: 10px; }
-            100% { left: 2px; width: 10px; }
+        /* SUBSCRIPTION PROMPT */
+        #kust-subscription-overlay {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            width: 100%;
+            padding: 20px;
+            box-sizing: border-box;
+            text-align: center;
+            gap: 12px;
+        }
+
+        .sub-icon {
+            font-size: 36px;
+            margin-bottom: 4px;
+        }
+
+        .sub-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: var(--kust-text);
+        }
+
+        .sub-desc {
+            font-size: 12px;
+            color: var(--kust-text-dim);
+            line-height: 1.4;
+            max-width: 240px;
+        }
+
+        .sub-btn {
+            margin-top: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            width: 100%;
+            padding: 12px;
+            background: var(--kust-accent);
+            color: #000;
+            font-weight: bold;
+            font-size: 12px;
+            border-radius: 6px;
+            text-decoration: none;
+            text-transform: uppercase;
+        }
+
+        .sub-btn:hover {
+            background: #00c400;
+        }
+
+        .sub-id {
+            font-size: 10px;
+            color: #444;
+            margin-top: auto;
+        }
+
+        /* Server container labels */
+        .server-container {
+            flex: 1;
+            background: #0a0a0a;
+            border: 1px solid #222;
+            border-radius: 4px;
+            padding: 8px;
+        }
+
+        .server-label {
+            font-size: 9px;
+            text-align: center;
+            margin-bottom: 6px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .server-label.main { color: var(--kust-accent); }
+        .server-label.regional { color: #3b82f6; }
+
+        /* Horizontal rule */
+        .settings-divider {
+            border: 0;
+            border-top: 1px solid #333;
+            margin-bottom: 12px;
         }
     `);
     // ================================
@@ -989,16 +950,15 @@ const GM_xmlhttpRequest = (details) => {
             : msg;
         
         // Build latency breakdown HTML if provided
-        // NOTE: "Network" now shows the actual API network latency (round-trip time to Stake API)
         let latencyHtml = '';
         if (latencyInfo) {
             latencyHtml = `
                 <div class="latency-breakdown">
-                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">🌐 Network: ${latencyInfo.apiLatency}ms</span>
-                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval (cache or generate)">
-                        ${latencyInfo.turnstileCacheHit ? '⚡ Cache Hit' : '🔄 Cache Miss'} (${latencyInfo.tokenLatency}ms)
+                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">Net: ${latencyInfo.apiLatency}ms</span>
+                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval">
+                        ${latencyInfo.turnstileCacheHit ? 'Cache' : 'Miss'} (${latencyInfo.tokenLatency}ms)
                     </span>
-                    <span class="latency-item latency-total" title="Total processing time">⏱️ Total: ${latencyInfo.totalTime}ms</span>
+                    <span class="latency-item latency-total" title="Total processing time">Total: ${latencyInfo.totalTime}ms</span>
                 </div>
             `;
         }
@@ -1036,16 +996,15 @@ const GM_xmlhttpRequest = (details) => {
             : msg;
         
         // Build latency breakdown HTML if provided
-        // NOTE: "Network" now shows the actual API network latency (round-trip time to Stake API)
         let latencyHtml = '';
         if (latencyInfo) {
             latencyHtml = `
                 <div class="latency-breakdown">
-                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">🌐 Network: ${latencyInfo.apiLatency}ms</span>
-                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval (cache or generate)">
-                        ${latencyInfo.turnstileCacheHit ? '⚡ Cache Hit' : '🔄 Cache Miss'} (${latencyInfo.tokenLatency}ms)
+                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">Net: ${latencyInfo.apiLatency}ms</span>
+                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval">
+                        ${latencyInfo.turnstileCacheHit ? 'Cache' : 'Miss'} (${latencyInfo.tokenLatency}ms)
                     </span>
-                    <span class="latency-item latency-total" title="Total processing time">⏱️ Total: ${latencyInfo.totalTime}ms</span>
+                    <span class="latency-item latency-total" title="Total processing time">Total: ${latencyInfo.totalTime}ms</span>
                 </div>
             `;
         }
@@ -1289,7 +1248,7 @@ const GM_xmlhttpRequest = (details) => {
     }
 
     // ================================
-    // ⚡ TOKEN 3D OVERLAY TRACKER
+    // ⚡ TOKEN OVERLAY TRACKER
     // ================================
     function updateTokenUI() {
         const overlayEl = document.getElementById('kust-token-overlay');
@@ -1306,7 +1265,7 @@ const GM_xmlhttpRequest = (details) => {
         // Update the text
         countEl.innerText = `${count}/${max}`;
 
-        // Update glowing effects based on state
+        // Update state classes
         if (count === 0) {
             overlayEl.className = 'depleted';
             overlayEl.title = 'Tokens Depleted! Waiting for generation...';
@@ -1363,71 +1322,17 @@ const GM_xmlhttpRequest = (details) => {
         if(document.getElementById('kust-subscription-overlay')) return;
         // Clear existing content safely
         bodyEl.innerHTML = `
-            <div id="kust-subscription-overlay" style="
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                height: 100%;
-                width: 100%;
-                padding: 24px;
-                box-sizing: border-box;
-                text-align: center;
-                gap:16px;
-                animation: fadeIn 0.5s ease;
-            ">
-                <div style="
-                    font-size: 48px;
-                    margin-bottom: 8px;
-                    filter: drop-shadow(0 0 20px rgba(255, 77, 77, 0.4));
-                ">🔒</div>
-
-                <div style="
-                    font-size: 18px;
-                    font-weight: 800;
-                    color: var(--kust-text);
-                    letter-spacing: -0.5px;
-                ">
-                    Access Restricted
-                </div>
-
-                <div style="
-                    font-size: 13px;
-                    color: var(--kust-text-dim);
-                    line-height: 1.5;
-                    max-width: 260px;
-                ">
+            <div id="kust-subscription-overlay">
+                <div class="sub-icon">🔒</div>
+                <div class="sub-title">Access Restricted</div>
+                <div class="sub-desc">
                     Your premium subscription has expired or is invalid. Renew to continue claiming.
                 </div>
-
-                <a href="https://t.me/kustchatbot" target="_blank" style="
-                    margin-top: 8px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 8px;
-                    width: 100%;
-                    padding: 14px;
-                    background: linear-gradient(135deg, #00E701 0%, #00b301 100%);
-                    color: #000;
-                    font-weight: 800;
-                    font-size: 13px;
-                    border-radius: 12px;
-                    text-decoration: none;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                    box-shadow: 0 4px 20px rgba(0, 231, 1, 0.2);
-                    text-transform: uppercase;
-                    letter-spacing: 0.5px;
-                " onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+                <a href="https://t.me/kustchatbot" target="_blank" class="sub-btn">
                     <span>Get Access Now</span>
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
                 </a>
-
-                <div style="
-                    font-size: 11px;
-                    color: rgba(255,255,255,0.2);
-                    margin-top: auto;
-                ">
+                <div class="sub-id">
                     ID: <span style="font-family: monospace;">${currentUsername || 'UNKNOWN'}</span>
                 </div>
             </div>
@@ -2128,7 +2033,7 @@ const GM_xmlhttpRequest = (details) => {
             if (!sessionToken) {
                 const sessionCookie = getCookie("session");
                 if (!sessionCookie) {
-                    addLog(`❌ No session token found (checked: hardcoded, localStorage, window.__KUST_SESSION_TOKEN__, cookie)`, 'error');
+                    addLog(`No session token found`, 'error');
                     return null;
                 }
                 sessionToken = sessionCookie;
@@ -2144,11 +2049,11 @@ const GM_xmlhttpRequest = (details) => {
                 const username = result.data.name;
                 return username;
             } else {
-                addLog(`❌ ${result.error || 'No user data in response'}`, 'error');
+                addLog(`${result.error || 'No user data in response'}`, 'error');
                 return null;
             }
         } catch (error) {
-            addLog(`❌ Error fetching user from API: ${error.message}`, 'error');
+            addLog(`Error fetching user from API: ${error.message}`, 'error');
             return null;
         }
     }
@@ -2203,21 +2108,21 @@ const GM_xmlhttpRequest = (details) => {
                             // Not Authorized
                         }
                     } catch (e) {
-                        addLog(`❌ Authorization API error: ${e.message}`, "error");
+                        addLog(`Authorization API error: ${e.message}`, "error");
                         resolve(false);
                     }
                 },
                 onerror: (error) => {
                     clearTimeout(timeoutId);
                     authCheckInProgress = false;
-                    addLog("❌ Network error while checking authorization.", "error");
+                    addLog("Network error while checking authorization.", "error");
                     // Don't kill connection on network error, assume authorized to prevent false negatives
                     resolve(true);
                 },
                 ontimeout: () => {
                     clearTimeout(timeoutId);
                     authCheckInProgress = false;
-                    addLog("❌ Authorization request timed out.", "warning");
+                    addLog("Authorization request timed out.", "warning");
                     resolve(true);
                     // Assume authorized on timeout
                 }
@@ -2291,11 +2196,11 @@ const GM_xmlhttpRequest = (details) => {
         const submitButton = document.querySelector('button[data-testid="claim-drop"]');
 
         if (!codeInput || !submitButton) {
-            addLog("❌ UI: Bonus Code Form not found. Navigate to the Offers page.", "error");
+            addLog("UI: Bonus Code Form not found. Navigate to the Offers page.", "error");
             return;
         }
 
-        addLog(`🔄 UI: Typing code <span class="code-highlight">${code}</span> and clicking Submit.`, "warning");
+        addLog(`UI: Typing code ${code} and clicking Submit.`, "warning");
         try {
             // 2. Set value and dispatch events
             codeInput.value = code;
@@ -2304,22 +2209,22 @@ const GM_xmlhttpRequest = (details) => {
             // 3. Click submit (with short delay)
             setTimeout(() => {
                 submitButton.click();
-                addLog("✅ UI: Submit button clicked. Waiting for modal...", "success");
+                addLog("UI: Submit button clicked. Waiting for modal...", "success");
 
                 // 4. Wait for modal and click dismiss button
                 setTimeout(() => {
                     const dismissButton = document.querySelector('button[data-testid="claim-bonus-dismiss"]');
                     if (dismissButton) {
                         dismissButton.click();
-                        addLog("✅ UI: Modal dismissed.", "info");
+                        addLog("UI: Modal dismissed.", "info");
                     } else {
-                        addLog("⚠️ UI: Dismiss button not found. Modal may need manual closing.", "warning");
+                        addLog("UI: Dismiss button not found.", "warning");
                     }
                 }, 300); // Wait 0.3 seconds
 
             }, 300);
         } catch (e) {
-            addLog(`❌ UI Submission Error: ${e.message}`, "error");
+            addLog(`UI Submission Error: ${e.message}`, "error");
         }
     }
 
@@ -2373,7 +2278,7 @@ const GM_xmlhttpRequest = (details) => {
             });
 
             // UI updates happen AFTER the request is on the network
-            const logId = addLog(`${isRetry ? '🔄 RETRY - ' : ''}Processing Code: ${code}...`, "info", true);
+            const logId = addLog(`${isRetry ? 'RETRY - ' : ''}Processing: ${code}...`, "info", true);
 
             // Handle the response asynchronously (non-blocking)
             claimPromise
@@ -2398,8 +2303,8 @@ const GM_xmlhttpRequest = (details) => {
 
         } else {
             // SLOW PATH: No token cache, fallback to async generation
-            addLog(`⚠️ Token cache empty! Falling back to async grab...`, "warning");
-            const logId = addLog(`${isRetry ? '🔄 RETRY - ' : ''}Processing Code: ${code}...`, "info", true);
+            addLog(`Token cache empty! Falling back...`, "warning");
+            const logId = addLog(`${isRetry ? 'RETRY - ' : ''}Processing: ${code}...`, "info", true);
             const tokenStartTime = performance.now();
             
             turnstileManager.getTokenWithMetrics().then(tokenResult => {
@@ -2442,7 +2347,7 @@ const GM_xmlhttpRequest = (details) => {
 
         // Fix: Retry on invalid turnstile error
         if (claimResponse.errors && claimResponse.errors.length > 0 && claimResponse.errors[0].message === 'error.invalid_turnstile') {
-            updateLog(logId, `⚠️ Invalid Turnstile detected. Retrying...`, "warning", true);
+            updateLog(logId, `Invalid Turnstile. Retrying...`, "warning", true);
             turnstileManager.tokenCache = []; 
             const tokenStartTime = performance.now();
             let newTokenResult = await turnstileManager.getTokenWithMetrics();
@@ -2485,13 +2390,13 @@ const GM_xmlhttpRequest = (details) => {
             });
             if (claimStats.recentClaims.length > 50) claimStats.recentClaims.shift();
             
-            updateLog(logId, `✅ Successfully claimed <span class="code-highlight">${code}</span>! Bonus: <span class="value-highlight">${data.amount} ${data.currency}</span>${isRetry ? ' <span class="retry-highlight">(MANUAL RETRY)</span>' : ''}`, "success", true, latencyInfo);
+            updateLog(logId, `SUCCESS! Claimed ${code}! Bonus: ${data.amount} ${data.currency}${isRetry ? ' (MANUAL RETRY)' : ''}`, "success", true, latencyInfo);
             
             // Remove from processing set
             processingCodes.delete(code);
             
             if (userSettings && userSettings.vault) {
-                stakeApi.createVaultDeposit(data.currency, data.amount).then(() => addLog(`✅ Amount deposited to vault`, "success")).catch(() => {});
+                stakeApi.createVaultDeposit(data.currency, data.amount).then(() => addLog(`Amount deposited to vault`, "success")).catch(() => {});
             }
             
             // Build raw JSON report for custom backend
@@ -2556,26 +2461,26 @@ const GM_xmlhttpRequest = (details) => {
             // Just show the error message
             processingCodes.delete(code);
             
-            let logMessage = `❌ Failed to claim <span class="code-highlight">${code}</span>. Reason: ${failureReason}`;
+            let logMessage = `FAILED ${code}. Reason: ${failureReason}`;
             let logType = "error";
             
             if (errorType === 'bonusCodeInactive') { 
-                logMessage = `⚠️ Code <span class="code-highlight">${code}</span> has been fully claimed`; 
+                logMessage = `Code ${code} has been fully claimed`; 
                 logType = "warning"; 
             } else if (errorType === 'alreadyClaimed') { 
-                logMessage = `⚠️ You have already claimed code <span class="code-highlight">${code}</span>`; 
+                logMessage = `Already claimed code ${code}`; 
                 logType = "warning"; 
             } else if (errorType === 'weeklyWagerRequirement') { 
-                logMessage = `⚠️ Wager requirement not met for code <span class="code-highlight">${code}</span>`; 
+                logMessage = `Wager requirement not met for ${code}`; 
                 logType = "warning"; 
             } else if (errorType === 'withdrawError') { 
-                logMessage = `⚠️ Deposit required to claim code <span class="code-highlight">${code}</span>`; 
+                logMessage = `Deposit required to claim ${code}`; 
                 logType = "warning"; 
             } else if (errorType === 'emailUnverified') { 
-                logMessage = `⚠️ Email verification required for code <span class="code-highlight">${code}</span>`; 
+                logMessage = `Email verification required for ${code}`; 
                 logType = "warning"; 
             } else if (errorType === 'kycLevelNotSufficient') { 
-                logMessage = `⚠️ KYC level insufficient for code <span class="code-highlight">${code}</span>`; 
+                logMessage = `KYC level insufficient for ${code}`; 
                 logType = "warning"; 
             }
             
@@ -2709,7 +2614,7 @@ const GM_xmlhttpRequest = (details) => {
                             }
                             // Silently ignore duplicate codes
                         } else if (!userSettings.processAll) {
-                            addLog(`Skipping code type: ${codeType} (not in user settings)`, "info");
+                            addLog(`Skipping code type: ${codeType}`, "info");
                         }
                     }
                 } catch (e) {
@@ -2874,7 +2779,7 @@ const GM_xmlhttpRequest = (details) => {
                             }
                             // Silently ignore duplicate codes
                         } else if (!userSettings.processAll) {
-                            addLog(`Skipping code type: ${codeType} (not in user settings)`, "info");
+                            addLog(`Skipping code type: ${codeType}`, "info");
                         }
                     }
                 } catch (e) {}
@@ -3055,7 +2960,7 @@ const GM_xmlhttpRequest = (details) => {
                     <div id="kust-username" class="kust-username">Guest</div>
                 </div>
                 <div class="kust-header-right">
-                    <div id="kust-network-bars" class="network-bars" title="Checking Network...">
+                    <div id="kust-network-bars" class="network-bars" title="Checking...">
                         <div class="net-bar"></div>
                         <div class="net-bar"></div>
                         <div class="net-bar"></div>
@@ -3080,15 +2985,15 @@ const GM_xmlhttpRequest = (details) => {
         document.body.appendChild(panel);
 
         // ================================
-        // INJECT NEW 3D FLOATING HUD OVERLAY
+        // INJECT SIMPLIFIED TOKEN OVERLAY
         // ================================
         const overlay = document.createElement("div");
         overlay.id = "kust-token-overlay";
         overlay.innerHTML = `
-            <div class="token-3d-icon">⚡</div>
-            <div class="token-3d-text">
-                <span class="token-3d-label">Bypass Ammo</span>
-                <span id="kust-token-count" class="token-3d-value">0/5</span>
+            <div class="token-icon">⚡</div>
+            <div class="token-text">
+                <span class="token-label">Bypass Ammo</span>
+                <span id="kust-token-count" class="token-value">0/5</span>
             </div>
         `;
         document.body.appendChild(overlay);
@@ -3110,7 +3015,7 @@ const GM_xmlhttpRequest = (details) => {
                 <div class="settings-popup-content">
                     
                     <div class="settings-section">
-                        <div class="settings-section-title">📊 Claim Statistics</div>
+                        <div class="settings-section-title">Claim Statistics</div>
                         <div class="claim-stats-grid">
                             <div class="claim-stat-item">
                                 <span class="claim-stat-label">Success</span>
@@ -3132,47 +3037,47 @@ const GM_xmlhttpRequest = (details) => {
                     </div>
 
                     <div class="settings-section">
-                        <div class="settings-section-title">Network Intelligence</div>
-                        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                        <div class="settings-section-title">Network Status</div>
+                        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
                             
-                            <div style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
-                                <div style="font-size: 10px; color: var(--kust-accent); text-align: center; margin-bottom: 8px; font-weight: bold; text-transform: uppercase;">Main Server</div>
+                            <div class="server-container">
+                                <div class="server-label main">Main Server</div>
                                 <div class="net-stats-grid" style="margin-bottom: 0;">
-                                    <div class="net-stat-item" style="padding: 8px;">
+                                    <div class="net-stat-item" style="padding: 6px;">
                                         <span class="net-stat-label">Latency</span>
                                         <span class="net-stat-value" id="stat-latency">--ms</span>
                                     </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
+                                    <div class="net-stat-item" style="padding: 6px;">
                                         <span class="net-stat-label">Jitter</span>
                                         <span class="net-stat-value" id="stat-jitter">--ms</span>
                                     </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Loss (Est)</span>
+                                    <div class="net-stat-item" style="padding: 6px;">
+                                        <span class="net-stat-label">Loss</span>
                                         <span class="net-stat-value" id="stat-loss">--%</span>
                                     </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
+                                    <div class="net-stat-item" style="padding: 6px;">
                                         <span class="net-stat-label">Status</span>
                                         <span class="net-stat-value" id="stat-server">--</span>
                                     </div>
                                 </div>
                             </div>
                             
-                            <div style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
-                                <div style="font-size: 10px; color: #3b82f6; text-align: center; margin-bottom: 8px; font-weight: bold; text-transform: uppercase;">Regional Routed</div>
+                            <div class="server-container">
+                                <div class="server-label regional">Regional</div>
                                 <div class="net-stats-grid" style="margin-bottom: 0;">
-                                    <div class="net-stat-item" style="padding: 8px;">
+                                    <div class="net-stat-item" style="padding: 6px;">
                                         <span class="net-stat-label">Latency</span>
                                         <span class="net-stat-value" id="stat-latency-reg">--ms</span>
                                     </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
+                                    <div class="net-stat-item" style="padding: 6px;">
                                         <span class="net-stat-label">Jitter</span>
                                         <span class="net-stat-value" id="stat-jitter-reg">--ms</span>
                                     </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
-                                        <span class="net-stat-label">Loss (Est)</span>
+                                    <div class="net-stat-item" style="padding: 6px;">
+                                        <span class="net-stat-label">Loss</span>
                                         <span class="net-stat-value" id="stat-loss-reg">--%</span>
                                     </div>
-                                    <div class="net-stat-item" style="padding: 8px;">
+                                    <div class="net-stat-item" style="padding: 6px;">
                                         <span class="net-stat-label">Status</span>
                                         <span class="net-stat-value" id="stat-server-reg">--</span>
                                     </div>
@@ -3188,7 +3093,7 @@ const GM_xmlhttpRequest = (details) => {
                             <input type="checkbox" id="processAll" class="settings-checkbox">
                             <label for="processAll" class="settings-label" style="color: #00E701; font-weight: bold;">Process ALL Codes (Ignore Filters)</label>
                         </div>
-                        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin-bottom: 15px;">
+                        <hr class="settings-divider">
 
                         <div class="settings-option">
                             <input type="checkbox" id="daily1" class="settings-checkbox" value="Daily1" checked>
@@ -3315,7 +3220,6 @@ const GM_xmlhttpRequest = (details) => {
             const rect = panel.getBoundingClientRect();
             initialLeft = rect.left;
             initialTop = rect.top;
-            panel.style.transition = 'none';
         });
         document.addEventListener('mousemove', (e) => {
             if (!isDragging) return;
@@ -3328,7 +3232,6 @@ const GM_xmlhttpRequest = (details) => {
 
         document.addEventListener('mouseup', () => {
             isDragging = false;
-            panel.style.transition = 'opacity 0.3s ease';
         });
     }
 
@@ -3337,7 +3240,7 @@ const GM_xmlhttpRequest = (details) => {
     // ================================
     async function fetchRemoteConfig() {
         return new Promise((resolve, reject) => {
-            updateStatus("disconnected", "Fetching server list...");
+            updateStatus("disconnected", "Fetching config...");
             GM_xmlhttpRequest({
                 method: "GET",
                 url: REMOTE_CONFIG_URL,
@@ -3353,7 +3256,7 @@ const GM_xmlhttpRequest = (details) => {
                             if (config.regionalUrl) {
                                 HH123_URL = config.regionalUrl;
                             }
-                            addLog(`nodes list loaded ✨: ${config.meta && config.meta.selected_node_stats !== "Fallback Mode" ? "Optimized" : "Default"}`, "success");
+                            addLog(`Config loaded`, "success");
                             resolve(true);
                         } else {
                             reject("Invalid Config Structure");
@@ -3381,7 +3284,7 @@ const GM_xmlhttpRequest = (details) => {
         // ------------------------------------------
 
         createPanel();
-        addLog("Kust Claimer v2.5 Initialized (Raw JSON Reporting - Manual Retry via r- prefix)", "info");
+        addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes
@@ -3391,7 +3294,7 @@ const GM_xmlhttpRequest = (details) => {
         try {
             await fetchRemoteConfig();
         } catch (e) {
-            addLog(`⚠️ Config Fetch Failed: ${e}. Using default servers.`, "warning");
+            addLog(`Config Fetch Failed: ${e}. Using defaults.`, "warning");
             // WS_SERVER_URL and AUTH_CHECK_URL retain their default values defined at the top
         }
 
@@ -3403,7 +3306,7 @@ const GM_xmlhttpRequest = (details) => {
         activePingCheck(); // Initial check
         activeRegionalPingCheck();
         
-        // Start Token Power-Up UI Polling for the new 3D Overlay
+        // Start Token UI Polling
         setInterval(updateTokenUI, 500);
 
         // 1. Initialize user settings

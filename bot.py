@@ -6,6 +6,9 @@ import shutil
 import json
 import zipfile
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
 
 # ================================
 # CONFIGURATION
@@ -13,7 +16,93 @@ import re
 WORKDIR = "/app"
 EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
 PROFILE_DIR = "/tmp/firefox-profile"
+INTERNAL_SERVER_PORT = int(os.environ.get("INTERNAL_SERVER_PORT", 17532))
+INTERNAL_SERVER_HOST = "127.0.0.1"
 
+# Global state
+bot_state = {
+    "status": "starting",
+    "last_heartbeat": None,
+    "firefox_pid": None,
+}
+
+# ================================
+# INTERNAL HTTP SERVER
+# ================================
+class InternalAPIHandler(BaseHTTPRequestHandler):
+    """HTTP handler for extension -> bot communication."""
+    
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+    
+    def _send_json_response(self, data, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+    
+    def _read_json_body(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > 0:
+            body = self.rfile.read(content_length)
+            return json.loads(body.decode())
+        return {}
+    
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json_response({
+                "status": bot_state["status"],
+                "last_heartbeat": bot_state["last_heartbeat"],
+                "firefox_pid": bot_state["firefox_pid"],
+            })
+        else:
+            self._send_json_response({"error": "Not found"}, status=404)
+    
+    def do_POST(self):
+        if self.path == "/heartbeat":
+            bot_state["last_heartbeat"] = datetime.now().isoformat()
+            bot_state["status"] = "running"
+            self._send_json_response({"ok": True})
+            print(f"[INTERNAL API] ♥ Heartbeat received", flush=True)
+        
+        elif self.path == "/restart":
+            reason = "extension requested"
+            try:
+                body = self._read_json_body()
+                reason = body.get("reason", reason)
+            except:
+                pass
+            
+            print(f"\n{'='*60}", flush=True)
+            print(f"[INTERNAL API] 🔄 RESTART REQUESTED: {reason}", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            
+            self._send_json_response({"restart_scheduled": True})
+            threading.Thread(target=self._trigger_restart, daemon=True).start()
+        
+        else:
+            self._send_json_response({"error": "Not found"}, status=404)
+    
+    def _trigger_restart(self):
+        time.sleep(2)
+        print("[INTERNAL API] 🔌 Exiting for restart...", flush=True)
+        os._exit(1)
+
+
+def run_internal_server():
+    server = HTTPServer((INTERNAL_SERVER_HOST, INTERNAL_SERVER_PORT), InternalAPIHandler)
+    server.serve_forever()
+
+
+def start_internal_server():
+    server_thread = threading.Thread(target=run_internal_server, daemon=True)
+    server_thread.start()
+    print(f"[INTERNAL SERVER] 🌐 Started on {INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
+
+
+# ================================
+# EXTENSION SETUP
+# ================================
 def prepare_sideload_extension():
     """Zips the claimer folder and places it in the profile's extension directory."""
     print("=" * 60, flush=True)
@@ -92,7 +181,12 @@ def main():
     print("=" * 60, flush=True)
     print(f"Working Directory: {WORKDIR}", flush=True)
     print(f"Profile Directory: {PROFILE_DIR}", flush=True)
+    print(f"Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
     print("=" * 60 + "\n", flush=True)
+    
+    # 0. Start Internal Server
+    start_internal_server()
+    bot_state["status"] = "initializing"
     
     print("[MAIN] Waiting for Xvfb...", flush=True)
     time.sleep(5)
@@ -154,12 +248,17 @@ def main():
     # Pass the DISPLAY environment variable so it renders on your VNC screen
     process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
     
+    # Update bot state
+    bot_state["firefox_pid"] = process.pid
+    bot_state["status"] = "running"
+    
     print("\n" + "=" * 60, flush=True)
     print("🔥 FIREFOX LAUNCHED SUCCESSFULLY", flush=True)
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
     print("  Target URL: https://stake1017.com/")
+    print(f"  Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
     print("=" * 60 + "\n", flush=True)
     
     try:

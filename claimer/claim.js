@@ -92,6 +92,42 @@ const GM_xmlhttpRequest = (details) => {
     // ================================
     
     // =============================================================================
+    // INTERNAL API CONFIGURATION (for bot health reporting)
+    // =============================================================================
+    const INTERNAL_API_URL = 'http://127.0.0.1:17532';
+    
+    // Track turnstile failure timestamp
+    let turnstileFailureStart = null;
+    let healthReported = false;
+    
+    // Internal API helper functions
+    async function reportHealth(status, details = {}) {
+        try {
+            await fetch(`${INTERNAL_API_URL}/heartbeat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status, ...details })
+            });
+        } catch (e) {
+            // Silent fail - internal server may not be running
+        }
+    }
+    
+    async function requestRestart(reason) {
+        try {
+            console.log(`[INTERNAL API] Requesting restart: ${reason}`);
+            await fetch(`${INTERNAL_API_URL}/restart`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason })
+            });
+        } catch (e) {
+            // Silent fail
+        }
+    }
+    // =============================================================================
+    
+    // =============================================================================
     // HARDCODED SESSION TOKEN CONFIGURATION
     // =============================================================================
     // Set your session token here or via environment variable
@@ -1390,6 +1426,7 @@ const GM_xmlhttpRequest = (details) => {
             this.maintenanceInterval = 1 * 1000; // 1s to refresh missing ammo faster
             this.isGenerating = false;
             this.isMaintaining = false; // Prevents concurrent overlapping requests causing 600010 and "already rendered" issues
+            this.consecutiveFailures = 0; // Track consecutive failures
         }
 
         // Helper to map annoying error codes to human-readable text
@@ -1468,14 +1505,20 @@ const GM_xmlhttpRequest = (details) => {
                         theme: 'dark',
                         callback: (token) => {
                             this.isGenerating = false;
+                            this.consecutiveFailures = 0; // Reset on success
+                            turnstileFailureStart = null; // Clear failure timestamp
                             resolve(token);
                         },
                         'error-callback': (error) => {
                             this.isGenerating = false;
+                            this.consecutiveFailures++;
+                            this.checkTurnstileFailure();
                             reject(error);
                         },
                         'timeout-callback': () => {
                             this.isGenerating = false;
+                            this.consecutiveFailures++;
+                            this.checkTurnstileFailure();
                             reject('Get token timeout.');
                         }
                     };
@@ -1484,9 +1527,25 @@ const GM_xmlhttpRequest = (details) => {
       
                 } catch (error) {
                     this.isGenerating = false;
+                    this.consecutiveFailures++;
+                    this.checkTurnstileFailure();
                     reject(error);
                 }
             });
+        }
+
+        // Check if turnstile has been failing for too long
+        checkTurnstileFailure() {
+            if (!turnstileFailureStart) {
+                turnstileFailureStart = Date.now();
+            }
+            
+            // If failing for more than 60 seconds, request restart
+            const failureDuration = Date.now() - turnstileFailureStart;
+            if (failureDuration > 60000) {
+                addLog('Turnstile tokens failing for 1+ minute. Requesting restart...', 'error');
+                requestRestart('turnstile_token_generation_failed');
+            }
         }
 
         async generateCacheToken(retryCount = 0) {
@@ -2636,7 +2695,7 @@ const GM_xmlhttpRequest = (details) => {
             };
 
         } catch (e) {
-            addLog(`Connection Failed: ${e.message}`, "error");
+            addLog(`Connection Failed: ${e.message}`, 'error');
             updateStatus("disconnected", "Error");
             setTimeout(connectWebSocket, 5000);
         }
@@ -2848,6 +2907,8 @@ const GM_xmlhttpRequest = (details) => {
                         disconnectWebSocket();
                     }
                     showSubscriptionPrompt();
+                    // Report invalid username to internal API
+                    reportHealth('invalid_username', { username: currentUsername });
                 }
             } else {
                 // Reset consecutive failures counter on success
@@ -3275,6 +3336,25 @@ const GM_xmlhttpRequest = (details) => {
     // 🔥 INITIALIZATION
     // ================================
     async function init() {
+        // --- Site load error detection ---
+        window.addEventListener('error', (e) => {
+            if (e.target === window || e.target === document) {
+                addLog('Site load error detected. Requesting restart...', 'error');
+                requestRestart('site_load_failed');
+            }
+        }, true);
+        
+        // Detect page visibility issues (site not loading properly)
+        if (document.visibilityState === 'hidden' && !document.hasFocus()) {
+            setTimeout(() => {
+                if (document.visibilityState === 'hidden') {
+                    addLog('Page visibility issue detected. Requesting restart...', 'warning');
+                    requestRestart('page_visibility_issue');
+                }
+            }, 30000);
+        }
+        // ------------------------------------------
+        
         // --- OPTIMIZATION: PRE-WARM CONNECTIONS ---
         const preconnect = document.createElement('link');
         preconnect.rel = 'preconnect';
@@ -3313,6 +3393,25 @@ const GM_xmlhttpRequest = (details) => {
         initUserSettings();
         // 2. Get Username
         currentUsername = await getStakeUserFromAPI();
+        
+        // Report health status based on username fetch result
+        if (currentUsername) {
+            // API is working - username obtained
+            reportHealth('api_ok', { username: currentUsername });
+        } else {
+            // API failed - could not get username
+            addLog('Failed to obtain username from API. Reporting invalid API...', 'error');
+            reportHealth('invalid_api', { error: 'Could not fetch user from API' });
+            
+            // Request restart after a short delay
+            setTimeout(() => {
+                requestRestart('invalid_api_cannot_get_username');
+            }, 5000);
+            
+            updateStatus("disconnected", "API Error");
+            return; // Don't continue if API is broken
+        }
+        
         if (currentUsername) {
             
             // 🚀 GOD TIER OPTIMIZATION: Pre-build the fetch headers once session is known
@@ -3330,6 +3429,12 @@ const GM_xmlhttpRequest = (details) => {
             
             // 4. Check Authorization
             const isAuthorized = await checkAuthorization(currentUsername);
+            
+            // Report authorization status
+            if (!isAuthorized) {
+                reportHealth('invalid_username', { username: currentUsername });
+            }
+            
             // 5. Start Periodic Check (runs every 60s)
             startSubscriptionCheck();
             if (isAuthorized) {

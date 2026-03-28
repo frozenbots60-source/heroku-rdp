@@ -221,7 +221,7 @@ def main():
     user_pref("browser.dom.window.dump.enabled", true);
     
     // STARTUP
-    user_pref("browser.startup.homepage", "https://stake.com/");
+    user_pref("browser.startup.homepage", "https://Stake.bet/");
     user_pref("browser.startup.page", 1);
     user_pref("browser.startup.homepage_override.mstone", "ignore");
     """
@@ -257,7 +257,7 @@ def main():
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print("  Target URL: https://stake.com/")
+    print("  Target URL: https://Stake.bet/")
     print(f"  Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
     print("=" * 60 + "\n", flush=True)
     

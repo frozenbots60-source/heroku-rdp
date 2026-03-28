@@ -257,7 +257,7 @@ def main():
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print("  Target URL: https://stake1017.com/")
+    print("  Target URL: https://stake.com/")
     print(f"  Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
     print("=" * 60 + "\n", flush=True)
     

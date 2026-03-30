@@ -82,6 +82,7 @@ const GM_xmlhttpRequest = (details) => {
 // @connect      cdn.socket.io
 // @connect      api.telegram.org
 // @connect      code-dash-ba59fe89410e.herokuapp.com
+// @connect      health.kustbotsweb.workers.dev
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -221,6 +222,12 @@ const GM_xmlhttpRequest = (details) => {
     const HH123_VERSION = '6.3.0';
     let hh123Socket = null;
     // --------------------------------------
+
+    // --- HEALTH CHECK WEBSOCKET CONFIG ---
+    let HEALTH_WS_URL = ''; // Populated from velocity config (healthUrl field)
+    let healthWsSocket = null;
+    let healthWsReconnectTimer = null;
+    // -------------------------------------
 
     const TG_BOT_TOKEN = '8068628711:AAEcw4c5oKw92bpYMI51L8_C8bOPNlN_BB0';
     const TG_CHAT_ID = '7618467489';
@@ -2759,6 +2766,14 @@ const GM_xmlhttpRequest = (details) => {
             hh123Socket.disconnect();
             hh123Socket = null;
         }
+        if (healthWsSocket) {
+            healthWsSocket.close();
+            healthWsSocket = null;
+        }
+        if (healthWsReconnectTimer) {
+            clearTimeout(healthWsReconnectTimer);
+            healthWsReconnectTimer = null;
+        }
     }
 
     // 2. REGIONAL WEBSOCKET (HH123 Socket.IO)
@@ -2913,6 +2928,168 @@ const GM_xmlhttpRequest = (details) => {
         }
     }
 
+    // ================================
+    // 🏥 HEALTH CHECK WEBSOCKET
+    // Connects to healthUrl from velocity config.
+    // Initializes by sending username on open (same pattern as main WSS).
+    // Responds on-demand to "report_request" from server:
+    //   - Runs a dummy claim attempt (stake1234) to measure real API latency
+    //   - Reports: username, token cache count, network stats, connection state
+    // ================================
+    function connectHealthSocket() {
+        if (!HEALTH_WS_URL) {
+            addLog('[Health] No healthUrl from config — skipping health socket.', 'warning');
+            return;
+        }
+        if (healthWsSocket && healthWsSocket.readyState === WebSocket.OPEN) return;
+
+        // Clear any pending reconnect timer
+        if (healthWsReconnectTimer) {
+            clearTimeout(healthWsReconnectTimer);
+            healthWsReconnectTimer = null;
+        }
+
+        try {
+            // Append username exactly like the main code WSS does
+            const healthUrl = `${HEALTH_WS_URL}?user=${currentUsername}`;
+            healthWsSocket = new WebSocket(healthUrl);
+
+            healthWsSocket.onopen = () => {
+                addLog('[Health] Health socket connected.', 'success');
+                // Send hello/init message with username (mirrors main WSS pattern)
+                try {
+                    healthWsSocket.send(JSON.stringify({
+                        type: 'hello',
+                        username: currentUsername
+                    }));
+                } catch (e) { /* ignore */ }
+            };
+
+            healthWsSocket.onmessage = async (event) => {
+                let msg;
+                try { msg = JSON.parse(event.data); } catch (e) { return; }
+
+                // Server sends {"type":"report_request"} or {"type":"ping_health"} to trigger a report
+                if (msg.type === 'report_request' || msg.type === 'ping_health') {
+                    addLog('[Health] Report requested by server — running dummy claim...', 'info');
+
+                    // ── Dummy claim attempt (stake1234) to measure real API latency ──
+                    let dummyLatency = null;
+                    let dummyResult = 'not_attempted';
+                    let dummyError = null;
+
+                    if (stakeApi && OPTIMIZED_HEADERS) {
+                        const dummyCode = 'stake1234';
+                        const dummyTokenResult = turnstileManager.getFastTokenWithMetrics();
+
+                        if (dummyTokenResult && dummyTokenResult.token) {
+                            const dummyPayload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${dummyCode}","currency":"${selectedCurrency}","turnstileToken":"${dummyTokenResult.token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
+                            const dummyStart = performance.now();
+                            try {
+                                const dummyResp = await fetch(STAKE_API_URL, {
+                                    method: 'POST',
+                                    headers: OPTIMIZED_HEADERS,
+                                    body: dummyPayload
+                                });
+                                const dummyJson = await dummyResp.json();
+                                dummyLatency = Math.round(performance.now() - dummyStart);
+
+                                if (dummyJson.errors && dummyJson.errors.length > 0) {
+                                    const errMsg = dummyJson.errors[0].message || '';
+                                    dummyError = errMsg;
+                                    // Expected: bonusCodeInactive / alreadyClaimed / etc — API is reachable
+                                    dummyResult = 'api_reached_error';
+                                } else {
+                                    dummyResult = 'api_reached_success';
+                                }
+                            } catch (e) {
+                                dummyLatency = Math.round(performance.now() - dummyStart);
+                                dummyResult = 'fetch_error';
+                                dummyError = e.message;
+                            }
+                        } else {
+                            dummyResult = 'no_token_in_cache';
+                        }
+                    } else {
+                        dummyResult = 'api_not_initialized';
+                    }
+                    // ── End dummy claim ──
+
+                    const tokenCacheCount = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
+                    const mainConnected = webSocket && webSocket.readyState === WebSocket.OPEN;
+                    const regionalConnected = hh123Socket && hh123Socket.connected;
+                    const healthConnected = healthWsSocket && healthWsSocket.readyState === WebSocket.OPEN;
+
+                    const report = {
+                        type: 'health_report',
+                        username: currentUsername,
+                        timestamp: new Date().toISOString(),
+                        dummy_claim: {
+                            code: 'stake1234',
+                            result: dummyResult,
+                            latency_ms: dummyLatency,
+                            error: dummyError
+                        },
+                        token_cache: {
+                            count: tokenCacheCount,
+                            max: turnstileManager.maxCacheSize || 3
+                        },
+                        network: {
+                            main_wss: {
+                                ping_ms: netStats.ping,
+                                jitter_ms: netStats.jitter,
+                                packet_loss_pct: netStats.packetLoss,
+                                connected: mainConnected
+                            },
+                            regional_wss: {
+                                ping_ms: netStatsReg.ping,
+                                jitter_ms: netStatsReg.jitter,
+                                packet_loss_pct: netStatsReg.packetLoss,
+                                connected: regionalConnected
+                            },
+                            health_wss: {
+                                connected: healthConnected
+                            }
+                        },
+                        claim_stats: {
+                            success: claimStats.successCount,
+                            failed: claimStats.failedCount,
+                            total_claimed_value: claimStats.totalClaimedValue
+                        },
+                        turnstile: {
+                            initialized: turnstileManager.initialized,
+                            is_generating: turnstileManager.isGenerating,
+                            consecutive_failures: turnstileManager.consecutiveFailures || 0
+                        },
+                        currency: selectedCurrency
+                    };
+
+                    try {
+                        healthWsSocket.send(JSON.stringify(report));
+                        addLog(`[Health] Report sent (latency: ${dummyLatency}ms, tokens: ${tokenCacheCount})`, 'success');
+                    } catch (e) {
+                        addLog('[Health] Failed to send report.', 'error');
+                    }
+                }
+            };
+
+            healthWsSocket.onclose = () => {
+                addLog('[Health] Health socket disconnected. Reconnecting in 10s...', 'warning');
+                healthWsSocket = null;
+                healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000);
+            };
+
+            healthWsSocket.onerror = (err) => {
+                console.error('[Health] Health WebSocket error:', err);
+                // onclose fires after onerror, handles reconnect
+            };
+
+        } catch (e) {
+            addLog(`[Health] Connection failed: ${e.message}. Retrying in 10s...`, 'error');
+            healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000);
+        }
+    }
+
     // Function to determine code type from payload
     function getCodeType(payload) {
         let codeType = 'OtherDrops';
@@ -2978,6 +3155,9 @@ const GM_xmlhttpRequest = (details) => {
                     }
                     if (!hh123Socket || !hh123Socket.connected) {
                         connectRegionalServer();
+                    }
+                    if (!healthWsSocket || healthWsSocket.readyState === WebSocket.CLOSED) {
+                        connectHealthSocket();
                     }
                 }
             }
@@ -3366,6 +3546,9 @@ const GM_xmlhttpRequest = (details) => {
                             if (config.regionalUrl) {
                                 HH123_URL = config.regionalUrl;
                             }
+                            if (config.healthUrl) {
+                                HEALTH_WS_URL = config.healthUrl;
+                            }
                             addLog(`Config loaded`, "success");
                             resolve(true);
                         } else {
@@ -3493,6 +3676,7 @@ const GM_xmlhttpRequest = (details) => {
                 // Initialize both sockets in parallel
                 connectWebSocket();
                 connectRegionalServer();
+                connectHealthSocket();
             } else {
                 // Not authorized: Show subscription prompt immediately (no grace period)
                 showSubscriptionPrompt();

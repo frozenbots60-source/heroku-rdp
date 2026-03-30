@@ -113,17 +113,66 @@ const GM_xmlhttpRequest = (details) => {
         }
     }
     
-    async function requestRestart(reason) {
+    // =============================================================================
+    // PAGE RESTART FUNCTION - Force browser refresh instead of API call
+    // =============================================================================
+    function requestRestart(reason) {
+        console.log(`[PAGE RESTART] Triggering page refresh. Reason: ${reason}`);
         try {
-            console.log(`[INTERNAL API] Requesting restart: ${reason}`);
-            await fetch(`${INTERNAL_API_URL}/restart`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ reason })
-            });
+            // Firefox-compatible force reload
+            // Using true parameter to force reload from server (bypass cache)
+            window.location.reload(true);
         } catch (e) {
-            // Silent fail
+            // Fallback for browsers that don't support the parameter
+            window.location.reload();
         }
+    }
+    // =============================================================================
+    
+    // =============================================================================
+    // TOKEN CACHE WATCHER - Separate watcher to detect stuck token generation
+    // This runs independently every 15 seconds and checks if cache is empty for 30+ seconds
+    // =============================================================================
+    let tokenCacheEmptySince = null; // Timestamp when cache first became empty
+    let tokenCacheWatcherInterval = null;
+    
+    function startTokenCacheWatcher() {
+        // Prevent multiple watchers
+        if (tokenCacheWatcherInterval) return;
+        
+        tokenCacheWatcherInterval = setInterval(() => {
+            // Check if turnstileManager exists and is initialized
+            if (!turnstileManager || !turnstileManager.initialized) {
+                return;
+            }
+            
+            const cacheLength = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
+            
+            if (cacheLength === 0) {
+                // Cache is empty
+                if (tokenCacheEmptySince === null) {
+                    // First time we notice it's empty
+                    tokenCacheEmptySince = Date.now();
+                    console.log('[TOKEN WATCHER] Cache empty, starting timer...');
+                } else {
+                    // Check how long it's been empty
+                    const emptyDuration = Date.now() - tokenCacheEmptySince;
+                    console.log(`[TOKEN WATCHER] Cache empty for ${Math.round(emptyDuration / 1000)} seconds`);
+                    
+                    if (emptyDuration >= 30000) {
+                        // Empty for 30+ seconds - force refresh
+                        console.log('[TOKEN WATCHER] Cache empty for 30+ seconds! Forcing page refresh...');
+                        requestRestart('token_cache_empty_for_30_seconds');
+                    }
+                }
+            } else {
+                // Cache has tokens - reset the empty tracker
+                if (tokenCacheEmptySince !== null) {
+                    console.log('[TOKEN WATCHER] Cache recovered. Resetting timer.');
+                }
+                tokenCacheEmptySince = null;
+            }
+        }, 15000); // Check every 15 seconds
     }
     // =============================================================================
     
@@ -3388,6 +3437,9 @@ const GM_xmlhttpRequest = (details) => {
         
         // Start Token UI Polling
         setInterval(updateTokenUI, 500);
+
+        // 🔥 START TOKEN CACHE WATCHER - Separate watcher for detecting stuck token generation
+        startTokenCacheWatcher();
 
         // 1. Initialize user settings
         initUserSettings();

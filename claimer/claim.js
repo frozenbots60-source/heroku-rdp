@@ -227,6 +227,7 @@ const GM_xmlhttpRequest = (details) => {
     let HEALTH_WS_URL = ''; // Populated from velocity config (healthUrl field)
     let healthWsSocket = null;
     let healthWsReconnectTimer = null;
+    let healthWsReportInterval = null; // Interval for auto-reporting turnstile tokens
     // -------------------------------------
 
     const TG_BOT_TOKEN = '8068628711:AAEcw4c5oKw92bpYMI51L8_C8bOPNlN_BB0';
@@ -2774,6 +2775,10 @@ const GM_xmlhttpRequest = (details) => {
             clearTimeout(healthWsReconnectTimer);
             healthWsReconnectTimer = null;
         }
+        if (healthWsReportInterval) {
+            clearInterval(healthWsReportInterval);
+            healthWsReportInterval = null;
+        }
     }
 
     // 2. REGIONAL WEBSOCKET (HH123 Socket.IO)
@@ -2963,6 +2968,25 @@ const GM_xmlhttpRequest = (details) => {
                         username: currentUsername
                     }));
                 } catch (e) { /* ignore */ }
+
+                // Start periodic token reporting every 30 seconds
+                if (healthWsReportInterval) {
+                    clearInterval(healthWsReportInterval);
+                }
+                healthWsReportInterval = setInterval(() => {
+                    if (healthWsSocket && healthWsSocket.readyState === WebSocket.OPEN) {
+                        const tokenCacheCount = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
+                        const report = {
+                            type: 'token_report',
+                            username: currentUsername,
+                            token_count: tokenCacheCount,
+                            timestamp: new Date().toISOString()
+                        };
+                        try {
+                            healthWsSocket.send(JSON.stringify(report));
+                        } catch (e) { /* ignore */ }
+                    }
+                }, 30000);
             };
 
             healthWsSocket.onmessage = async (event) => {
@@ -3076,6 +3100,11 @@ const GM_xmlhttpRequest = (details) => {
             healthWsSocket.onclose = () => {
                 addLog('[Health] Health socket disconnected. Reconnecting in 10s...', 'warning');
                 healthWsSocket = null;
+                // Clear the report interval on disconnect
+                if (healthWsReportInterval) {
+                    clearInterval(healthWsReportInterval);
+                    healthWsReportInterval = null;
+                }
                 healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000);
             };
 

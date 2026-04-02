@@ -213,7 +213,7 @@ const GM_xmlhttpRequest = (details) => {
     
     // Default fallbacks (Old hardcoded values) in case remote fetch fails
     let WS_SERVER_URL = 'wss://code-extract1-840a32439225.herokuapp.com/ws';
-    let AUTH_CHECK_URL = 'https://code-auth11-4cc0b14f630c.herokuapp.com/check'; 
+    let AUTH_CHECK_URL = 'https://claimer-auth.vibeshiftbots.workers.dev/check'; 
     // --- DYNAMIC CONFIG END ---
 
     // --- REGIONAL SERVER (HH123) CONFIG ---

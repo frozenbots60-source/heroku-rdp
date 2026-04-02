@@ -18,6 +18,8 @@ EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
 PROFILE_DIR = "/tmp/firefox-profile"
 INTERNAL_SERVER_PORT = int(os.environ.get("INTERNAL_SERVER_PORT", 17532))
 INTERNAL_SERVER_HOST = "127.0.0.1"
+MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.bet")
+TARGET_URL = f"https://{MIRROR_SITE}/"
 
 # Global state
 bot_state = {
@@ -182,6 +184,8 @@ def main():
     print(f"Working Directory: {WORKDIR}", flush=True)
     print(f"Profile Directory: {PROFILE_DIR}", flush=True)
     print(f"Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
+    print(f"Mirror Site: {MIRROR_SITE}", flush=True)
+    print(f"Target URL: {TARGET_URL}", flush=True)
     print("=" * 60 + "\n", flush=True)
     
     # 0. Start Internal Server
@@ -204,7 +208,7 @@ def main():
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     print(f"[MAIN] Writing Firefox preferences...", flush=True)
     
-    prefs_content = """
+    prefs_content = f"""
     // Extension logic
     user_pref("xpinstall.signatures.required", false);
     user_pref("extensions.autoDisableScopes", 0); // Auto-enable sideloaded addons
@@ -221,7 +225,7 @@ def main():
     user_pref("browser.dom.window.dump.enabled", true);
     
     // STARTUP
-    user_pref("browser.startup.homepage", "https://Stake.bet/");
+    user_pref("browser.startup.homepage", "{TARGET_URL}");
     user_pref("browser.startup.page", 1);
     user_pref("browser.startup.homepage_override.mstone", "ignore");
     """
@@ -257,7 +261,7 @@ def main():
     print("=" * 60, flush=True)
     print("\n[STATUS]", flush=True)
     print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print("  Target URL: https://Stake.bet/")
+    print(f"  Target URL: {TARGET_URL}", flush=True)
     print(f"  Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
     print("=" * 60 + "\n", flush=True)
     

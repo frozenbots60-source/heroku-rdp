@@ -1,11 +1,13 @@
 FROM ubuntu:22.04
 
-ENV DEBIAN_FRONTEND=noninteractive
+# Prevent interactive prompts and Python bytecode generation to speed things up
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# 1. Install dependencies (Added curl, bzip2, and xz-utils for the manual Firefox Dev install)
-RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    gnupg \
+# 1. ONE MASSIVE LAYER: Install, Download, Configure, and Clean up
+# Squashing this into one layer makes Docker and Heroku process it much faster.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     curl \
     bzip2 \
@@ -47,43 +49,25 @@ RUN apt-get update && apt-get install -y \
     libxss1 \
     libxtst6 \
     libgbm1 \
-    lsb-release \
-    unzip \
-    && apt-get clean
-
-# --- NEW SECTION: Install Firefox Developer Edition ---
-# Using curl -L to handle Mozilla's redirects and tar -xf to auto-detect xz/bz2 formats
-RUN curl -L "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -o /tmp/firefox-dev.tar.xz \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -L "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -o /tmp/firefox-dev.tar.xz \
     && tar -xf /tmp/firefox-dev.tar.xz -C /opt \
     && ln -s /opt/firefox/firefox /usr/bin/firefox \
-    && rm /tmp/firefox-dev.tar.xz
-# ------------------------------------------------------
-
-# --- NEW SECTION: Install Geckodriver Manually ---
-RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
+    && wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
     && tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin \
-    && rm /tmp/geckodriver.tar.gz
-# ------------------------------------------------
+    && rm -f /tmp/firefox-dev.tar.xz /tmp/geckodriver.tar.gz \
+    && mkdir -p /opt/firefox/browser/defaults/preferences/ \
+    && echo 'pref("general.config.filename", "mozilla.cfg");' > /opt/firefox/browser/defaults/preferences/autoconfig.js \
+    && echo 'pref("general.config.obscure_value", 0);' >> /opt/firefox/browser/defaults/preferences/autoconfig.js \
+    && echo '//' > /opt/firefox/mozilla.cfg \
+    && echo 'lockPref("xpinstall.signatures.required", false);' >> /opt/firefox/mozilla.cfg \
+    && echo 'lockPref("extensions.checkCompatibility.nightly", false);' >> /opt/firefox/mozilla.cfg \
+    && chmod 1777 /tmp \
+    && ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
-# --- Install Python Libraries ---
-RUN pip3 install selenium
-# --------------------------------
-
-# --- FIREFOX CONFIGURATION (FIX: Allow Unsigned Extensions) ---
-# For Developer Edition, these files live in /opt/firefox
-RUN mkdir -p /opt/firefox/browser/defaults/preferences/ && \
-    echo 'pref("general.config.filename", "mozilla.cfg");' > /opt/firefox/browser/defaults/preferences/autoconfig.js && \
-    echo 'pref("general.config.obscure_value", 0);' >> /opt/firefox/browser/defaults/preferences/autoconfig.js && \
-    echo '//' > /opt/firefox/mozilla.cfg && \
-    echo 'lockPref("xpinstall.signatures.required", false);' >> /opt/firefox/mozilla.cfg && \
-    echo 'lockPref("extensions.checkCompatibility.nightly", false);' >> /opt/firefox/mozilla.cfg
-# --------------------------------------------------------------
-
-# 2b. Set /tmp to be globally writable (Sticky Bit) 
-RUN chmod 1777 /tmp
-
-# 3. Enable the full noVNC interface
-RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+# 2. Install Python Libraries
+# Added --no-cache-dir so pip doesn't save backup files, saving more space
+RUN pip3 install --no-cache-dir selenium
 
 WORKDIR /app
 COPY . .

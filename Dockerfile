@@ -7,19 +7,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # 1. ONE MASSIVE LAYER: Install, Download, Configure, and Clean up
 # Squashing this into one layer makes Docker and Heroku process it much faster.
-# Includes APT pipeline hacks and parallel background downloads.
-RUN echo 'Acquire::http::Pipeline-Depth "100";' > /etc/apt/apt.conf.d/99parallel && \
-    echo 'Acquire::Queue-Mode "access";' >> /etc/apt/apt.conf.d/99parallel && \
-    echo 'Acquire::Retries "3";' >> /etc/apt/apt.conf.d/99parallel && \
-    apt-get update && \
+RUN apt-get update && \
+    echo "Installing core downloaders first..." && \
+    apt-get install -y --no-install-recommends wget curl ca-certificates xz-utils bzip2 && \
     echo "Starting parallel downloads in the background..." && \
     curl -sL "https://download.mozilla.org/?product=firefox-devedition-latest-ssl&os=linux64&lang=en-US" -o /tmp/firefox-dev.tar.xz & \
     FIREFOX_PID=$! && \
     wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz & \
     GECKO_PID=$! && \
-    echo "Running hyper-pipelined apt-get install..." && \
+    echo "Installing the rest of the heavy GUI dependencies..." && \
     apt-get install -y --no-install-recommends \
-        wget curl bzip2 xz-utils ca-certificates xvfb fluxbox x11vnc novnc websockify \
+        xvfb fluxbox x11vnc novnc websockify \
         supervisor python3 python3-pip fonts-liberation libasound2 libatk1.0-0 libc6 \
         libcairo2 libdbus-1-3 libexpat1 libfontconfig1 libgcc-s1 libgdk-pixbuf2.0-0 \
         libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libx11-6 libx11-xcb1 libxcb1 \

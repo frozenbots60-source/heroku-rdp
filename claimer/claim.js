@@ -209,7 +209,7 @@ const GM_xmlhttpRequest = (details) => {
     // =============================================================================
     
     // --- DYNAMIC CONFIG START ---
-    const REMOTE_CONFIG_URL = 'https://velocity.kustbotsweb.workers.dev/';
+    const REMOTE_CONFIG_URL = 'https://velocity-4ayz.onrender.com/';
     
     // Default fallbacks (Old hardcoded values) in case remote fetch fails
     let WS_SERVER_URL = 'wss://code-extract1-840a32439225.herokuapp.com/ws';
@@ -217,7 +217,7 @@ const GM_xmlhttpRequest = (details) => {
     // --- DYNAMIC CONFIG END ---
 
     // --- REGIONAL SERVER (HH123) CONFIG ---
-    let HH123_URL = 'https://velocity.kustbotsweb.workers.dev';
+    let HH123_URL = 'https://velocity-4ayz.onrender.com';
     const HH123_USERNAME = 'Kustx';
     const HH123_VERSION = '6.3.0';
     let hh123Socket = null;

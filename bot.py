@@ -18,7 +18,7 @@ EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
 PROFILE_DIR = "/tmp/firefox-profile"
 INTERNAL_SERVER_PORT = int(os.environ.get("INTERNAL_SERVER_PORT", 17532))
 INTERNAL_SERVER_HOST = "127.0.0.1"
-MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.bet")
+MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.ac")
 TARGET_URL = f"https://{MIRROR_SITE}/"
 
 # Global state

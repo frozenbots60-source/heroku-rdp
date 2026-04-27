@@ -245,9 +245,10 @@ const GM_xmlhttpRequest = (details) => {
 
     // ================================
     // 🚦 RATE LIMITING CONFIGURATION
-    // Maximum 4 code claim attempts per minute
+    // Maximum 2 code claim attempts per 3-second sliding window
     // ================================
-    const MAX_CODES_PER_MINUTE = 4;
+    const MAX_CODES_PER_WINDOW = 2;
+    const RATE_WINDOW_MS = 3000;
     let codeAttempts = []; // Timestamps of recent code attempts (sliding window)
 
     let webSocket = null;
@@ -2364,9 +2365,8 @@ const GM_xmlhttpRequest = (details) => {
     // ================================
     function checkRateLimit() {
         const nowMs = Date.now();
-        // Remove attempts older than 60 seconds (sliding window)
-        codeAttempts = codeAttempts.filter(ts => nowMs - ts < 60000);
-        return codeAttempts.length < MAX_CODES_PER_MINUTE;
+        codeAttempts = codeAttempts.filter(ts => nowMs - ts < RATE_WINDOW_MS);
+        return codeAttempts.length < MAX_CODES_PER_WINDOW;
     }
 
     function recordRateLimitAttempt() {
@@ -2388,26 +2388,21 @@ const GM_xmlhttpRequest = (details) => {
         if (!isRetry && processingCodes.has(code)) {
             return; // Silently skip duplicate
         }
-        
-        // 🚦 RATE LIMIT CHECK: Max 4 codes per minute
-        if (!checkRateLimit()) {
-            addLog(`Rate limit reached (${MAX_CODES_PER_MINUTE}/min). Skipping ${code}`, "warning", true);
-            return;
-        }
-        // Record this attempt in the rate limit window
-        recordRateLimitAttempt();
-        
-        // Only add to claimedCodes if not a retry
+
+        // Mark this code as "tried" BEFORE the rate-limit check.
+        // A code is never re-attempted unless it has the "r-" prefix,
+        // even if the first attempt was dropped due to rate limiting.
         if (!isRetry) {
             claimedCodes.add(code);
         }
-        processingCodes.add(code);
 
-        // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE
-        // Fire the info API call and immediately proceed to claim (fire and forget)
-        if (stakeApi) {
-            stakeApi.checkBonusCode(code).catch(() => {}); // Fire and forget - no waiting
+        // 🚦 RATE LIMIT: silently drop overflow codes
+        if (!checkRateLimit()) {
+            return;
         }
+        recordRateLimitAttempt();
+
+        processingCodes.add(code);
 
         // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
         let tokenResult = turnstileManager.getFastTokenWithMetrics();

@@ -132,9 +132,9 @@ const GM_xmlhttpRequest = (details) => {
     
     // =============================================================================
     // TOKEN CACHE WATCHER - Separate watcher to detect stuck token generation
-    // This runs independently every 15 seconds and checks if cache is empty for 30+ seconds
+    // This runs independently every 10 seconds and checks if cache has < 2 tokens for 30+ seconds
     // =============================================================================
-    let tokenCacheEmptySince = null; // Timestamp when cache first became empty
+    let tokenCacheEmptySince = null; // Timestamp when cache first dropped below 2 tokens
     let tokenCacheWatcherInterval = null;
     
     function startTokenCacheWatcher() {
@@ -149,31 +149,31 @@ const GM_xmlhttpRequest = (details) => {
             
             const cacheLength = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
             
-            if (cacheLength === 0) {
-                // Cache is empty
+            if (cacheLength < 2) {
+                // Cache has less than 2 tokens
                 if (tokenCacheEmptySince === null) {
-                    // First time we notice it's empty
+                    // First time we notice it's low
                     tokenCacheEmptySince = Date.now();
-                    console.log('[TOKEN WATCHER] Cache empty, starting timer...');
+                    console.log('[TOKEN WATCHER] Cache below 2 tokens, starting timer...');
                 } else {
-                    // Check how long it's been empty
-                    const emptyDuration = Date.now() - tokenCacheEmptySince;
-                    console.log(`[TOKEN WATCHER] Cache empty for ${Math.round(emptyDuration / 1000)} seconds`);
+                    // Check how long it's been low
+                    const lowDuration = Date.now() - tokenCacheEmptySince;
+                    console.log(`[TOKEN WATCHER] Cache below 2 tokens for ${Math.round(lowDuration / 1000)} seconds (current: ${cacheLength})`);
                     
-                    if (emptyDuration >= 30000) {
-                        // Empty for 30+ seconds - force refresh
-                        console.log('[TOKEN WATCHER] Cache empty for 30+ seconds! Forcing page refresh...');
-                        requestRestart('token_cache_empty_for_30_seconds');
+                    if (lowDuration >= 30000) {
+                        // Below 2 tokens for 30+ seconds - force refresh
+                        console.log('[TOKEN WATCHER] Cache below 2 tokens for 30+ seconds! Forcing page refresh...');
+                        requestRestart('token_cache_below_2_for_30_seconds');
                     }
                 }
             } else {
-                // Cache has tokens - reset the empty tracker
+                // Cache has 2+ tokens - reset the low tracker
                 if (tokenCacheEmptySince !== null) {
                     console.log('[TOKEN WATCHER] Cache recovered. Resetting timer.');
                 }
                 tokenCacheEmptySince = null;
             }
-        }, 15000); // Check every 15 seconds
+        }, 10000); // Check every 10 seconds for more responsive 30s detection
     }
     // =============================================================================
     
@@ -242,6 +242,13 @@ const GM_xmlhttpRequest = (details) => {
     const CURRENT_MIRROR = window.location.origin;
     const STAKE_API_URL = `${CURRENT_MIRROR}/_api/graphql`;
     const FC_USER_SETTINGS = 'FC_USER_SETTINGS';
+
+    // ================================
+    // 🚦 RATE LIMITING CONFIGURATION
+    // Maximum 4 code claim attempts per minute
+    // ================================
+    const MAX_CODES_PER_MINUTE = 4;
+    let codeAttempts = []; // Timestamps of recent code attempts (sliding window)
 
     let webSocket = null;
     // Global reference for connection management
@@ -1475,7 +1482,7 @@ const GM_xmlhttpRequest = (details) => {
             this.siteKey = TURNSTILE_SITE_KEY;
             this.widgetId = null;
             this.tokenCache = [];
-            this.maxCacheSize = 8; 
+            this.maxCacheSize = 5; 
             this.initialized = false;
             this.tokenTimeout = 2.6 * 60 * 1000; // 2.6 mins
             this.refreshThreshold = 60 * 1000; // 60 seconds before expiration
@@ -1595,6 +1602,13 @@ const GM_xmlhttpRequest = (details) => {
         checkTurnstileFailure() {
             if (!turnstileFailureStart) {
                 turnstileFailureStart = Date.now();
+            }
+            
+            // 🚨 If 3 or more consecutive failures, refresh page immediately
+            if (this.consecutiveFailures >= 3) {
+                addLog(`Token generation failed ${this.consecutiveFailures} times in a row. Refreshing page...`, 'error');
+                requestRestart('token_gen_3_consecutive_failures');
+                return;
             }
             
             // If failing for more than 60 seconds, request restart
@@ -2345,6 +2359,21 @@ const GM_xmlhttpRequest = (details) => {
     }
 
     // ================================
+    // 🚦 RATE LIMIT CHECKER
+    // Returns true if we can proceed, false if rate limit reached
+    // ================================
+    function checkRateLimit() {
+        const nowMs = Date.now();
+        // Remove attempts older than 60 seconds (sliding window)
+        codeAttempts = codeAttempts.filter(ts => nowMs - ts < 60000);
+        return codeAttempts.length < MAX_CODES_PER_MINUTE;
+    }
+
+    function recordRateLimitAttempt() {
+        codeAttempts.push(Date.now());
+    }
+
+    // ================================
     // 🚀 API LOGIC (Fully Optimized for Speed with Latency Tracking)
     // NO AUTO RETRY - Manual retry via "r-" prefix
     // ================================
@@ -2359,6 +2388,14 @@ const GM_xmlhttpRequest = (details) => {
         if (!isRetry && processingCodes.has(code)) {
             return; // Silently skip duplicate
         }
+        
+        // 🚦 RATE LIMIT CHECK: Max 4 codes per minute
+        if (!checkRateLimit()) {
+            addLog(`Rate limit reached (${MAX_CODES_PER_MINUTE}/min). Skipping ${code}`, "warning", true);
+            return;
+        }
+        // Record this attempt in the rate limit window
+        recordRateLimitAttempt();
         
         // Only add to claimedCodes if not a retry
         if (!isRetry) {
@@ -3056,7 +3093,7 @@ const GM_xmlhttpRequest = (details) => {
                         },
                         token_cache: {
                             count: tokenCacheCount,
-                            max: turnstileManager.maxCacheSize || 3
+                            max: turnstileManager.maxCacheSize || 5
                         },
                         network: {
                             main_wss: {
@@ -3626,6 +3663,7 @@ const GM_xmlhttpRequest = (details) => {
 
         createPanel();
         addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
+        addLog(`Rate limit: max ${MAX_CODES_PER_MINUTE} codes/min | Token cache: 5 max`, "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes

@@ -245,10 +245,10 @@ const GM_xmlhttpRequest = (details) => {
 
     // ================================
     // 🚦 RATE LIMITING CONFIGURATION
-    // Maximum 2 code claim attempts per 3-second sliding window
+    // Maximum 4 code claim attempts per minute
     // ================================
     const MAX_CODES_PER_WINDOW = 2;
-    const RATE_WINDOW_MS = 3000;
+    const RATE_LIMIT_WINDOW_MS = 3000; // 3-second sliding window
     let codeAttempts = []; // Timestamps of recent code attempts (sliding window)
 
     let webSocket = null;
@@ -2365,7 +2365,8 @@ const GM_xmlhttpRequest = (details) => {
     // ================================
     function checkRateLimit() {
         const nowMs = Date.now();
-        codeAttempts = codeAttempts.filter(ts => nowMs - ts < RATE_WINDOW_MS);
+        // Remove attempts older than the window (sliding window)
+        codeAttempts = codeAttempts.filter(ts => nowMs - ts < RATE_LIMIT_WINDOW_MS);
         return codeAttempts.length < MAX_CODES_PER_WINDOW;
     }
 
@@ -2388,20 +2389,22 @@ const GM_xmlhttpRequest = (details) => {
         if (!isRetry && processingCodes.has(code)) {
             return; // Silently skip duplicate
         }
-
-        // Mark this code as "tried" BEFORE the rate-limit check.
-        // A code is never re-attempted unless it has the "r-" prefix,
-        // even if the first attempt was dropped due to rate limiting.
+        
+        // 🚦 RATE LIMIT CHECK: Max 2 codes per 3-second window
+        // Bypassed for "r-" prefix retries so manual retries always go through
+        if (!isRetry && !checkRateLimit()) {
+            addLog(`Rate limit (${MAX_CODES_PER_WINDOW}/${RATE_LIMIT_WINDOW_MS / 1000}s). Ignoring ${code}`, "warning", true);
+            // Mark as claimed so this code is never auto-retried (only "r-" prefix retries allowed)
+            claimedCodes.add(code);
+            return;
+        }
+        // Record this attempt in the rate limit window
+        recordRateLimitAttempt();
+        
+        // Only add to claimedCodes if not a retry
         if (!isRetry) {
             claimedCodes.add(code);
         }
-
-        // 🚦 RATE LIMIT: silently drop overflow codes
-        if (!checkRateLimit()) {
-            return;
-        }
-        recordRateLimitAttempt();
-
         processingCodes.add(code);
 
         // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
@@ -3658,7 +3661,7 @@ const GM_xmlhttpRequest = (details) => {
 
         createPanel();
         addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
-        addLog(`Rate limit: max ${MAX_CODES_PER_MINUTE} codes/min | Token cache: 5 max`, "info");
+        addLog(`Rate limit: max ${MAX_CODES_PER_WINDOW} codes per ${RATE_LIMIT_WINDOW_MS / 1000}s | Token cache: 5 max`, "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes

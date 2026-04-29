@@ -1,10 +1,8 @@
 /**
  * Captcha Detection and Hardware Click Bridge
- * 
- * This extension detects Cloudflare Turnstile captcha and sends coordinates
+ * * This extension detects Cloudflare Turnstile captcha and sends coordinates
  * to a Python backend that performs hardware-level clicks via xdotool.
- * 
- * The key challenge: JavaScript click events are detected by Cloudflare as synthetic.
+ * * The key challenge: JavaScript click events are detected by Cloudflare as synthetic.
  * Solution: Use xdotool via Python to generate X11-level input events that appear
  * as hardware input to applications running under XRDP.
  */
@@ -404,7 +402,7 @@
         status: "idle",
         responseText: "",
         
-        async askCopilot(text, onChunk, onDone) {
+        async askCopilot(text, convIdOverride, onChunk, onDone) {
             this.status = "busy";
             this.responseText = "";
             const originalFetch = window.fetch;
@@ -416,36 +414,9 @@
                 } catch(e) { return null; }
             }
 
-            let convId = null;
+            let convId = convIdOverride || null;
             
-            // FIX 1: Try to extract conversation ID from URL first (e.g. /chats/xxxxxx)
-            const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
-            if (urlMatch && urlMatch[1]) {
-                convId = urlMatch[1];
-                console.log("📌 Using conversation from URL:", convId);
-            }
-            
-            // FIX 2: Fallback - get from existing conversations list (new endpoint)
-            if (!convId) {
-                try {
-                    const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup', {
-                        method: 'GET',
-                        headers: { 'Accept': 'application/json' },
-                        credentials: 'include'
-                    });
-                    const data = await res.json();
-                    // Response shape may be { items: [...] } or an array
-                    const items = (data && data.items) ? data.items : (Array.isArray(data) ? data : null);
-                    if (items && items.length > 0 && items[0].id) {
-                        convId = items[0].id;
-                        console.log("📌 Using existing conversation:", convId);
-                    }
-                } catch(e) {
-                    console.error("Failed to get conversations list:", e);
-                }
-            }
-            
-            // FIX 3: Final fallback - call /c/api/start to create a new session
+            // FIX 1: If no explicit ID is provided, force create a NEW session
             if (!convId) {
                 try {
                     const res = await originalFetch('https://copilot.microsoft.com/c/api/start', {
@@ -466,10 +437,39 @@
                     console.error("Failed to start conversation:", e);
                 }
             }
+            
+            // FIX 2: Fallback - Extract from URL only if creation failed and no explicit ID given
+            if (!convId) {
+                const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
+                if (urlMatch && urlMatch[1]) {
+                    convId = urlMatch[1];
+                    console.log("📌 Fallback: Using conversation from URL:", convId);
+                }
+            }
+            
+            // FIX 3: Fallback - get from existing conversations list
+            if (!convId) {
+                try {
+                    const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup', {
+                        method: 'GET',
+                        headers: { 'Accept': 'application/json' },
+                        credentials: 'include'
+                    });
+                    const data = await res.json();
+                    // Response shape may be { items: [...] } or an array
+                    const items = (data && data.items) ? data.items : (Array.isArray(data) ? data : null);
+                    if (items && items.length > 0 && items[0].id) {
+                        convId = items[0].id;
+                        console.log("📌 Fallback: Using existing conversation:", convId);
+                    }
+                } catch(e) {
+                    console.error("Failed to get conversations list:", e);
+                }
+            }
 
             if (!convId) {
                 this.status = "idle";
-                onDone("❌ Session Error. Please solve CAPTCHA if visible.");
+                onDone("❌ Session Error. Please solve CAPTCHA if visible.", null);
                 return;
             }
 
@@ -522,26 +522,26 @@
                     // Only append text from the assistant, not user echo
                     if (!assistantMessageId || msg.messageId === assistantMessageId) {
                         this.responseText += msg.text;
-                        onChunk(this.responseText, msg.text);
+                        onChunk(this.responseText, msg.text, convId);
                     }
                 } else if (msg.event === 'done' || msg.event === 'error') {
                     apiSocket.close();
                     this.status = "idle";
-                    onDone(this.responseText);
+                    onDone(this.responseText, convId);
                 }
             };
             
             apiSocket.onerror = (err) => {
                 console.error("WebSocket error:", err);
                 this.status = "idle";
-                onDone("❌ Connection error");
+                onDone("❌ Connection error", convId);
             };
             
             apiSocket.onclose = () => {
                 if (this.status === "busy") {
                     this.status = "idle";
                     if (this.responseText) {
-                        onDone(this.responseText);
+                        onDone(this.responseText, convId);
                     }
                 }
             };
@@ -565,18 +565,25 @@
             if (data.message) {
                 console.log("Received message from backend:", data.message);
                 
-                window.terminalBridge.askCopilot(data.message, 
-                    (fullText, chunk) => {
+                // Extract explicit conversation_id if provided
+                const explicitConvId = data.conversation_id || null;
+                
+                window.terminalBridge.askCopilot(
+                    data.message,
+                    explicitConvId,
+                    (fullText, chunk, usedConvId) => {
                         backendSocket.send(JSON.stringify({
                             type: "chunk",
                             content: chunk,
-                            full: fullText
+                            full: fullText,
+                            conversation_id: usedConvId
                         }));
                     },
-                    (finalText) => {
+                    (finalText, usedConvId) => {
                         backendSocket.send(JSON.stringify({
                             type: "done",
-                            content: finalText
+                            content: finalText,
+                            conversation_id: usedConvId
                         }));
                     }
                 );

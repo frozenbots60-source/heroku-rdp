@@ -20,7 +20,7 @@
         HARDWARE_CLICK_SERVER: "ws://127.0.0.1:8765",
         
         // Backend WSS URL (your existing server)
-        BACKEND_WSS_URL: "wss://wss-api-5ca5596e4af3.herokuapp.com/ws",
+        BACKEND_WSS_URL: "wss://ai-wss-685eced2e7b5.herokuapp.com/ws",
         
         // Captcha detection settings
         CAPTCHA_CHECK_INTERVAL: 1000,  // Check every 1 second

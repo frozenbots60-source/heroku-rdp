@@ -402,6 +402,16 @@
         status: "idle",
         responseText: "",
         
+        // Helper: Natively generate a 21-char base62 ID
+        generateNanoId() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+            let id = '';
+            for (let i = 0; i < 21; i++) {
+                id += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return id;
+        },
+        
         async askCopilot(text, convIdOverride, onChunk, onDone) {
             this.status = "busy";
             this.responseText = "";
@@ -416,61 +426,14 @@
 
             let convId = convIdOverride || null;
             
-            // FIX 1: If no explicit ID is provided, force create a NEW session
+            // THE FIX: Completely bypass Copilot's /start API and URL fallbacks.
+            // If the server doesn't provide an ID, we create a fresh one locally.
+            // This guarantees 100% conversation isolation for /new.
             if (!convId) {
-                try {
-                    const res = await originalFetch('https://copilot.microsoft.com/c/api/start', {
-                        method: 'POST',
-                        headers: { 
-                            'Accept': 'application/json',
-                            'Content-Type': 'application/json'
-                        },
-                        credentials: 'include',
-                        body: JSON.stringify({})
-                    });
-                    const data = await res.json();
-                    if (data) {
-                        convId = data.id || data.conversationId || (data.conversation && data.conversation.id);
-                    }
-                    if (convId) console.log("📌 Started new conversation:", convId);
-                } catch(e) {
-                    console.error("Failed to start conversation:", e);
-                }
-            }
-            
-            // FIX 2: Fallback - Extract from URL only if creation failed and no explicit ID given
-            if (!convId) {
-                const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
-                if (urlMatch && urlMatch[1]) {
-                    convId = urlMatch[1];
-                    console.log("📌 Fallback: Using conversation from URL:", convId);
-                }
-            }
-            
-            // FIX 3: Fallback - get from existing conversations list
-            if (!convId) {
-                try {
-                    const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup', {
-                        method: 'GET',
-                        headers: { 'Accept': 'application/json' },
-                        credentials: 'include'
-                    });
-                    const data = await res.json();
-                    // Response shape may be { items: [...] } or an array
-                    const items = (data && data.items) ? data.items : (Array.isArray(data) ? data : null);
-                    if (items && items.length > 0 && items[0].id) {
-                        convId = items[0].id;
-                        console.log("📌 Fallback: Using existing conversation:", convId);
-                    }
-                } catch(e) {
-                    console.error("Failed to get conversations list:", e);
-                }
-            }
-
-            if (!convId) {
-                this.status = "idle";
-                onDone("❌ Session Error. Please solve CAPTCHA if visible.", null);
-                return;
+                convId = this.generateNanoId();
+                console.log("✨ Generated true fresh client-side conversation ID:", convId);
+            } else {
+                console.log("📌 Resuming specific conversation:", convId);
             }
 
             const apiSocket = new WebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');

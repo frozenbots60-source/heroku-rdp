@@ -406,14 +406,8 @@
             this.status = "busy";
             this.responseText = "";
             const originalFetch = window.fetch;
+            const DELIM = String.fromCharCode(30);
             
-            function safeParse(str) {
-                try {
-                    if (typeof str === 'string' && str.endsWith('\x1e')) str = str.slice(0, -1);
-                    return JSON.parse(str);
-                } catch(e) { return null; }
-            }
-
             let convId = convIdOverride || null;
             
             // FIX 1: If no explicit ID is provided, force create a NEW session locally
@@ -468,7 +462,7 @@
             let assistantMessageId = null;  // Track which messageId belongs to assistant
             
             apiSocket.onopen = () => {
-                // FIX 4: Updated setOptions with new supportedFeatures and supportedCards
+                // FIX 4: Updated setOptions with new supportedFeatures and supportedCards + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "setOptions",
                     "supportedFeatures": [
@@ -482,43 +476,51 @@
                         "healthcareEntity", "healthcareInfo", "chart",
                         "safetyHelpline", "quiz", "finance", "recipe", "personal"
                     ]
-                }));
+                }) + DELIM);
                 
-                // FIX 5: New event - report local consents (required by new API)
+                // FIX 5: New event - report local consents + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "reportLocalConsents",
                     "grantedConsents": []
-                }));
+                }) + DELIM);
                 
-                // FIX 6: send event - mode is now lowercase "smart" and includes "context": {}
+                // FIX 6: send event - mode is now lowercase "smart" + added messageId + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "send",
                     "conversationId": convId,
+                    "messageId": crypto.randomUUID(),
                     "content": [{"type": "text", "text": text}],
                     "mode": "smart",
                     "context": {}
-                }));
+                }) + DELIM);
             };
             
             apiSocket.onmessage = (event) => {
-                const msg = safeParse(event.data);
-                if (!msg) return;
+                // Safely split the response by the SignalR \x1e delimiter
+                const payloads = event.data.toString().split(DELIM);
                 
-                // FIX 7: Track assistant's messageId from startMessage event
-                // so we don't echo back our own user message text
-                if (msg.event === 'startMessage') {
-                    assistantMessageId = msg.messageId;
-                    console.log("🤖 Assistant message started:", assistantMessageId);
-                } else if (msg.event === 'appendText') {
-                    // Only append text from the assistant, not user echo
-                    if (!assistantMessageId || msg.messageId === assistantMessageId) {
-                        this.responseText += msg.text;
-                        onChunk(this.responseText, msg.text, convId);
-                    }
-                } else if (msg.event === 'done' || msg.event === 'error') {
-                    apiSocket.close();
-                    this.status = "idle";
-                    onDone(this.responseText, convId);
+                for (const payload of payloads) {
+                    if (!payload) continue;
+                    try {
+                        const msg = JSON.parse(payload);
+                        
+                        // FIX 7: Track assistant's messageId from startMessage event
+                        if (msg.event === 'startMessage') {
+                            assistantMessageId = msg.messageId;
+                            console.log("🤖 Assistant message started:", assistantMessageId);
+                        } else if (msg.event === 'appendText') {
+                            // Only append text from the assistant, not user echo
+                            if (!assistantMessageId || msg.messageId === assistantMessageId) {
+                                const chunkText = msg.text || "";
+                                this.responseText += chunkText;
+                                onChunk(this.responseText, chunkText, convId);
+                            }
+                        } else if (msg.event === 'done' || msg.event === 'error') {
+                            apiSocket.close();
+                            this.status = "idle";
+                            onDone(this.responseText, convId);
+                        }
+                    } catch(e) {}
                 }
             };
             

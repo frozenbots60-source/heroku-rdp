@@ -398,7 +398,7 @@
     }
 
     // ================================
-    // TERMINAL BRIDGE (Existing Logic)
+    // TERMINAL BRIDGE (UPDATED API CALLS)
     // ================================
     window.terminalBridge = {
         status: "idle",
@@ -417,15 +417,54 @@
             }
 
             let convId = null;
-            try {
-                const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations', {
-                    method: 'POST',
-                    headers: { 'Accept': 'application/json' }
-                });
-                const data = await res.json();
-                if (data && data.id) convId = data.id;
-            } catch(e) {
-                console.error("Failed to create conversation:", e);
+            
+            // FIX 1: Try to extract conversation ID from URL first (e.g. /chats/xxxxxx)
+            const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
+            if (urlMatch && urlMatch[1]) {
+                convId = urlMatch[1];
+                console.log("📌 Using conversation from URL:", convId);
+            }
+            
+            // FIX 2: Fallback - get from existing conversations list (new endpoint)
+            if (!convId) {
+                try {
+                    const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup', {
+                        method: 'GET',
+                        headers: { 'Accept': 'application/json' },
+                        credentials: 'include'
+                    });
+                    const data = await res.json();
+                    // Response shape may be { items: [...] } or an array
+                    const items = (data && data.items) ? data.items : (Array.isArray(data) ? data : null);
+                    if (items && items.length > 0 && items[0].id) {
+                        convId = items[0].id;
+                        console.log("📌 Using existing conversation:", convId);
+                    }
+                } catch(e) {
+                    console.error("Failed to get conversations list:", e);
+                }
+            }
+            
+            // FIX 3: Final fallback - call /c/api/start to create a new session
+            if (!convId) {
+                try {
+                    const res = await originalFetch('https://copilot.microsoft.com/c/api/start', {
+                        method: 'POST',
+                        headers: { 
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json'
+                        },
+                        credentials: 'include',
+                        body: JSON.stringify({})
+                    });
+                    const data = await res.json();
+                    if (data) {
+                        convId = data.id || data.conversationId || (data.conversation && data.conversation.id);
+                    }
+                    if (convId) console.log("📌 Started new conversation:", convId);
+                } catch(e) {
+                    console.error("Failed to start conversation:", e);
+                }
             }
 
             if (!convId) {
@@ -435,26 +474,57 @@
             }
 
             const apiSocket = new WebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');
+            let assistantMessageId = null;  // Track which messageId belongs to assistant
             
             apiSocket.onopen = () => {
+                // FIX 4: Updated setOptions with new supportedFeatures and supportedCards
                 apiSocket.send(JSON.stringify({
                     "event": "setOptions",
-                    "supportedFeatures": ["partial-generated-images"]
+                    "supportedFeatures": [
+                        "partial-generated-images",
+                        "side-by-side-comparison",
+                        "session-duration-nudge",
+                        "compose-email-html"
+                    ],
+                    "supportedCards": [
+                        "weather", "local", "image", "sports", "video",
+                        "healthcareEntity", "healthcareInfo", "chart",
+                        "safetyHelpline", "quiz", "finance", "recipe", "personal"
+                    ]
                 }));
+                
+                // FIX 5: New event - report local consents (required by new API)
+                apiSocket.send(JSON.stringify({
+                    "event": "reportLocalConsents",
+                    "grantedConsents": []
+                }));
+                
+                // FIX 6: send event - mode is now lowercase "smart" and includes "context": {}
                 apiSocket.send(JSON.stringify({
                     "event": "send",
                     "conversationId": convId,
                     "content": [{"type": "text", "text": text}],
-                    "mode": "Smart"
+                    "mode": "smart",
+                    "context": {}
                 }));
             };
             
             apiSocket.onmessage = (event) => {
                 const msg = safeParse(event.data);
-                if (msg?.event === 'appendText') {
-                    this.responseText += msg.text;
-                    onChunk(this.responseText, msg.text);
-                } else if (msg?.event === 'done' || msg?.event === 'error') {
+                if (!msg) return;
+                
+                // FIX 7: Track assistant's messageId from startMessage event
+                // so we don't echo back our own user message text
+                if (msg.event === 'startMessage') {
+                    assistantMessageId = msg.messageId;
+                    console.log("🤖 Assistant message started:", assistantMessageId);
+                } else if (msg.event === 'appendText') {
+                    // Only append text from the assistant, not user echo
+                    if (!assistantMessageId || msg.messageId === assistantMessageId) {
+                        this.responseText += msg.text;
+                        onChunk(this.responseText, msg.text);
+                    }
+                } else if (msg.event === 'done' || msg.event === 'error') {
                     apiSocket.close();
                     this.status = "idle";
                     onDone(this.responseText);
@@ -465,6 +535,15 @@
                 console.error("WebSocket error:", err);
                 this.status = "idle";
                 onDone("❌ Connection error");
+            };
+            
+            apiSocket.onclose = () => {
+                if (this.status === "busy") {
+                    this.status = "idle";
+                    if (this.responseText) {
+                        onDone(this.responseText);
+                    }
+                }
             };
         }
     };

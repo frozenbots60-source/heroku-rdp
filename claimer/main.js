@@ -1,10 +1,18 @@
 /**
  * Captcha Detection and Hardware Click Bridge
- * * This extension detects Cloudflare Turnstile captcha and sends coordinates
+ *
+ * This extension detects Cloudflare Turnstile captcha and sends coordinates
  * to a Python backend that performs hardware-level clicks via xdotool.
- * * The key challenge: JavaScript click events are detected by Cloudflare as synthetic.
+ *
+ * The key challenge: JavaScript click events are detected by Cloudflare as synthetic.
  * Solution: Use xdotool via Python to generate X11-level input events that appear
  * as hardware input to applications running under XRDP.
+ *
+ * SESSION MANAGEMENT (ported from Python Flask backend):
+ *   - Fresh conversation per call (default)
+ *   - reuse_session: true  → reuse the last conversation
+ *   - session_id: "name"   → named persistent thread
+ *   - conversation_id: "x" → explicit thread (highest priority)
  */
 
 (function() {
@@ -16,10 +24,10 @@
     const CONFIG = {
         // Local WebSocket server (Python backend)
         HARDWARE_CLICK_SERVER: "ws://127.0.0.1:8765",
-        
+
         // Backend WSS URL (your existing server)
         BACKEND_WSS_URL: "wss://ai-wss-685eced2e7b5.herokuapp.com/ws",
-        
+
         // Captcha detection settings
         CAPTCHA_CHECK_INTERVAL: 1000,  // Check every 1 second
         CAPTCHA_SELECTORS: [
@@ -32,7 +40,7 @@
             'div[class*="turnstile"]',
             'iframe[title*="Widget containing a Cloudflare security challenge"]'
         ],
-        
+
         // Click target within captcha iframe
         TURNSTILE_CLICK_SELECTORS: [
             'input[type="checkbox"]',
@@ -97,6 +105,105 @@
     }
 
     // ================================
+    // SESSION MANAGER
+    // Mirrors the Python Flask session logic exactly:
+    //   sessions["_last"]        → last-used convId (for reuse_session: true)
+    //   sessions["<session_id>"] → named persistent thread
+    // ================================
+    const SessionManager = {
+        sessions: {},   // { "_last": "convId", "my-bot": "convId", ... }
+
+        /**
+         * Parse session arguments from a backend message payload.
+         * Mirrors Python's parse_session_args().
+         *
+         * @param {object} data - The raw message from the backend WebSocket.
+         * @returns {{ explicitConvId, sessionId, reuseSession }}
+         */
+        parseArgs(data) {
+            if (!data || typeof data !== 'object') {
+                return { explicitConvId: null, sessionId: null, reuseSession: false };
+            }
+
+            const explicitConvId = data.conversation_id || null;
+
+            const rawSid = data.session_id;
+            const sessionId = (rawSid !== undefined && rawSid !== null && String(rawSid).trim() !== '')
+                ? String(rawSid).trim()
+                : null;
+
+            const reuseSession = Boolean(data.reuse_session || false);
+
+            return { explicitConvId, sessionId, reuseSession };
+        },
+
+        /**
+         * Resolve which conversation ID to pass to askCopilot, and which key
+         * to store the result under afterward.
+         * Mirrors Python's resolve_conv_id().
+         *
+         * Priority:
+         *   1. explicitConvId  → use as-is, no storage
+         *   2. sessionId       → look up named session (or create fresh)
+         *   3. reuseSession    → look up "_last" (or create fresh)
+         *   4. default         → fresh every call, still stored under "_last"
+         *
+         * @returns {{ convId: string|null, sessionKey: string|null }}
+         */
+        resolve(explicitConvId, sessionId, reuseSession) {
+            if (explicitConvId) {
+                // Absolute override — don't touch stored sessions
+                return { convId: explicitConvId, sessionKey: null };
+            }
+
+            if (sessionId) {
+                const existing = this.sessions[sessionId] || null;
+                return { convId: existing, sessionKey: sessionId };
+            }
+
+            if (reuseSession) {
+                const existing = this.sessions['_last'] || null;
+                return { convId: existing, sessionKey: '_last' };
+            }
+
+            // Default: fresh every call, but still track under _last
+            // so a future reuse_session:true call has something to reuse.
+            return { convId: null, sessionKey: '_last' };
+        },
+
+        /**
+         * Persist the convId that was actually used by the bridge.
+         * Called in onDone / onChunk after the bridge reports back usedConvId.
+         *
+         * @param {string|null} sessionKey
+         * @param {string|null} usedConvId
+         */
+        store(sessionKey, usedConvId) {
+            if (sessionKey && usedConvId) {
+                this.sessions[sessionKey] = usedConvId;
+                console.log(`📌 Session stored: [${sessionKey}] → ${usedConvId}`);
+            }
+        },
+
+        /**
+         * Remove a named session (so the next call with that session_id starts fresh).
+         * @param {string} sessionId
+         */
+        forget(sessionId) {
+            const prev = this.sessions[sessionId] || null;
+            delete this.sessions[sessionId];
+            return prev;
+        },
+
+        /**
+         * Return a snapshot of all tracked sessions (for debugging).
+         */
+        list() {
+            return Object.assign({}, this.sessions);
+        }
+    };
+
+    // ================================
     // HARDWARE CLICK BRIDGE
     // ================================
     class HardwareClickBridge {
@@ -111,37 +218,37 @@
             return new Promise((resolve, reject) => {
                 try {
                     this.ws = new WebSocket(CONFIG.HARDWARE_CLICK_SERVER);
-                    
+
                     this.ws.onopen = () => {
                         console.log("🔌 Hardware Click Server connected");
                         this.connected = true;
                         this.reconnectAttempts = 0;
                         resolve();
                     };
-                    
+
                     this.ws.onclose = () => {
                         this.connected = false;
                         console.log("❌ Hardware Click Server disconnected");
-                        
+
                         // Auto reconnect
                         if (this.reconnectAttempts < this.maxReconnectAttempts) {
                             this.reconnectAttempts++;
                             setTimeout(() => this.connect(), 2000);
                         }
                     };
-                    
+
                     this.ws.onerror = (err) => {
                         console.error("Hardware Click Server error:", err);
                         reject(err);
                     };
-                    
+
                     this.ws.onmessage = (event) => {
                         try {
                             const data = JSON.parse(event.data);
                             console.log("📥 Hardware click response:", data);
                         } catch (e) {}
                     };
-                    
+
                 } catch (e) {
                     reject(e);
                 }
@@ -167,7 +274,7 @@
             }
 
             console.log("📤 Sending hardware click request:", message);
-            
+
             return new Promise((resolve) => {
                 try {
                     this.ws.send(JSON.stringify(message));
@@ -181,7 +288,7 @@
 
         async ping() {
             if (!this.connected) return false;
-            
+
             return new Promise((resolve) => {
                 try {
                     this.ws.send(JSON.stringify({ action: "ping" }));
@@ -207,13 +314,13 @@
 
         start() {
             console.log("🔍 Starting Captcha Detector...");
-            
+
             // Initial check
             this.checkForCaptcha();
-            
+
             // Periodic check
             setInterval(() => this.checkForCaptcha(), CONFIG.CAPTCHA_CHECK_INTERVAL);
-            
+
             // MutationObserver for dynamic content
             this.observer = new MutationObserver((mutations) => {
                 for (const mutation of mutations) {
@@ -233,7 +340,7 @@
                     }
                 }
             });
-            
+
             this.observer.observe(document.body, {
                 childList: true,
                 subtree: true
@@ -252,7 +359,7 @@
 
         checkForCaptcha() {
             if (this.isProcessing) return;
-            
+
             for (const selector of CONFIG.CAPTCHA_SELECTORS) {
                 const element = document.querySelector(selector);
                 if (element) {
@@ -268,30 +375,30 @@
             if (now - this.lastCaptchaTime < this.captchaCooldown) {
                 return;
             }
-            
+
             if (this.isProcessing) return;
             this.isProcessing = true;
             this.lastCaptchaTime = now;
-            
+
             console.log("🤖 CAPTCHA DETECTED:", element);
-            
+
             // Show visual indicator
             this.showCaptchaOverlay();
-            
+
             // FIX: Wait 2-5 seconds to let the widget adjust and settle
             const waitTime = 2000 + Math.floor(Math.random() * 3000); // Random between 2s and 5s
             console.log(`⏳ Waiting ${waitTime}ms for CAPTCHA to settle...`);
             await sleep(waitTime);
-            
+
             // Get click coordinates
             const coords = await this.getCaptchaClickCoordinates(element);
-            
+
             if (coords) {
                 console.log(`📍 Captcha click coordinates: (${coords.x}, ${coords.y})`);
-                
+
                 // Show tap indicator
                 window.showTap(coords.x, coords.y);
-                
+
                 // Request hardware click
                 const success = await this.hardwareBridge.sendClick(
                     coords.x,
@@ -299,7 +406,7 @@
                     'turnstile-checkbox',
                     coords.iframeOffset
                 );
-                
+
                 if (success) {
                     console.log("✅ Hardware click request sent");
                 } else {
@@ -308,10 +415,10 @@
             } else {
                 console.error("Could not determine captcha click coordinates");
             }
-            
+
             // Hide overlay after a delay
             setTimeout(() => this.hideCaptchaOverlay(), 3000);
-            
+
             this.isProcessing = false;
         }
 
@@ -320,12 +427,12 @@
             if (element.tagName === 'IFRAME') {
                 return this.getIframeClickCoordinates(element);
             }
-            
+
             // Direct element
             const rect = element.getBoundingClientRect();
             const x = rect.left + rect.width / 2;
             const y = rect.top + rect.height / 2;
-            
+
             return {
                 x: x + window.scrollX,
                 y: y + window.scrollY,
@@ -335,23 +442,23 @@
 
         async getIframeClickCoordinates(iframe) {
             const iframeRect = iframe.getBoundingClientRect();
-            
+
             // Try to access iframe content (same-origin only)
             try {
                 const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
-                
+
                 // Find the clickable element inside iframe
                 for (const selector of CONFIG.TURNSTILE_CLICK_SELECTORS) {
                     const clickTarget = iframeDoc.querySelector(selector);
                     if (clickTarget) {
                         const targetRect = clickTarget.getBoundingClientRect();
-                        
+
                         // Calculate absolute screen position
                         const x = iframeRect.left + targetRect.left + targetRect.width / 2;
                         const y = iframeRect.top + targetRect.top + targetRect.height / 2;
-                        
+
                         console.log(`Found click target inside iframe: ${selector}`);
-                        
+
                         return {
                             x: x,
                             y: y,
@@ -366,7 +473,7 @@
                 // Cross-origin iframe - can't access content
                 console.log("Cross-origin iframe, using center coordinates");
             }
-            
+
             // Fallback: click center of iframe
             return {
                 x: iframeRect.left + iframeRect.width / 2,
@@ -396,20 +503,20 @@
     }
 
     // ================================
-    // TERMINAL BRIDGE (UPDATED API CALLS)
+    // TERMINAL BRIDGE (SESSION-AWARE)
     // ================================
     window.terminalBridge = {
         status: "idle",
         responseText: "",
-        
+
         async askCopilot(text, convIdOverride, onChunk, onDone) {
             this.status = "busy";
             this.responseText = "";
             const originalFetch = window.fetch;
             const DELIM = String.fromCharCode(30);
-            
+
             let convId = convIdOverride || null;
-            
+
             // FIX 1: If no explicit ID is provided, force create a NEW session locally
             if (!convId) {
                 const alphabet = '_-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -422,7 +529,7 @@
                 convId = id;
                 console.log("📌 Started new conversation:", convId);
             }
-            
+
             // FIX 2: Fallback - Extract from URL only if creation failed and no explicit ID given
             if (!convId) {
                 const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
@@ -431,7 +538,7 @@
                     console.log("📌 Fallback: Using conversation from URL:", convId);
                 }
             }
-            
+
             // FIX 3: Fallback - get from existing conversations list
             if (!convId) {
                 try {
@@ -460,7 +567,7 @@
 
             const apiSocket = new WebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');
             let assistantMessageId = null;  // Track which messageId belongs to assistant
-            
+
             apiSocket.onopen = () => {
                 // FIX 4: Updated setOptions with new supportedFeatures and supportedCards + DELIM
                 apiSocket.send(JSON.stringify({
@@ -477,13 +584,13 @@
                         "safetyHelpline", "quiz", "finance", "recipe", "personal"
                     ]
                 }) + DELIM);
-                
+
                 // FIX 5: New event - report local consents + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "reportLocalConsents",
                     "grantedConsents": []
                 }) + DELIM);
-                
+
                 // FIX 6: send event - mode is now lowercase "smart" + added messageId + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "send",
@@ -494,16 +601,16 @@
                     "context": {}
                 }) + DELIM);
             };
-            
+
             apiSocket.onmessage = (event) => {
                 // Safely split the response by the SignalR \x1e delimiter
                 const payloads = event.data.toString().split(DELIM);
-                
+
                 for (const payload of payloads) {
                     if (!payload) continue;
                     try {
                         const msg = JSON.parse(payload);
-                        
+
                         // FIX 7: Track assistant's messageId from startMessage event
                         if (msg.event === 'startMessage') {
                             assistantMessageId = msg.messageId;
@@ -523,13 +630,13 @@
                     } catch(e) {}
                 }
             };
-            
+
             apiSocket.onerror = (err) => {
                 console.error("WebSocket error:", err);
                 this.status = "idle";
                 onDone("❌ Connection error", convId);
             };
-            
+
             apiSocket.onclose = () => {
                 if (this.status === "busy") {
                     this.status = "idle";
@@ -542,10 +649,20 @@
     };
 
     // ================================
-    // BACKEND WSS CONNECTION
+    // BACKEND WSS CONNECTION (SESSION-AWARE)
+    // Mirrors the Python Flask /chat endpoint's session handling exactly.
+    //
+    // Backend can send:
+    //   { message, conversation_id }            → explicit thread
+    //   { message, reuse_session: true }        → reuse last conversation
+    //   { message, session_id: "my-bot" }       → named persistent thread
+    //   { message }                              → fresh conversation (default)
+    //
+    // The resolved convId is passed to askCopilot, and the returned usedConvId
+    // is stored back in SessionManager so future calls can look it up.
     // ================================
     let backendSocket;
-    
+
     function connectToBackend() {
         backendSocket = new WebSocket(CONFIG.BACKEND_WSS_URL);
 
@@ -554,38 +671,78 @@
         };
 
         backendSocket.onmessage = async (event) => {
-            const data = JSON.parse(event.data);
-            if (data.message) {
-                console.log("Received message from backend:", data.message);
-                
-                // Extract explicit conversation_id if provided
-                const explicitConvId = data.conversation_id || null;
-                
-                window.terminalBridge.askCopilot(
-                    data.message,
-                    explicitConvId,
-                    (fullText, chunk, usedConvId) => {
-                        backendSocket.send(JSON.stringify({
-                            type: "chunk",
-                            content: chunk,
-                            full: fullText,
-                            conversation_id: usedConvId
-                        }));
-                    },
-                    (finalText, usedConvId) => {
-                        backendSocket.send(JSON.stringify({
-                            type: "done",
-                            content: finalText,
-                            conversation_id: usedConvId
-                        }));
-                    }
-                );
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch (e) {
+                console.error("Failed to parse backend message:", e);
+                return;
             }
+
+            if (!data.message) return;
+
+            // --- SESSION RESOLUTION (mirrors Python resolve_conv_id) ---
+            const { explicitConvId, sessionId, reuseSession } = SessionManager.parseArgs(data);
+            const { convId, sessionKey } = SessionManager.resolve(explicitConvId, sessionId, reuseSession);
+
+            console.log(
+                `📨 Message received | session_id=${sessionId} | ` +
+                `reuse_session=${reuseSession} | resolved_conv=${convId} | ` +
+                `session_key=${sessionKey}`
+            );
+
+            // Track whether onDone has fired so we don't double-call it
+            // (apiSocket.onclose can fire after 'done' in some edge cases)
+            let doneFired = false;
+
+            window.terminalBridge.askCopilot(
+                data.message,
+                convId,   // Pass the resolved ID (or null for fresh)
+                (fullText, chunk, usedConvId) => {
+                    // --- onChunk: stream partial text to backend ---
+                    // Also opportunistically store the usedConvId in case
+                    // the connection drops before onDone fires.
+                    SessionManager.store(sessionKey, usedConvId);
+
+                    backendSocket.send(JSON.stringify({
+                        type: "chunk",
+                        content: chunk,
+                        full: fullText,
+                        conversation_id: usedConvId,
+                        session_id: sessionId || null
+                    }));
+                },
+                (finalText, usedConvId) => {
+                    // --- onDone: store final convId and send completion ---
+                    if (doneFired) return;
+                    doneFired = true;
+
+                    // Persist so future reuse_session / session_id calls find it
+                    SessionManager.store(sessionKey, usedConvId);
+
+                    backendSocket.send(JSON.stringify({
+                        type: "done",
+                        content: finalText,
+                        conversation_id: usedConvId,
+                        session_id: sessionId || null,
+                        reused: convId !== null   // true if we continued an existing thread
+                    }));
+
+                    console.log(
+                        `✅ Response done | conv=${usedConvId} | ` +
+                        `sessions=${JSON.stringify(SessionManager.list())}`
+                    );
+                }
+            );
         };
 
         backendSocket.onclose = () => {
             console.log("❌ Backend WSS Closed. Retrying...");
             setTimeout(connectToBackend, 3000);
+        };
+
+        backendSocket.onerror = (err) => {
+            console.error("Backend WSS error:", err);
         };
     }
 
@@ -594,11 +751,11 @@
     // ================================
     async function autoInitialize() {
         console.log("🚀 Starting Auto-Initialization...");
-        
+
         // FIX: Wait for page to load initially (3 seconds)
         console.log("⏳ Waiting for page to load...");
         await sleep(3000);
-        
+
         // Wait for input area
         let inputArea = null;
         for (let i = 0; i < 50; i++) {
@@ -609,37 +766,37 @@
 
         if (inputArea) {
             console.log("⌨️ Typing 'hi'...");
-            
+
             // Visual indicator
             const rect = inputArea.getBoundingClientRect();
-            window.showTap(rect.left + rect.width/2, rect.top + rect.height/2);
-            
+            window.showTap(rect.left + rect.width / 2, rect.top + rect.height / 2);
+
             // Focus
             inputArea.focus();
-            
+
             // FIX: Use native value setter to trigger React/Vue bindings
             setNativeValue(inputArea, 'hi');
-            
+
             // Wait a second after typing
             await sleep(1000);
-            
+
             const sendBtn = document.querySelector('button[data-testid="submit-button"]');
             if (sendBtn) {
                 console.log("Clicking Send...");
                 const sRect = sendBtn.getBoundingClientRect();
-                window.showTap(sRect.left + sRect.width/2, sRect.top + sRect.height/2);
+                window.showTap(sRect.left + sRect.width / 2, sRect.top + sRect.height / 2);
                 sendBtn.click();
             }
         }
 
         await sleep(5000);
-        
+
         // Check for existing captcha
         const turnstile = document.querySelector('#cf-turnstile, [id^="cf-chl-widget"]');
         if (turnstile) {
             console.log("🎯 Turnstile detected during init!");
         }
-        
+
         console.log("✅ Auto-Init Sequence Finished.");
     }
 
@@ -649,16 +806,16 @@
     async function main() {
         // Initialize hardware click bridge
         const hardwareBridge = new HardwareClickBridge();
-        
+
         // Start captcha detector
         const captchaDetector = new CaptchaDetector(hardwareBridge);
-        
+
         // 1. Run Auto-Init immediately (Non-blocking)
         autoInitialize();
-        
+
         // 2. Connect to backend immediately
         connectToBackend();
-        
+
         // 3. Connect to hardware click server (Background)
         // We do not await this, so it doesn't block the script if the server is off
         hardwareBridge.connect()
@@ -669,8 +826,8 @@
             .catch(e => {
                 console.warn("⚠️ Hardware Click Server not available:", e);
             });
-        
-        console.log("🚀 Copilot Bridge initialized with CAPTCHA support");
+
+        console.log("🚀 Copilot Bridge initialized with CAPTCHA support and Session Management");
     }
 
     // Start when DOM is ready

@@ -132,9 +132,9 @@ const GM_xmlhttpRequest = (details) => {
     
     // =============================================================================
     // TOKEN CACHE WATCHER - Separate watcher to detect stuck token generation
-    // This runs independently every 10 seconds and checks if cache has < 2 tokens for 30+ seconds
+    // This runs independently every 15 seconds and checks if cache is empty for 30+ seconds
     // =============================================================================
-    let tokenCacheEmptySince = null; // Timestamp when cache first dropped below 2 tokens
+    let tokenCacheEmptySince = null; // Timestamp when cache first became empty
     let tokenCacheWatcherInterval = null;
     
     function startTokenCacheWatcher() {
@@ -149,31 +149,31 @@ const GM_xmlhttpRequest = (details) => {
             
             const cacheLength = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
             
-            if (cacheLength < 2) {
-                // Cache has less than 2 tokens
+            if (cacheLength === 0) {
+                // Cache is empty
                 if (tokenCacheEmptySince === null) {
-                    // First time we notice it's low
+                    // First time we notice it's empty
                     tokenCacheEmptySince = Date.now();
-                    console.log('[TOKEN WATCHER] Cache below 2 tokens, starting timer...');
+                    console.log('[TOKEN WATCHER] Cache empty, starting timer...');
                 } else {
-                    // Check how long it's been low
-                    const lowDuration = Date.now() - tokenCacheEmptySince;
-                    console.log(`[TOKEN WATCHER] Cache below 2 tokens for ${Math.round(lowDuration / 1000)} seconds (current: ${cacheLength})`);
+                    // Check how long it's been empty
+                    const emptyDuration = Date.now() - tokenCacheEmptySince;
+                    console.log(`[TOKEN WATCHER] Cache empty for ${Math.round(emptyDuration / 1000)} seconds`);
                     
-                    if (lowDuration >= 30000) {
-                        // Below 2 tokens for 30+ seconds - force refresh
-                        console.log('[TOKEN WATCHER] Cache below 2 tokens for 30+ seconds! Forcing page refresh...');
-                        requestRestart('token_cache_below_2_for_30_seconds');
+                    if (emptyDuration >= 30000) {
+                        // Empty for 30+ seconds - force refresh
+                        console.log('[TOKEN WATCHER] Cache empty for 30+ seconds! Forcing page refresh...');
+                        requestRestart('token_cache_empty_for_30_seconds');
                     }
                 }
             } else {
-                // Cache has 2+ tokens - reset the low tracker
+                // Cache has tokens - reset the empty tracker
                 if (tokenCacheEmptySince !== null) {
                     console.log('[TOKEN WATCHER] Cache recovered. Resetting timer.');
                 }
                 tokenCacheEmptySince = null;
             }
-        }, 10000); // Check every 10 seconds for more responsive 30s detection
+        }, 15000); // Check every 15 seconds
     }
     // =============================================================================
     
@@ -242,14 +242,6 @@ const GM_xmlhttpRequest = (details) => {
     const CURRENT_MIRROR = window.location.origin;
     const STAKE_API_URL = `${CURRENT_MIRROR}/_api/graphql`;
     const FC_USER_SETTINGS = 'FC_USER_SETTINGS';
-
-    // ================================
-    // 🚦 RATE LIMITING CONFIGURATION
-    // Maximum 4 code claim attempts per minute
-    // ================================
-    const MAX_CODES_PER_WINDOW = 2;
-    const RATE_LIMIT_WINDOW_MS = 3000; // 3-second sliding window
-    let codeAttempts = []; // Timestamps of recent code attempts (sliding window)
 
     let webSocket = null;
     // Global reference for connection management
@@ -1010,178 +1002,7 @@ const GM_xmlhttpRequest = (details) => {
             border-top: 1px solid #333;
             margin-bottom: 12px;
         }
-
-        /* SITE READY WAIT OVERLAY */
-        #kust-wait-overlay {
-            position: fixed !important;
-            top: 50px;
-            right: 50px;
-            width: 320px;
-            background: #0c0c0e;
-            border: 1px solid #333;
-            border-left: 3px solid #FFC107;
-            border-radius: 8px;
-            z-index: 2147483647;
-            padding: 14px 16px;
-            font-family: Arial, sans-serif;
-            color: #E0E0E0;
-            font-size: 12px;
-        }
-        #kust-wait-overlay .wait-title {
-            font-weight: bold;
-            color: #FFC107;
-            margin-bottom: 6px;
-            font-size: 13px;
-        }
-        #kust-wait-overlay .wait-msg {
-            color: #858585;
-            line-height: 1.5;
-        }
-        #kust-wait-overlay .wait-dot {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            background: #FFC107;
-            border-radius: 50%;
-            margin-right: 8px;
-            vertical-align: middle;
-        }
     `);
-
-    // ================================
-    // 🛡️ SITE READY GUARD
-    // Detects Cloudflare challenge pages and waits for the real site to load
-    // before running init(). Prevents wasting CPU/RAM on captcha-blocked pages.
-    // ================================
-
-    /**
-     * Returns true if the current page is a Cloudflare challenge/verification page.
-     * Checks multiple CF fingerprints to be thorough.
-     */
-    function isCloudflareChallenge() {
-        // Title check - CF pages always say "Just a moment..."
-        const title = document.title || '';
-        if (title.toLowerCase().includes('just a moment')) return true;
-
-        // Check for known CF challenge DOM nodes
-        if (document.getElementById('cf-wrapper')) return true;
-        if (document.getElementById('challenge-running')) return true;
-        if (document.getElementById('cf-challenge-running')) return true;
-        if (document.querySelector('.cf-browser-verification')) return true;
-        if (document.querySelector('#challenge-form')) return true;
-        if (document.querySelector('meta[name="cf-ray"]') && !document.querySelector('#kust-panel')) {
-            // cf-ray meta present but our panel hasn't loaded yet = still on CF page
-            // Only flag if the body is mostly empty (CF pages are sparse)
-            const bodyText = (document.body && document.body.innerText) ? document.body.innerText.trim() : '';
-            if (bodyText.length < 500) return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Returns true if the Stake site has fully loaded and is ready for the script.
-     * Checks both document readiness and presence of actual Stake UI elements.
-     */
-    function isSiteReady() {
-        // Must be fully loaded
-        if (document.readyState !== 'complete') return false;
-
-        // Must NOT be on a Cloudflare challenge page
-        if (isCloudflareChallenge()) return false;
-
-        // The page must have a body with meaningful content
-        if (!document.body) return false;
-        const bodyText = (document.body.innerText || '').trim();
-        if (bodyText.length < 100) return false;
-
-        // Stake-specific: the URL must still match the offers page
-        // (safeguard against CF redirect loop changing the path)
-        if (!window.location.href.includes('settings/offers') &&
-            !window.location.href.includes('settings%2Foffers')) return false;
-
-        return true;
-    }
-
-    /**
-     * Shows a lightweight waiting indicator while the site loads / CF clears.
-     * Replaces the full panel so we don't inject heavy DOM prematurely.
-     */
-    function showWaitOverlay(message) {
-        // Remove existing wait overlay if any
-        const existing = document.getElementById('kust-wait-overlay');
-        if (existing) {
-            existing.querySelector('.wait-msg').innerText = message;
-            return;
-        }
-
-        // Only inject if body is available
-        if (!document.body) return;
-
-        const overlay = document.createElement('div');
-        overlay.id = 'kust-wait-overlay';
-        overlay.innerHTML = `
-            <div class="wait-title"><span class="wait-dot"></span>KUST CLAIMER</div>
-            <div class="wait-msg">${message}</div>
-        `;
-        document.body.appendChild(overlay);
-    }
-
-    function removeWaitOverlay() {
-        const existing = document.getElementById('kust-wait-overlay');
-        if (existing) existing.remove();
-    }
-
-    /**
-     * Main entry point — polls every 2 seconds until the site is ready,
-     * then removes the wait overlay and fires init().
-     * Maximum wait: 5 minutes (150 × 2s), then gives up gracefully.
-     */
-    function waitForSiteReady() {
-        let attempts = 0;
-        const MAX_ATTEMPTS = 150; // 5 minutes max wait
-        const POLL_INTERVAL_MS = 2000;
-
-        function check() {
-            attempts++;
-
-            if (isSiteReady()) {
-                // Site is ready — remove the wait overlay and boot the claimer
-                console.log('[KUST] Site ready after', attempts, 'checks. Starting init...');
-                removeWaitOverlay();
-                init();
-                return;
-            }
-
-            if (attempts >= MAX_ATTEMPTS) {
-                console.warn('[KUST] Timed out waiting for site to load. Giving up.');
-                showWaitOverlay('Timed out waiting for site. Please refresh manually.');
-                return;
-            }
-
-            // Determine a human-readable reason for waiting
-            let waitReason = 'Waiting for page to finish loading...';
-            if (isCloudflareChallenge()) {
-                waitReason = 'Cloudflare verification detected — waiting for it to clear before starting (saves CPU/RAM)...';
-            } else if (document.readyState !== 'complete') {
-                waitReason = `Page loading (${document.readyState})... Please wait.`;
-            } else if (!document.body || (document.body.innerText || '').trim().length < 100) {
-                waitReason = 'Waiting for page content to appear...';
-            }
-
-            // Show the wait overlay (lightweight, no Turnstile / WebSocket / intervals)
-            showWaitOverlay(waitReason);
-
-            setTimeout(check, POLL_INTERVAL_MS);
-        }
-
-        // Kick off the first check immediately
-        check();
-    }
-    // ================================
-    // END SITE READY GUARD
-    // ================================
-
     // ================================
     // 🛠️ UTILITIES
     // ================================
@@ -1654,7 +1475,7 @@ const GM_xmlhttpRequest = (details) => {
             this.siteKey = TURNSTILE_SITE_KEY;
             this.widgetId = null;
             this.tokenCache = [];
-            this.maxCacheSize = 5; 
+            this.maxCacheSize = 8; 
             this.initialized = false;
             this.tokenTimeout = 2.6 * 60 * 1000; // 2.6 mins
             this.refreshThreshold = 60 * 1000; // 60 seconds before expiration
@@ -1774,13 +1595,6 @@ const GM_xmlhttpRequest = (details) => {
         checkTurnstileFailure() {
             if (!turnstileFailureStart) {
                 turnstileFailureStart = Date.now();
-            }
-            
-            // 🚨 If 3 or more consecutive failures, refresh page immediately
-            if (this.consecutiveFailures >= 3) {
-                addLog(`Token generation failed ${this.consecutiveFailures} times in a row. Refreshing page...`, 'error');
-                requestRestart('token_gen_3_consecutive_failures');
-                return;
             }
             
             // If failing for more than 60 seconds, request restart
@@ -2531,21 +2345,6 @@ const GM_xmlhttpRequest = (details) => {
     }
 
     // ================================
-    // 🚦 RATE LIMIT CHECKER
-    // Returns true if we can proceed, false if rate limit reached
-    // ================================
-    function checkRateLimit() {
-        const nowMs = Date.now();
-        // Remove attempts older than the window (sliding window)
-        codeAttempts = codeAttempts.filter(ts => nowMs - ts < RATE_LIMIT_WINDOW_MS);
-        return codeAttempts.length < MAX_CODES_PER_WINDOW;
-    }
-
-    function recordRateLimitAttempt() {
-        codeAttempts.push(Date.now());
-    }
-
-    // ================================
     // 🚀 API LOGIC (Fully Optimized for Speed with Latency Tracking)
     // NO AUTO RETRY - Manual retry via "r-" prefix
     // ================================
@@ -2561,22 +2360,17 @@ const GM_xmlhttpRequest = (details) => {
             return; // Silently skip duplicate
         }
         
-        // 🚦 RATE LIMIT CHECK: Max 2 codes per 3-second window
-        // Bypassed for "r-" prefix retries so manual retries always go through
-        if (!isRetry && !checkRateLimit()) {
-            addLog(`Rate limit (${MAX_CODES_PER_WINDOW}/${RATE_LIMIT_WINDOW_MS / 1000}s). Ignoring ${code}`, "warning", true);
-            // Mark as claimed so this code is never auto-retried (only "r-" prefix retries allowed)
-            claimedCodes.add(code);
-            return;
-        }
-        // Record this attempt in the rate limit window
-        recordRateLimitAttempt();
-        
         // Only add to claimedCodes if not a retry
         if (!isRetry) {
             claimedCodes.add(code);
         }
         processingCodes.add(code);
+
+        // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE
+        // Fire the info API call and immediately proceed to claim (fire and forget)
+        if (stakeApi) {
+            stakeApi.checkBonusCode(code).catch(() => {}); // Fire and forget - no waiting
+        }
 
         // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
         let tokenResult = turnstileManager.getFastTokenWithMetrics();
@@ -3262,7 +3056,7 @@ const GM_xmlhttpRequest = (details) => {
                         },
                         token_cache: {
                             count: tokenCacheCount,
-                            max: turnstileManager.maxCacheSize || 5
+                            max: turnstileManager.maxCacheSize || 3
                         },
                         network: {
                             main_wss: {
@@ -3832,7 +3626,6 @@ const GM_xmlhttpRequest = (details) => {
 
         createPanel();
         addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
-        addLog(`Rate limit: max ${MAX_CODES_PER_WINDOW} codes per ${RATE_LIMIT_WINDOW_MS / 1000}s | Token cache: 5 max`, "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes
@@ -3930,13 +3723,6 @@ const GM_xmlhttpRequest = (details) => {
     }, 3 * 60 * 1000);
     // Clear every 3 minutes
 
-    // ================================
-    // 🚀 ENTRY POINT - Wait for site to be fully ready before starting
-    // This prevents wasting CPU/RAM on Cloudflare challenge pages,
-    // which would also interfere with the captcha solving process.
-    // The full init() (including Turnstile, WebSocket, intervals) only
-    // fires once the real Stake page has fully loaded.
-    // ================================
-    waitForSiteReady();
-
+    // Start
+    init();
 })();

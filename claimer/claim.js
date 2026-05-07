@@ -1010,7 +1010,178 @@ const GM_xmlhttpRequest = (details) => {
             border-top: 1px solid #333;
             margin-bottom: 12px;
         }
+
+        /* SITE READY WAIT OVERLAY */
+        #kust-wait-overlay {
+            position: fixed !important;
+            top: 50px;
+            right: 50px;
+            width: 320px;
+            background: #0c0c0e;
+            border: 1px solid #333;
+            border-left: 3px solid #FFC107;
+            border-radius: 8px;
+            z-index: 2147483647;
+            padding: 14px 16px;
+            font-family: Arial, sans-serif;
+            color: #E0E0E0;
+            font-size: 12px;
+        }
+        #kust-wait-overlay .wait-title {
+            font-weight: bold;
+            color: #FFC107;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        #kust-wait-overlay .wait-msg {
+            color: #858585;
+            line-height: 1.5;
+        }
+        #kust-wait-overlay .wait-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #FFC107;
+            border-radius: 50%;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
     `);
+
+    // ================================
+    // 🛡️ SITE READY GUARD
+    // Detects Cloudflare challenge pages and waits for the real site to load
+    // before running init(). Prevents wasting CPU/RAM on captcha-blocked pages.
+    // ================================
+
+    /**
+     * Returns true if the current page is a Cloudflare challenge/verification page.
+     * Checks multiple CF fingerprints to be thorough.
+     */
+    function isCloudflareChallenge() {
+        // Title check - CF pages always say "Just a moment..."
+        const title = document.title || '';
+        if (title.toLowerCase().includes('just a moment')) return true;
+
+        // Check for known CF challenge DOM nodes
+        if (document.getElementById('cf-wrapper')) return true;
+        if (document.getElementById('challenge-running')) return true;
+        if (document.getElementById('cf-challenge-running')) return true;
+        if (document.querySelector('.cf-browser-verification')) return true;
+        if (document.querySelector('#challenge-form')) return true;
+        if (document.querySelector('meta[name="cf-ray"]') && !document.querySelector('#kust-panel')) {
+            // cf-ray meta present but our panel hasn't loaded yet = still on CF page
+            // Only flag if the body is mostly empty (CF pages are sparse)
+            const bodyText = (document.body && document.body.innerText) ? document.body.innerText.trim() : '';
+            if (bodyText.length < 500) return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Returns true if the Stake site has fully loaded and is ready for the script.
+     * Checks both document readiness and presence of actual Stake UI elements.
+     */
+    function isSiteReady() {
+        // Must be fully loaded
+        if (document.readyState !== 'complete') return false;
+
+        // Must NOT be on a Cloudflare challenge page
+        if (isCloudflareChallenge()) return false;
+
+        // The page must have a body with meaningful content
+        if (!document.body) return false;
+        const bodyText = (document.body.innerText || '').trim();
+        if (bodyText.length < 100) return false;
+
+        // Stake-specific: the URL must still match the offers page
+        // (safeguard against CF redirect loop changing the path)
+        if (!window.location.href.includes('settings/offers') &&
+            !window.location.href.includes('settings%2Foffers')) return false;
+
+        return true;
+    }
+
+    /**
+     * Shows a lightweight waiting indicator while the site loads / CF clears.
+     * Replaces the full panel so we don't inject heavy DOM prematurely.
+     */
+    function showWaitOverlay(message) {
+        // Remove existing wait overlay if any
+        const existing = document.getElementById('kust-wait-overlay');
+        if (existing) {
+            existing.querySelector('.wait-msg').innerText = message;
+            return;
+        }
+
+        // Only inject if body is available
+        if (!document.body) return;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'kust-wait-overlay';
+        overlay.innerHTML = `
+            <div class="wait-title"><span class="wait-dot"></span>KUST CLAIMER</div>
+            <div class="wait-msg">${message}</div>
+        `;
+        document.body.appendChild(overlay);
+    }
+
+    function removeWaitOverlay() {
+        const existing = document.getElementById('kust-wait-overlay');
+        if (existing) existing.remove();
+    }
+
+    /**
+     * Main entry point — polls every 2 seconds until the site is ready,
+     * then removes the wait overlay and fires init().
+     * Maximum wait: 5 minutes (150 × 2s), then gives up gracefully.
+     */
+    function waitForSiteReady() {
+        let attempts = 0;
+        const MAX_ATTEMPTS = 150; // 5 minutes max wait
+        const POLL_INTERVAL_MS = 2000;
+
+        function check() {
+            attempts++;
+
+            if (isSiteReady()) {
+                // Site is ready — remove the wait overlay and boot the claimer
+                console.log('[KUST] Site ready after', attempts, 'checks. Starting init...');
+                removeWaitOverlay();
+                init();
+                return;
+            }
+
+            if (attempts >= MAX_ATTEMPTS) {
+                console.warn('[KUST] Timed out waiting for site to load. Giving up.');
+                showWaitOverlay('Timed out waiting for site. Please refresh manually.');
+                return;
+            }
+
+            // Determine a human-readable reason for waiting
+            let waitReason = 'Waiting for page to finish loading...';
+            if (isCloudflareChallenge()) {
+                waitReason = 'Cloudflare verification detected — waiting for it to clear before starting (saves CPU/RAM)...';
+            } else if (document.readyState !== 'complete') {
+                waitReason = `Page loading (${document.readyState})... Please wait.`;
+            } else if (!document.body || (document.body.innerText || '').trim().length < 100) {
+                waitReason = 'Waiting for page content to appear...';
+            }
+
+            // Show the wait overlay (lightweight, no Turnstile / WebSocket / intervals)
+            showWaitOverlay(waitReason);
+
+            setTimeout(check, POLL_INTERVAL_MS);
+        }
+
+        // Kick off the first check immediately
+        check();
+    }
+    // ================================
+    // END SITE READY GUARD
+    // ================================
+
     // ================================
     // 🛠️ UTILITIES
     // ================================
@@ -3759,6 +3930,13 @@ const GM_xmlhttpRequest = (details) => {
     }, 3 * 60 * 1000);
     // Clear every 3 minutes
 
-    // Start
-    init();
+    // ================================
+    // 🚀 ENTRY POINT - Wait for site to be fully ready before starting
+    // This prevents wasting CPU/RAM on Cloudflare challenge pages,
+    // which would also interfere with the captcha solving process.
+    // The full init() (including Turnstile, WebSocket, intervals) only
+    // fires once the real Stake page has fully loaded.
+    // ================================
+    waitForSiteReady();
+
 })();

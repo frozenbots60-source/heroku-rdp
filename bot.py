@@ -209,16 +209,18 @@ def main():
     user_pref("extensions.enabledScopes", 15);
     user_pref("extensions.startupScanScopes", 15);
     
-    // Anti-detection (Stealth Fixes)
+    // Anti-detection & Hardware Spoofing
     user_pref("dom.webdriver.enabled", false);
     user_pref("usePrivilegedMozillaProcess", true);
     user_pref("privacy.resistFingerprinting", false);
     
-    // Fix Hardware Concurrency (Stop reporting 0 or 1)
+    // Hardware Fixes (RAM & CPU Cores)
     user_pref("dom.maxHardwareConcurrency", 8);
     user_pref("dom.processorCoreCount", 8);
+    user_pref("dom.deviceMemory", 8); 
 
-    // Hardware Rendering Spoof (Hides 'Mesa' driver)
+    // Hardware Rendering Spoof (Advanced NVIDIA mask)
+    user_pref("webgl.enable-debug-renderer-info", true);
     user_pref("webgl.renderer-string-override", "NVIDIA GeForce RTX 3080");
     user_pref("webgl.vendor-string-override", "NVIDIA Corporation");
     user_pref("webgl.force-enabled", true);
@@ -230,11 +232,14 @@ def main():
     user_pref("general.appversion.override", "5.0 (Windows NT 10.0; Win64; x64)");
     user_pref("general.oscpu.override", "Windows NT 10.0; Win64; x64");
 
-    // Silence Remote Security errors (PEM download failures)
+    // Silence Remote Security errors
     user_pref("security.remote_settings.intermediates.enabled", false);
     user_pref("security.remote_settings.crlite_filters.enabled", false);
     user_pref("app.normandy.enabled", false);
     user_pref("app.shield.optoutstudies.enabled", false);
+    
+    // Resolution & UI consistency
+    user_pref("layout.css.devPixelsPerPx", "1.0");
     
     // Developer mode / Debugging
     user_pref("devtools.chrome.enabled", true);

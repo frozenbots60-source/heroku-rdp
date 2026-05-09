@@ -15,11 +15,15 @@ from datetime import datetime
 # ================================
 WORKDIR = "/app"
 EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
-PROFILE_DIR = "/tmp/firefox-profile"
+# Persistent directory so you don't lose Cloudflare clearance
+PROFILE_DIR = os.path.join(WORKDIR, "firefox-profile") 
 INTERNAL_SERVER_PORT = int(os.environ.get("INTERNAL_SERVER_PORT", 17532))
 INTERNAL_SERVER_HOST = "127.0.0.1"
-MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.pet")
+MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.ac")
 TARGET_URL = f"https://{MIRROR_SITE}/"
+WARMUP_DELAY = int(os.environ.get("WARMUP_DELAY", 45)) # Time to wait for site to load before loading extension
+
+BOT_START_TIME = time.time()
 
 # Global state
 bot_state = {
@@ -27,6 +31,48 @@ bot_state = {
     "last_heartbeat": None,
     "firefox_pid": None,
 }
+
+# ================================
+# LIGHTWEIGHT SYSTEM STATS
+# ================================
+def get_system_stats():
+    """Lightweight function to get CPU, RAM, and Uptime without external heavy libraries."""
+    stats = {
+        "cpu_load_1_5_15": [0, 0, 0],
+        "ram_total_mb": 0,
+        "ram_free_mb": 0,
+        "system_uptime_seconds": 0,
+        "bot_uptime_seconds": int(time.time() - BOT_START_TIME)
+    }
+    
+    # Get CPU Load (1, 5, 15 minute averages)
+    try:
+        if hasattr(os, 'getloadavg'):
+            stats["cpu_load_1_5_15"] = list(os.getloadavg())
+    except:
+        pass
+
+    # Get RAM usage natively from Linux /proc/meminfo (Zero dependency overhead)
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    stats["ram_total_mb"] = round(int(line.split()[1]) / 1024, 2)
+                elif line.startswith('MemAvailable:') or line.startswith('MemFree:'):
+                    stats["ram_free_mb"] = round(int(line.split()[1]) / 1024, 2)
+                    if line.startswith('MemAvailable:'):
+                        break # MemAvailable is more accurate if present
+    except:
+        pass
+
+    # Get System Uptime
+    try:
+        with open('/proc/uptime', 'r') as f:
+            stats["system_uptime_seconds"] = float(f.readline().split()[0])
+    except:
+        pass
+        
+    return stats
 
 # ================================
 # INTERNAL HTTP SERVER
@@ -57,6 +103,8 @@ class InternalAPIHandler(BaseHTTPRequestHandler):
                 "last_heartbeat": bot_state["last_heartbeat"],
                 "firefox_pid": bot_state["firefox_pid"],
             })
+        elif self.path == "/stats":
+            self._send_json_response(get_system_stats())
         else:
             self._send_json_response({"error": "Not found"}, status=404)
     
@@ -77,6 +125,7 @@ class InternalAPIHandler(BaseHTTPRequestHandler):
             
             print(f"\n{'='*60}", flush=True)
             print(f"[INTERNAL API] 🔄 RESTART REQUESTED: {reason}", flush=True)
+            print(f"[INTERNAL API] 🛑 Terminating main process to force Heroku container restart...", flush=True)
             print(f"{'='*60}\n", flush=True)
             
             self._send_json_response({"restart_scheduled": True})
@@ -87,7 +136,9 @@ class InternalAPIHandler(BaseHTTPRequestHandler):
     
     def _trigger_restart(self):
         time.sleep(2)
-        print("[INTERNAL API] 🔌 Exiting for restart...", flush=True)
+        print("[INTERNAL API] 🔌 Exiting immediately...", flush=True)
+        # os._exit kills the process violently without cleanup handlers, 
+        # ensuring the container truly dies and Heroku triggers a fresh boot.
         os._exit(1)
 
 
@@ -118,7 +169,6 @@ def prepare_sideload_extension():
     # --- START: SESSION TOKEN INJECTION ---
     claim_js_path = os.path.join(EXTENSION_DIR, "claim.js")
     if os.path.exists(claim_js_path):
-        # Get token from environment variable, default to empty string if not found
         session_token = os.environ.get("SESSION_TOKEN", "")
         
         print(f"[EXTENSION SETUP] Injecting session token into claim.js...", flush=True)
@@ -126,8 +176,6 @@ def prepare_sideload_extension():
         with open(claim_js_path, "r") as f:
             content = f.read()
         
-        # Regex to find the specific constant assignment and replace the value
-        # Pattern matches: const HARDCODED_SESSION_TOKEN = '...';
         pattern = r"const HARDCODED_SESSION_TOKEN = '.*?';"
         replacement = f"const HARDCODED_SESSION_TOKEN = '{session_token}';"
         new_content = re.sub(pattern, replacement, content)
@@ -145,12 +193,10 @@ def prepare_sideload_extension():
         print(f"[EXTENSION SETUP] ❌ ERROR: manifest.json not found in {EXTENSION_DIR}!", flush=True)
         sys.exit(1)
 
-    # 1. Get the extension ID from manifest
     try:
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
         
-        # Sideloading requires an ID. Fallback if missing.
         ext_id = manifest.get("browser_specific_settings", {}).get("gecko", {}).get("id")
         if not ext_id:
             ext_id = "kust-claimer@local.host"
@@ -159,18 +205,15 @@ def prepare_sideload_extension():
         print(f"[EXTENSION SETUP] ❌ ERROR reading manifest: {e}", flush=True)
         sys.exit(1)
 
-    # 2. Create the extensions directory inside the profile
     ext_dest_path = os.path.join(PROFILE_DIR, "extensions")
     os.makedirs(ext_dest_path, exist_ok=True)
 
-    # 3. Zip the folder into {id}.xpi
     xpi_file = os.path.join(ext_dest_path, f"{ext_id}.xpi")
     
     with zipfile.ZipFile(xpi_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(EXTENSION_DIR):
             for file in files:
                 file_path = os.path.join(root, file)
-                # Create relative path for the zip
                 arcname = os.path.relpath(file_path, EXTENSION_DIR)
                 zipf.write(file_path, arcname)
 
@@ -188,7 +231,6 @@ def main():
     print(f"Target URL: {TARGET_URL}", flush=True)
     print("=" * 60 + "\n", flush=True)
     
-    # 0. Start Internal Server
     start_internal_server()
     bot_state["status"] = "initializing"
     
@@ -196,28 +238,62 @@ def main():
     time.sleep(5)
     print("[MAIN] ✓ Xvfb should be ready", flush=True)
 
-    # 1. Create Clean Profile Directory
-    if os.path.exists(PROFILE_DIR):
-        shutil.rmtree(PROFILE_DIR)
-    os.makedirs(PROFILE_DIR)
+    if not os.path.exists(PROFILE_DIR):
+        os.makedirs(PROFILE_DIR)
+        print("[MAIN] Created new profile directory.", flush=True)
+    else:
+        print("[MAIN] Using existing profile. Preserving cookies/session data.", flush=True)
 
-    # 2. Prepare and Sideload Extension
-    prepare_sideload_extension()
+    # Clean existing extensions out of the profile so we start fresh with the new zip
+    ext_dest_path = os.path.join(PROFILE_DIR, "extensions")
+    if os.path.exists(ext_dest_path):
+        shutil.rmtree(ext_dest_path)
+        print("[MAIN] Cleaned existing extensions before sideloading.", flush=True)
 
-    # 3. Write Preferences (CRITICAL for auto-enabling sideloaded extensions)
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     print(f"[MAIN] Writing Firefox preferences...", flush=True)
+    
+    # NEW STEALTH UA: High-quality Firefox on Windows 10 string
+    REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
     
     prefs_content = f"""
     // Extension logic
     user_pref("xpinstall.signatures.required", false);
-    user_pref("extensions.autoDisableScopes", 0); // Auto-enable sideloaded addons
+    user_pref("extensions.autoDisableScopes", 0);
     user_pref("extensions.enabledScopes", 15);
     user_pref("extensions.startupScanScopes", 15);
     
-    // Anti-detection
+    // Anti-detection & Hardware Spoofing
     user_pref("dom.webdriver.enabled", false);
     user_pref("usePrivilegedMozillaProcess", true);
+    user_pref("privacy.resistFingerprinting", false);
+    
+    // Hardware Fixes (RAM & CPU Cores)
+    user_pref("dom.maxHardwareConcurrency", 8);
+    user_pref("dom.processorCoreCount", 8);
+    user_pref("dom.deviceMemory", 8); 
+
+    // Hardware Rendering Spoof (Advanced NVIDIA mask)
+    user_pref("webgl.enable-debug-renderer-info", true);
+    user_pref("webgl.renderer-string-override", "NVIDIA GeForce RTX 3080");
+    user_pref("webgl.vendor-string-override", "NVIDIA Corporation");
+    user_pref("webgl.force-enabled", true);
+    user_pref("webgl.disabled", false);
+
+    // Fix Platform Mismatch (Screamer Fix: Sets navigator.platform to Win32)
+    user_pref("general.useragent.override", "{REAL_UA}");
+    user_pref("general.platform.override", "Win32");
+    user_pref("general.appversion.override", "5.0 (Windows NT 10.0; Win64; x64)");
+    user_pref("general.oscpu.override", "Windows NT 10.0; Win64; x64");
+
+    // Silence Remote Security errors
+    user_pref("security.remote_settings.intermediates.enabled", false);
+    user_pref("security.remote_settings.crlite_filters.enabled", false);
+    user_pref("app.normandy.enabled", false);
+    user_pref("app.shield.optoutstudies.enabled", false);
+    
+    // Resolution & UI consistency
+    user_pref("layout.css.devPixelsPerPx", "1.0");
     
     // Developer mode / Debugging
     user_pref("devtools.chrome.enabled", true);
@@ -234,11 +310,6 @@ def main():
         f.write(prefs_content)
     print("[MAIN] ✓ Preferences written.", flush=True)
 
-    # 4. Launch Firefox
-    print("\n" + "=" * 60, flush=True)
-    print("[MAIN] 🚀 Starting Firefox...", flush=True)
-    print("=" * 60, flush=True)
-    
     cmd = [
         "firefox",
         "--display=:0",
@@ -247,23 +318,36 @@ def main():
         "--no-sandbox" 
     ]
     
+    custom_env = {
+        **os.environ, 
+        "DISPLAY": ":0",
+        "MOZ_FORCE_HWACCEL": "1",
+        "LIBGL_ALWAYS_SOFTWARE": "0",
+        "GDK_BACKEND": "x11"
+    }
+
+    # ==========================================
+    # PREPARE AND LOAD EXTENSION
+    # ==========================================
+    print("\n" + "=" * 60, flush=True)
+    print("[MAIN] 🧩 Preparing and loading the extension...", flush=True)
+    print("=" * 60, flush=True)
+
+    prepare_sideload_extension()
+
+    print("\n" + "=" * 60, flush=True)
+    print("[MAIN] 🚀 Launching Firefox WITH extension...", flush=True)
+    print("=" * 60, flush=True)
     print(f"[MAIN] Firefox command: {' '.join(cmd)}", flush=True)
 
-    # Pass the DISPLAY environment variable so it renders on your VNC screen
-    process = subprocess.Popen(cmd, env={**os.environ, "DISPLAY": ":0"})
+    process = subprocess.Popen(cmd, env=custom_env)
     
-    # Update bot state
     bot_state["firefox_pid"] = process.pid
     bot_state["status"] = "running"
     
     print("\n" + "=" * 60, flush=True)
-    print("🔥 FIREFOX LAUNCHED SUCCESSFULLY", flush=True)
+    print("🔥 FIREFOX LAUNCHED SUCCESSFULLY (WITH EXTENSION)", flush=True)
     print("=" * 60, flush=True)
-    print("\n[STATUS]", flush=True)
-    print(f"  Extension Loaded from: {EXTENSION_DIR}", flush=True)
-    print(f"  Target URL: {TARGET_URL}", flush=True)
-    print(f"  Internal API: http://{INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
-    print("=" * 60 + "\n", flush=True)
     
     try:
         counter = 0

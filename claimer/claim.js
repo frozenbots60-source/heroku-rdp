@@ -258,6 +258,9 @@ const GM_xmlhttpRequest = (details) => {
     
     // Track codes currently being processed (to prevent duplicate processing)
     let processingCodes = new Set();
+
+    // 🚦 RATE LIMITER: Max 3 codes per 20 seconds
+    let rateLimitTimestamps = [];
     
     let rates = {};
     // Currency conversion rates
@@ -1581,7 +1584,7 @@ const GM_xmlhttpRequest = (details) => {
                     };
 
                     this.widgetId = unsafeWindow.turnstile.render(container, config);
-      
+        
                 } catch (error) {
                     this.isGenerating = false;
                     this.consecutiveFailures++;
@@ -2363,6 +2366,16 @@ const GM_xmlhttpRequest = (details) => {
         // Only add to claimedCodes if not a retry
         if (!isRetry) {
             claimedCodes.add(code);
+
+            // --- 🚦 RATE LIMIT CHECK (Max 3 codes per 20 seconds) ---
+            const now = Date.now();
+            rateLimitTimestamps = rateLimitTimestamps.filter(t => now - t < 20000);
+            if (rateLimitTimestamps.length >= 3) {
+                addLog(`Rate limit exceeded! Dropped code: ${code} (Max 3 per 20s)`, "warning");
+                return; // Stop processing this code
+            }
+            rateLimitTimestamps.push(now);
+            // --------------------------------------------------------
         }
         processingCodes.add(code);
 

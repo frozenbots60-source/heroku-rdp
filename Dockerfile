@@ -53,16 +53,17 @@ RUN sed -i 's/archive.ubuntu.com/us-east-1.ec2.archive.ubuntu.com/g' /etc/apt/so
     unzip \
     && apt-get clean
 
-# --- NEW SECTION: Install Firefox Developer Edition (Pinned Stable Release) ---
-# Downloaded from a static archive version to guarantee your environment never drifts
-RUN curl -L "https://ftp.mozilla.org/pub/devedition/releases/147.0b4/linux-x86_64/en-US/firefox-147.0b4.tar.bz2" -o /tmp/firefox-dev.tar.bz2 \
+# --- NEW SECTION: Install Firefox Developer Edition ---
+# Using curl -f -L to handle redirects and fail on error, and tar -xf to auto-detect formats.
+# Pinned to stable Developer Edition 125.0b9 to match Geckodriver v0.34.0
+RUN curl -f -L "https://archive.mozilla.org/pub/devedition/releases/125.0b9/linux-x86_64/en-US/firefox-125.0b9.tar.bz2" -o /tmp/firefox-dev.tar.bz2 \
     && tar -xf /tmp/firefox-dev.tar.bz2 -C /opt \
     && ln -s /opt/firefox/firefox /usr/bin/firefox \
     && rm /tmp/firefox-dev.tar.bz2
 # ------------------------------------------------------
 
 # --- NEW SECTION: Install Geckodriver Manually ---
-RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
+RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz" -O /tmp/geckodriver.tar.gz \
     && tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin \
     && rm /tmp/geckodriver.tar.gz
 # ------------------------------------------------

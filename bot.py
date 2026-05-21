@@ -152,6 +152,45 @@ def start_internal_server():
     server_thread.start()
     print(f"[INTERNAL SERVER] 🌐 Started on {INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
 
+# ================================
+# FIREFOX POLICIES SETUP
+# ================================
+def setup_firefox_policies():
+    """Creates the policies.json file to completely disable the welcome screen and telemetry."""
+    print("=" * 60, flush=True)
+    print("[POLICY SETUP] Creating enterprise policies.json...", flush=True)
+    print("=" * 60, flush=True)
+    
+    policies = {
+        "policies": {
+            "DisableTelemetry": True,
+            "DisableFirefoxStudies": True,
+            "DisableProfileTutorial": True,
+            "DisableFirefoxAccounts": True,
+            "DontCheckDefaultBrowser": True,
+            "OverrideFirstRunPage": "",
+            "OverridePostUpdatePage": "",
+            "CaptivePortal": False
+        }
+    }
+    
+    # Standard installation paths for Firefox/Developer Edition in Linux containers
+    paths = [
+        "/usr/lib/firefox/distribution",
+        "/usr/lib/firefox-developer-edition/distribution",
+        "/etc/firefox/policies"
+    ]
+    
+    for path in paths:
+        try:
+            os.makedirs(path, exist_ok=True)
+            policy_file = os.path.join(path, "policies.json")
+            with open(policy_file, "w") as f:
+                json.dump(policies, f, indent=4)
+            print(f"[POLICY SETUP] ✓ Wrote policies to {policy_file}", flush=True)
+        except Exception as e:
+            print(f"[POLICY SETUP] ⚠️ Could not write to {path} (might need root permissions): {e}", flush=True)
+    print("=" * 60, flush=True)
 
 # ================================
 # EXTENSION SETUP
@@ -237,6 +276,9 @@ def main():
     print("[MAIN] Waiting for Xvfb...", flush=True)
     time.sleep(5)
     print("[MAIN] ✓ Xvfb should be ready", flush=True)
+
+    # Build and inject the Firefox Enterprise Policies to nuke the welcome screen
+    setup_firefox_policies()
 
     if not os.path.exists(PROFILE_DIR):
         os.makedirs(PROFILE_DIR)

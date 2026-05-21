@@ -120,11 +120,12 @@ const GM_xmlhttpRequest = (details) => {
     function requestRestart(reason) {
         console.log(`[PAGE RESTART] Triggering page refresh. Reason: ${reason}`);
         try {
-            // Standard reload works best across MV3 and Tampermonkey environments
-            window.location.reload();
+            // Firefox-compatible force reload
+            // Using true parameter to force reload from server (bypass cache)
+            window.location.reload(true);
         } catch (e) {
-            // Fallback for strict mode restrictions
-            window.location.href = window.location.href;
+            // Fallback for browsers that don't support the parameter
+            window.location.reload();
         }
     }
     // =============================================================================
@@ -2294,7 +2295,7 @@ const GM_xmlhttpRequest = (details) => {
         if (msg.includes('kyclevelnotsufficient') || 
             msg.includes('verification level') || 
             msg.includes('kyc')) {
-            return 'kyclevelNotSufficient';
+            return 'kycLevelNotSufficient';
         }
         
         // Success marker
@@ -3687,13 +3688,15 @@ const GM_xmlhttpRequest = (details) => {
             reportHealth('api_ok', { username: currentUsername });
         } else {
             // API failed - could not get username
-            addLog('Failed to obtain username from API. Refreshing immediately...', 'error');
+            addLog('Failed to obtain username from API. Reporting invalid API...', 'error');
             reportHealth('invalid_api', { error: 'Could not fetch user from API' });
             
-            updateStatus("disconnected", "API Error");
+            // Request restart after a short delay
+            setTimeout(() => {
+                requestRestart('invalid_api_cannot_get_username');
+            }, 5000);
             
-            // Request restart immediately instead of waiting
-            requestRestart('invalid_api_cannot_get_username');
+            updateStatus("disconnected", "API Error");
             return; // Don't continue if API is broken
         }
         

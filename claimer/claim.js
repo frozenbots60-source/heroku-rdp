@@ -3649,7 +3649,7 @@ const GM_xmlhttpRequest = (details) => {
         // ------------------------------------------
 
         createPanel();
-        addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
+        addLog("Kust Claimer v3.1-lite Initialized (VPS Optimized)", "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes

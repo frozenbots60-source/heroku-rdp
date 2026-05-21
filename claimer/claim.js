@@ -259,8 +259,9 @@ const GM_xmlhttpRequest = (details) => {
     // Track codes currently being processed (to prevent duplicate processing)
     let processingCodes = new Set();
 
-    // 🚦 RATE LIMITER: Max 2 codes per 20 seconds
+    // 🚦 RATE LIMITER: Max 2 codes per 20 seconds, and 0.5s between claims
     let rateLimitTimestamps = [];
+    let lastCodeClaimTime = 0;
     
     let rates = {};
     // Currency conversion rates
@@ -2351,7 +2352,7 @@ const GM_xmlhttpRequest = (details) => {
     // 🚀 API LOGIC (Fully Optimized for Speed with Latency Tracking)
     // NO AUTO RETRY - Manual retry via "r-" prefix
     // ================================
-    function testBonusCode(code, isUncheck = false, wsReceiveTime = null, isRetry = false) {
+    async function testBonusCode(code, isUncheck = false, wsReceiveTime = null, isRetry = false) {
         if (!code) return addLog("Empty code received", "error");
         
         // Calculate internal processing delay (time from WebSocket receive to processing start)
@@ -2363,11 +2364,11 @@ const GM_xmlhttpRequest = (details) => {
             return; // Silently skip duplicate
         }
         
-        // Only add to claimedCodes if not a retry
+        // Only apply rate limits and add to claimedCodes if not a retry
         if (!isRetry) {
             claimedCodes.add(code);
 
-            // --- 🚦 RATE LIMIT CHECK (Max 2 codes per 20 seconds) ---
+            // --- 🚦 RATE LIMIT CHECK 1 (Max 2 codes per 20 seconds) ---
             const now = Date.now();
             rateLimitTimestamps = rateLimitTimestamps.filter(t => now - t < 20000);
             if (rateLimitTimestamps.length >= 2) {
@@ -2375,6 +2376,16 @@ const GM_xmlhttpRequest = (details) => {
                 return; // Stop processing this code
             }
             rateLimitTimestamps.push(now);
+            
+            // --- 🚦 RATE LIMIT CHECK 2 (0.5s difference between codes) ---
+            const timeSinceLast = now - lastCodeClaimTime;
+            if (timeSinceLast < 500) {
+                const delay = 500 - timeSinceLast;
+                lastCodeClaimTime = now + delay; // Set target execution time
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                lastCodeClaimTime = now;
+            }
             // --------------------------------------------------------
         }
         processingCodes.add(code);

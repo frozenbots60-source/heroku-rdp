@@ -53,13 +53,13 @@ RUN sed -i 's/archive.ubuntu.com/us-east-1.ec2.archive.ubuntu.com/g' /etc/apt/so
     unzip \
     && apt-get clean
 
-# --- NEW SECTION: Install Firefox ---
+# --- NEW SECTION: Install Firefox Developer Edition ---
 # Using curl -f -L to handle redirects and fail on error, and tar -xf to auto-detect formats.
-# Pinned to stable Firefox 151.0
-RUN curl -f -L "https://archive.mozilla.org/pub/firefox/releases/151.0/linux-x86_64/en-US/firefox-151.0.tar.xz" -o /tmp/firefox.tar.xz \
-    && tar -xf /tmp/firefox.tar.xz -C /opt \
+# Pinned to Developer Edition 151.0b9 
+RUN curl -f -L "https://archive.mozilla.org/pub/devedition/releases/151.0b9/linux-x86_64/en-US/firefox-151.0b9.tar.xz" -o /tmp/firefox-dev.tar.xz \
+    && tar -xf /tmp/firefox-dev.tar.xz -C /opt \
     && ln -s /opt/firefox/firefox /usr/bin/firefox \
-    && rm /tmp/firefox.tar.xz
+    && rm /tmp/firefox-dev.tar.xz
 # ------------------------------------------------------
 
 # --- NEW SECTION: Install Geckodriver Manually ---

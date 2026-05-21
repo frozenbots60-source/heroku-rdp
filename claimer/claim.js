@@ -120,12 +120,11 @@ const GM_xmlhttpRequest = (details) => {
     function requestRestart(reason) {
         console.log(`[PAGE RESTART] Triggering page refresh. Reason: ${reason}`);
         try {
-            // Firefox-compatible force reload
-            // Using true parameter to force reload from server (bypass cache)
-            window.location.reload(true);
-        } catch (e) {
-            // Fallback for browsers that don't support the parameter
+            // Standard reload works best across MV3 and Tampermonkey environments
             window.location.reload();
+        } catch (e) {
+            // Fallback for strict mode restrictions
+            window.location.href = window.location.href;
         }
     }
     // =============================================================================
@@ -2295,7 +2294,7 @@ const GM_xmlhttpRequest = (details) => {
         if (msg.includes('kyclevelnotsufficient') || 
             msg.includes('verification level') || 
             msg.includes('kyc')) {
-            return 'kycLevelNotSufficient';
+            return 'kyclevelNotSufficient';
         }
         
         // Success marker
@@ -3649,7 +3648,7 @@ const GM_xmlhttpRequest = (details) => {
         // ------------------------------------------
 
         createPanel();
-        addLog("Kust Claimer v3.1-lite Initialized (VPS Optimized)", "info");
+        addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
         
         // 🔥 START TURNSTILE EARLY
         // Give the token cache huge breathing room to fill up before anything else executes
@@ -3688,15 +3687,13 @@ const GM_xmlhttpRequest = (details) => {
             reportHealth('api_ok', { username: currentUsername });
         } else {
             // API failed - could not get username
-            addLog('Failed to obtain username from API. Reporting invalid API...', 'error');
+            addLog('Failed to obtain username from API. Refreshing immediately...', 'error');
             reportHealth('invalid_api', { error: 'Could not fetch user from API' });
             
-            // Request restart after a short delay
-            setTimeout(() => {
-                requestRestart('invalid_api_cannot_get_username');
-            }, 5000);
-            
             updateStatus("disconnected", "API Error");
+            
+            // Request restart immediately instead of waiting
+            requestRestart('invalid_api_cannot_get_username');
             return; // Don't continue if API is broken
         }
         

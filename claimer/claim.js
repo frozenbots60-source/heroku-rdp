@@ -1,3752 +1,1679 @@
-// =============================================================================
-// CHROME EXTENSION COMPATIBILITY LAYER
-// These shims allow the Tampermonkey script to run natively in Chrome (MV3)
-// =============================================================================
+import os
+import asyncio
+import logging
+import re
+import urllib.parse
+import aiohttp
+from aiohttp import web
+import time
+import isodate
+import math
+import speedtest
+import uuid
+import random
+from datetime import datetime, timedelta
+from pymongo import ReturnDocument
 
-const unsafeWindow = window;
-const GM_addStyle = (css) => {
-    const style = document.createElement('style');
-    style.textContent = css;
-    document.head.appendChild(style);
-};
-const GM_getValue = (key, defaultValue) => {
-    const value = localStorage.getItem(key);
-    if (value === null) return defaultValue;
-    try {
-        return JSON.parse(value);
-    } catch (e) {
-        return value;
-    }
-};
-const GM_setValue = (key, value) => {
-    localStorage.setItem(key, JSON.stringify(value));
-};
-const GM_xmlhttpRequest = (details) => {
-    const { method, url, headers, data, onload, onerror } = details;
-    // Filter out headers that cause "Refused to set unsafe header" errors in Chrome
-    // This prevents the debugger from pausing on exceptions.
-    const safeHeaders = headers ? { ...headers } : {};
-    
-    const unsafeHeaders = ['Referer', 'Origin', 'User-Agent', 'Content-Length', 'Host', 'Connection', 'Cookie'];
-    unsafeHeaders.forEach(header => delete safeHeaders[header]);
-    
-    fetch(url, {
-        method: method || 'GET',
-        headers: safeHeaders,
-        body: data,
-        mode: 'cors'
+# ─── MONKEY PATCH FOR COMPATIBILITY ───────────────────────────────────────
+# This must run BEFORE importing pytgcalls to fix the ImportError
+import pyrogram.errors
+try:
+    # Map the missing exception to the correct one existing in Pyrogram
+    if not hasattr(pyrogram.errors, "GroupcallForbidden"):
+        pyrogram.errors.GroupcallForbidden = pyrogram.errors.GroupCallForbidden
+except AttributeError:
+    # Fallback if even the standard one is missing
+    class GroupcallForbidden(Exception):
+        pass
+    pyrogram.errors.GroupcallForbidden = GroupcallForbidden
+# ──────────────────────────────────────────────────────────────────────────
+
+from pyrogram import Client, filters, idle
+from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram.types import (
+    InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, ChatPermissions
+)
+from pyrogram.errors import (
+    UserNotParticipant, ChatAdminRequired, UserAlreadyParticipant, PeerIdInvalid, RPCError
+)
+from pytgcalls import PyTgCalls, filters as fl
+from pytgcalls.types import StreamEnded, Update
+
+# MongoDB
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# ─── Configuration ────────────────────────────────────────────────────────
+API_ID = 29568441
+API_HASH = "b32ec0fb66d22da6f77d355fbace4f2a"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SESSION_STRING = os.getenv("ASSISTANT_SESSION")
+MONGO_URI = "mongodb+srv://rj5706603:O95nvJYxapyDHfkw@cluster0.fzmckei.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+if not BOT_TOKEN or not SESSION_STRING:
+    print("Error: BOT_TOKEN or ASSISTANT_SESSION not found in environment variables.")
+
+OWNER_ID = int(os.getenv('OWNER_ID', '7618467489'))
+
+# APIs
+SEARCH_API_URL = "https://search-api.kustbotsweb.workers.dev"
+DOWNLOAD_API_BASE = "https://divine-dream-fde5.lagendplayersyt.workers.dev/down?url="
+
+# Distributed System VPS Identifier
+INSTANCE_ID = str(uuid.uuid4())
+
+# ─── Database & State ─────────────────────────────────────────────────────
+# { (bot_id, chat_id): [ {song_info}, ... ] }
+chat_queues = {}
+progress_tasks = {} # Stores the asyncio tasks for progress bars { (bot_id, chat_id): task }
+assistant_cache = {} # Cache for assistant join status { (bot_id, chat_id): True }
+bot_start_time = time.time()
+
+# Bot Registry & Routing
+# Added assistant username/name caching for dynamic mentioning
+bot_registry = {} 
+
+# Rate Limiting
+user_command_history = {}
+RATE_LIMIT_COUNT = 4
+RATE_LIMIT_WINDOW = 6
+ASSISTANT_ID = None
+
+# MongoDB Setup
+mongo_client = None
+hosted_bots_collection = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [MusicBot] - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Ensure downloads directory exists
+if not os.path.exists("downloads"):
+    os.makedirs("downloads")
+
+# ─── Clients Setup ────────────────────────────────────────────────────────
+
+# 1. Main Bot Client
+app = Client(
+    "MusicBot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+# 2. Assistant User Client (For Voice Chat)
+user_app = Client(
+    "MusicAssistant",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
+
+# 3. PyTgCalls Client (Audio Engine)
+call_py = PyTgCalls(user_app)
+
+# ─── Multi-Bot Hosting Context ────────────────────────────────────────────
+
+def get_bot_context(bot_id):
+    if bot_id in bot_registry:
+        return bot_registry[bot_id]
+    if hasattr(app, "me") and app.me:
+        # Fallback to main context if dynamic fetch fails initially
+        me_user = getattr(user_app, "me", None)
+        ass_username = me_user.username if me_user else None
+        ass_name = me_user.first_name if me_user else "Assistant"
+        return {
+            "bot": app, "user": user_app, "call": call_py, 
+            "assistant_id": ASSISTANT_ID, "owner_id": OWNER_ID,
+            "assistant_username": ass_username, "assistant_name": ass_name
+        }
+    return {"bot": app, "user": user_app, "call": call_py, "assistant_id": ASSISTANT_ID, "owner_id": OWNER_ID}
+
+# ─── HTTP Logging Function ────────────────────────────────────────────────
+
+async def send_play_log(current_app, chat_id, song_info):
+    try:
+        bot_name = current_app.me.first_name if hasattr(current_app, "me") and current_app.me else "Music Bot"
+        try:
+            chat_obj = await current_app.get_chat(chat_id)
+            chat_title = chat_obj.title or str(chat_id)
+        except:
+            chat_title = str(chat_id)
+            
+        song_name = song_info.get("title", "Unknown")
+        requester = song_info.get("req", "Unknown")
+        
+        # Log delivery details
+        token = "7598576464:AAFtOfwYwLp1kcAFLmie99HVzubUVgtTU-k"
+        log_chat_id = "-1002763195805"
+        
+        text = (
+            f"🎵 <b>New Song Played</b>\n\n"
+            f"🤖 <b>Bot:</b> {bot_name}\n"
+            f"🏠 <b>Chat:</b> {chat_title}\n"
+            f"🎶 <b>Song:</b> {song_name}\n"
+            f"👤 <b>Requested By:</b> {requester}"
+        )
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": log_chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Failed to send playback log: {e}")
+
+# ─── Web API Routes ───────────────────────────────────────────────────────
+
+routes = web.RouteTableDef()
+
+@routes.get('/load')
+async def get_load(request):
+    return web.json_response({
+        "live_vcs": len(progress_tasks),
+        "total_running_bots": len(bot_registry),
+        "instance_id": INSTANCE_ID
     })
-    .then(async response => {
-        const text = await response.text();
-        if (onload) {
-            onload({
-                responseText: text,
-                status: response.status,
-                statusText: response.statusText,
-                readyState: 4
-            });
+
+@routes.get('/host')
+async def host_bot_api(request):
+    token = request.query.get("token")
+    session = request.query.get("stringsession")
+    owner_id = request.query.get("owner_id", str(OWNER_ID))
+    
+    if not token or not session:
+        return web.json_response({"error": "Missing token or stringsession query parameters"}, status=400)
+
+    try:
+        bot_id_str = token.split(":")[0]
+        bot_id = int(bot_id_str)
+        owner_id = int(owner_id)
+    except Exception:
+        return web.json_response({"error": "Invalid token or owner_id format"}, status=400)
+
+    # Persist the hosted bot to MongoDB ensuring it survives restarts
+    if hosted_bots_collection is not None:
+        await hosted_bots_collection.update_one(
+            {"token": token},
+            {"$set": {
+                "bot_id": bot_id,
+                "token": token, 
+                "session": session,
+                "owner_id": owner_id,
+                "assigned_to": INSTANCE_ID,
+                "last_active": datetime.utcnow()
+            }},
+            upsert=True
+        )
+
+    asyncio.create_task(start_one_hosted_bot(token, session, owner_id))
+    return web.json_response({"status": "Success", "message": "Bot triggered to start/host"})
+
+@routes.get('/delete')
+async def delete_bot_api(request):
+    token = request.query.get("token")
+    if not token:
+        return web.json_response({"error": "Missing token query parameter"}, status=400)
+
+    try:
+        bot_id_str = token.split(":")[0]
+        bot_id = int(bot_id_str)
+    except Exception:
+        return web.json_response({"error": "Invalid token format"}, status=400)
+
+    if hosted_bots_collection is not None:
+        await hosted_bots_collection.delete_one({"token": token})
+
+    if bot_id in bot_registry:
+        if hasattr(app, "me") and app.me and bot_id == app.me.id:
+            return web.json_response({"error": "Cannot delete the primary bot instance"}, status=400)
+
+        b_ctx = bot_registry[bot_id]
+        try:
+            await b_ctx["call"].stop()
+            await b_ctx["user"].stop()
+            await b_ctx["bot"].stop()
+        except Exception as e:
+            logger.error(f"Error stopping deleted bot {bot_id}: {e}")
+        
+        del bot_registry[bot_id]
+        return web.json_response({"status": "Success", "message": f"Bot {bot_id} stopped and deleted."})
+    
+    return web.json_response({"status": "Success", "message": "Bot deleted from database (was not actively running)."})
+
+async def start_one_hosted_bot(token, session, owner_id):
+    try:
+        bot_id_str = token.split(":")[0]
+        bot_id = int(bot_id_str)
+        if bot_id in bot_registry:
+            return
+
+        bot_app = Client(
+            f"bot_{bot_id_str}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=token,
+            in_memory=True
+        )
+        u_app = Client(
+            f"user_{bot_id_str}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session,
+            in_memory=True
+        )
+        new_call = PyTgCalls(u_app)
+
+        if hasattr(app.dispatcher, "groups"):
+            for group, handlers in app.dispatcher.groups.items():
+                for handler in handlers:
+                    bot_app.add_handler(handler, group)
+
+        @new_call.on_update(fl.stream_end())
+        async def hosted_stream_end(cl, update):
+            await on_stream_end(cl, update)
+
+        await bot_app.start()
+        await u_app.start()
+        await new_call.start()
+
+        me_bot = await bot_app.get_me()
+        me_user = await u_app.get_me()
+
+        bot_registry[me_bot.id] = {
+            "bot": bot_app,
+            "user": u_app,
+            "call": new_call,
+            "assistant_id": me_user.id,
+            "assistant_username": me_user.username,
+            "assistant_name": me_user.first_name,
+            "owner_id": owner_id
         }
+        logger.info(f"✅ Hosted bot started: @{me_bot.username} (Assistant ID: {me_user.id})")
+        
+        bot_db = mongo_client[f"musicbot_{me_bot.id}"]
+        await bot_db.users.create_index("user_id", unique=True)
+        await bot_db.chats.create_index("chat_id", unique=True)
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start hosted bot {token[:10]}: {e}")
+        err_str = str(e).lower()
+        if any(x in err_str for x in ["revoke", "invalid", "unauthorized", "unregistered", "expire"]):
+            if hosted_bots_collection is not None:
+                await hosted_bots_collection.delete_one({"token": token})
+                logger.info(f"🗑️ Removed dead/invalid bot {token[:10]} from database.")
+
+async def load_hosted_bots():
+    if hosted_bots_collection is None: return
+    # Faster TTL check: Assume instance dead if no ping for 90 seconds
+    dead_threshold = datetime.utcnow() - timedelta(seconds=90)
+    
+    cursor = hosted_bots_collection.find({
+        "$or": [
+            {"assigned_to": {"$exists": False}},
+            {"assigned_to": None},
+            {"last_active": {"$lt": dead_threshold}}
+        ]
     })
-    .catch(error => {
-        if (onerror) {
-            onerror(error);
-        }
-    });
-};
-
-// =============================================================================
-// ORIGINAL SCRIPT STARTS HERE
-// =============================================================================
-
-// ==UserScript==
-// @name         kust-code-claimer-lite
-// @namespace    http://tampermonkey.net/
-// @version      2.5-lite
-// @description  Lightweight WebSocket listener & Auto Bonus Claimer for Stake.com (Optimized for VPS/XRDP)
-// @author       Kust
-// @match        *://*stake*/settings/offers*
-// @grant        GM_addStyle
-// @grant        GM_xmlhttpRequest
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        unsafeWindow
-// @connect      stake.com
-// @connect      stake*.com
-// @connect      stake*.in
-// @connect      stake*.pet
-// @connect      backend.tenopno.workers.dev
-// @connect      kust-bots-129c234bbe49.herokuapp.com
-// @connect      chat-auth-75bd02aa400a.herokuapp.com
-// @connect      velocity.kustbotsweb.workers.dev
-// @connect      code.hh123.site
-// @connect      cdn.socket.io
-// @connect      api.telegram.org
-// @connect      code-dash-ba59fe89410e.herokuapp.com
-// @connect      health.kustbotsweb.workers.dev
-// @run-at       document-idle
-// ==/UserScript==
-
-(function () {
-    'use strict';
-    // ================================
-    // ⚙️ CONFIGURATION
-    // ================================
     
-    // =============================================================================
-    // INTERNAL API CONFIGURATION (for bot health reporting)
-    // =============================================================================
-    const INTERNAL_API_URL = 'http://127.0.0.1:17532';
-    
-    // Track turnstile failure timestamp
-    let turnstileFailureStart = null;
-    let healthReported = false;
-    
-    // Internal API helper functions
-    async function reportHealth(status, details = {}) {
-        try {
-            await fetch(`${INTERNAL_API_URL}/heartbeat`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ status, ...details })
-            });
-        } catch (e) {
-            // Silent fail - internal server may not be running
-        }
-    }
-    
-    // =============================================================================
-    // PAGE RESTART FUNCTION - Force browser refresh instead of API call
-    // =============================================================================
-    function requestRestart(reason) {
-        console.log(`[PAGE RESTART] Triggering page refresh. Reason: ${reason}`);
-        try {
-            // Firefox-compatible force reload
-            // Using true parameter to force reload from server (bypass cache)
-            window.location.reload(true);
-        } catch (e) {
-            // Fallback for browsers that don't support the parameter
-            window.location.reload();
-        }
-    }
-    // =============================================================================
-    
-    // =============================================================================
-    // TOKEN CACHE WATCHER - Separate watcher to detect stuck token generation
-    // This runs independently every 15 seconds and checks if cache is empty for 30+ seconds
-    // =============================================================================
-    let tokenCacheEmptySince = null; // Timestamp when cache first became empty
-    let tokenCacheWatcherInterval = null;
-    
-    function startTokenCacheWatcher() {
-        // Prevent multiple watchers
-        if (tokenCacheWatcherInterval) return;
+    async for doc in cursor:
+        token = doc.get("token")
+        if not token: continue
         
-        tokenCacheWatcherInterval = setInterval(() => {
-            // Check if turnstileManager exists and is initialized
-            if (!turnstileManager || !turnstileManager.initialized) {
-                return;
-            }
-            
-            const cacheLength = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
-            
-            if (cacheLength === 0) {
-                // Cache is empty
-                if (tokenCacheEmptySince === null) {
-                    // First time we notice it's empty
-                    tokenCacheEmptySince = Date.now();
-                    console.log('[TOKEN WATCHER] Cache empty, starting timer...');
-                } else {
-                    // Check how long it's been empty
-                    const emptyDuration = Date.now() - tokenCacheEmptySince;
-                    console.log(`[TOKEN WATCHER] Cache empty for ${Math.round(emptyDuration / 1000)} seconds`);
-                    
-                    if (emptyDuration >= 30000) {
-                        // Empty for 30+ seconds - force refresh
-                        console.log('[TOKEN WATCHER] Cache empty for 30+ seconds! Forcing page refresh...');
-                        requestRestart('token_cache_empty_for_30_seconds');
-                    }
-                }
-            } else {
-                // Cache has tokens - reset the empty tracker
-                if (tokenCacheEmptySince !== null) {
-                    console.log('[TOKEN WATCHER] Cache recovered. Resetting timer.');
-                }
-                tokenCacheEmptySince = null;
-            }
-        }, 15000); // Check every 15 seconds
-    }
-    // =============================================================================
-    
-    // =============================================================================
-    // HARDCODED SESSION TOKEN CONFIGURATION
-    // =============================================================================
-    // Set your session token here or via environment variable
-    // Priority: HARDCODED_SESSION_TOKEN > localStorage > Cookie
-    // To use: Set the token value below or set localStorage.setItem('HARDCODED_SESSION_TOKEN', 'your_token_here')
-    const HARDCODED_SESSION_TOKEN = ''; // <-- PASTE YOUR SESSION TOKEN HERE (leave empty to use cookie)
-
-    // Helper function to get hardcoded token from various sources
-    function getHardcodedSessionToken() {
-        // 1. Check direct hardcoded value first
-        if (HARDCODED_SESSION_TOKEN && HARDCODED_SESSION_TOKEN.trim() !== '') {
-            return HARDCODED_SESSION_TOKEN.trim();
-        }
-        
-        // 2. Check localStorage for hardcoded token (can be set externally)
-        const localStorageToken = localStorage.getItem('HARDCODED_SESSION_TOKEN');
-        if (localStorageToken && localStorageToken.trim() !== '') {
-            return localStorageToken.trim();
-        }
-        
-        // 3. Check for environment variable style (window.__KUST_SESSION_TOKEN__)
-        if (typeof window !== 'undefined' && window.__KUST_SESSION_TOKEN__) {
-            return window.__KUST_SESSION_TOKEN__;
-        }
-        
-        // No hardcoded token found
-        return null;
-    }
-    // =============================================================================
-    
-    // --- DYNAMIC CONFIG START ---
-    const REMOTE_CONFIG_URL = 'https://velocity-4ayz.onrender.com/';
-    
-    // Default fallbacks (Old hardcoded values) in case remote fetch fails
-    let WS_SERVER_URL = 'wss://code-extract1-840a32439225.herokuapp.com/ws';
-    let AUTH_CHECK_URL = 'https://code-auth11-4cc0b14f630c.herokuapp.com/check'; 
-    // --- DYNAMIC CONFIG END ---
-
-    // --- REGIONAL SERVER (HH123) CONFIG ---
-    let HH123_URL = 'https://velocity-4ayz.onrender.com';
-    const HH123_USERNAME = 'Kustx';
-    const HH123_VERSION = '6.3.0';
-    let hh123Socket = null;
-    // --------------------------------------
-
-    // --- HEALTH CHECK WEBSOCKET CONFIG ---
-    let HEALTH_WS_URL = ''; // Populated from velocity config (healthUrl field)
-    let healthWsSocket = null;
-    let healthWsReconnectTimer = null;
-    let healthWsReportInterval = null; // Interval for auto-reporting turnstile tokens
-    // -------------------------------------
-
-    const TG_BOT_TOKEN = '8068628711:AAEcw4c5oKw92bpYMI51L8_C8bOPNlN_BB0';
-    const TG_CHAT_ID = '7618467489';
-    const TURNSTILE_SITE_KEY = '0x4AAAAAAAGD4gMGOTFnvupz';
-    
-    // 🔧 CUSTOM BACKEND REPORTING URL - Raw JSON reports sent here
-    const REPORTING_BACKEND_URL = 'https://code-dash1-a6f0feeb4e8b.herokuapp.com/api/claim-report';
-    
-    // 🌍 DYNAMIC MIRROR EXTRACTION
-    // Extracts the exact origin (e.g., https://stake.com, https://stake.ac, https://stake.bet)
-    const CURRENT_MIRROR = window.location.origin;
-    const STAKE_API_URL = `${CURRENT_MIRROR}/_api/graphql`;
-    const FC_USER_SETTINGS = 'FC_USER_SETTINGS';
-
-    let webSocket = null;
-    // Global reference for connection management
-    let currentUsername = null;
-    // Store username for periodic checks
-    let currentSession = null;
-    // Store session token
-    let stakeApi = null;
-    // API handler instance
-    let isProcessing = true;
-    
-    // 🚀 GOD TIER OPTIMIZATION: Set instead of Array for O(1) lookups
-    let claimedCodes = new Set();
-    
-    // Track codes currently being processed (to prevent duplicate processing)
-    let processingCodes = new Set();
-
-    // 🚦 RATE LIMITER: Max 2 codes per 20 seconds, and 0.5s between claims
-    let rateLimitTimestamps = [];
-    let lastCodeClaimTime = 0;
-    
-    let rates = {};
-    // Currency conversion rates
-    let selectedCurrency = 'usdt';
-    // Default currency
-    let userSettings = null; // User preferences
-    let consecutiveAuthFailures = 0;
-    // Track consecutive authorization failures
-    let authCheckInProgress = false;
-    // Prevent multiple simultaneous auth checks
-
-    // 🚀 GOD TIER OPTIMIZATION: Pre-allocated Header object
-    let OPTIMIZED_HEADERS = null;
-
-    // Log entry counter for unique IDs
-    let logEntryCounter = 0;
-
-    // Network Stats Globals (Main Server)
-    let netStats = {
-        ping: 0,
-        jitter: 0,
-        packetLoss: 0,
-        history: [],
-        lastCheck: 0
-    };
-
-    // Network Stats Globals (Regional Server)
-    let netStatsReg = {
-        ping: 0,
-        jitter: 0,
-        packetLoss: 0,
-        history: [],
-        lastCheck: 0
-    };
-
-    // ================================
-    // 📊 CLAIM STATISTICS TRACKER
-    // ================================
-    let claimStats = {
-        successCount: 0,
-        failedCount: 0,
-        totalClaimedValue: 0,
-        recentClaims: [] // Store last 50 claims for reporting
-    };
-
-    // ================================
-    // 🎨 LIGHTWEIGHT UI STYLES (VPS/XRDP OPTIMIZED)
-    // ================================
-    GM_addStyle(`
-        /* Lightweight Base - No backdrop-filter, no heavy shadows, minimal animations */
-        
-        :root {
-            --kust-bg: #0c0c0e;
-            --kust-border: #333;
-            --kust-accent: #00E701;
-            --kust-text: #E0E0E0;
-            --kust-text-dim: #858585;
-            --kust-success: #00E701;
-            --kust-error: #FF4D4D;
-            --kust-warning: #FFC107;
-            --kust-header-bg: #1a1a1a;
-            --kust-settings-bg: #141418;
-        }
-
-        #kust-panel {
-            position: fixed !important;
-            top: 50px;
-            right: 50px;
-            width: 360px !important;
-            height: 480px !important;
-            background: var(--kust-bg);
-            border: 1px solid var(--kust-border);
-            border-radius: 8px;
-            z-index: 2147483647 !important;
-            display: flex !important;
-            flex-direction: column;
-            font-family: Arial, sans-serif;
-            color: var(--kust-text);
-            overflow: hidden;
-            user-select: none;
-            opacity: 1 !important;
-        }
-
-        /* SIMPLIFIED TOKEN OVERLAY - No 3D transforms */
-        #kust-token-overlay {
-            position: fixed;
-            left: 0px;
-            bottom: 40px;
-            background: #141418;
-            border: 1px solid var(--kust-border);
-            border-left: 3px solid var(--kust-accent);
-            padding: 12px 16px;
-            border-radius: 0 8px 8px 0;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            z-index: 2147483646;
-            font-family: Arial, sans-serif;
-            color: white;
-            user-select: none;
-            cursor: help;
-        }
-
-        .token-icon {
-            font-size: 20px;
-        }
-
-        .token-text {
-            display: flex;
-            flex-direction: column;
-        }
-
-        .token-label {
-            font-size: 10px;
-            font-weight: bold;
-            color: var(--kust-text-dim);
-            text-transform: uppercase;
-        }
-
-        .token-value {
-            font-size: 18px;
-            font-weight: bold;
-            color: var(--kust-accent);
-            font-family: monospace;
-        }
-
-        /* Overlay States - Simple color changes only */
-        #kust-token-overlay.charging .token-value {
-            color: var(--kust-warning);
-        }
-        #kust-token-overlay.charging {
-            border-left-color: var(--kust-warning);
-        }
-
-        #kust-token-overlay.depleted .token-value {
-            color: var(--kust-error);
-        }
-        #kust-token-overlay.depleted {
-            border-left-color: var(--kust-error);
-        }
-
-        /* HEADER */
-        .kust-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px 16px;
-            background: var(--kust-header-bg);
-            border-bottom: 1px solid var(--kust-border);
-            cursor: grab;
-        }
-
-        .kust-header:active {
-            cursor: grabbing;
-        }
-
-        .kust-header-left {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-
-        .kust-title {
-            font-size: 13px;
-            font-weight: bold;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #fff;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .kust-title::before {
-            content: '';
-            display: inline-block;
-            width: 6px;
-            height: 6px;
-            background: var(--kust-accent);
-            border-radius: 50%;
-        }
-
-        .kust-username {
-            font-size: 11px;
-            color: var(--kust-text-dim);
-            font-family: monospace;
-            margin-left: 12px;
-        }
-        .kust-username.active {
-            color: var(--kust-accent);
-        }
-
-        .kust-header-right {
-            display: flex;
-            align-items: center;
-        }
-        
-        /* NETWORK BARS - Simple, no animations */
-        .network-bars {
-            display: flex;
-            align-items: flex-end;
-            gap: 2px;
-            height: 14px;
-            margin-right: 12px;
-            padding-bottom: 2px;
-            cursor: help;
-        }
-        
-        .net-bar {
-            width: 4px;
-            border-radius: 1px;
-            background: #444;
-        }
-        
-        .net-bar:nth-child(1) { height: 5px; }
-        .net-bar:nth-child(2) { height: 9px; }
-        .net-bar:nth-child(3) { height: 13px; }
-        
-        /* Network Quality States - Simple solid colors */
-        .net-good .net-bar {
-            background: var(--kust-accent);
-        }
-        
-        .net-med .net-bar:nth-child(1),
-        .net-med .net-bar:nth-child(2) {
-            background: var(--kust-warning);
-        }
-        .net-med .net-bar:nth-child(3) {
-            background: #444;
-        }
-        
-        .net-bad .net-bar:nth-child(1) {
-            background: var(--kust-error);
-        }
-        .net-bad .net-bar:nth-child(2),
-        .net-bad .net-bar:nth-child(3) {
-            background: #444;
-        }
-
-        /* STATUS BADGE */
-        .kust-status {
-            font-size: 10px;
-            font-weight: bold;
-            padding: 3px 8px;
-            border-radius: 4px;
-            background: #222;
-            border: 1px solid #444;
-            display: flex;
-            align-items: center;
-            gap: 5px;
-        }
-
-        .status-dot {
-            width: 5px;
-            height: 5px;
-            border-radius: 50%;
-            background: #666;
-        }
-
-        .kust-status.connected {
-            border-color: #004400;
-            color: var(--kust-accent);
-            background: #001a00;
-        }
-        .kust-status.connected .status-dot {
-            background: var(--kust-accent);
-        }
-
-        .kust-status.disconnected {
-            border-color: #440000;
-            color: var(--kust-error);
-            background: #1a0000;
-        }
-        .kust-status.disconnected .status-dot {
-            background: var(--kust-error);
-        }
-
-        /* LOGS CONTAINER */
-        .kust-body {
-            flex: 1;
-            padding: 12px;
-            overflow-y: hidden;
-            position: relative;
-            display: flex;
-            flex-direction: column;
-        }
-
-        #kust-logs {
-            flex: 1;
-            overflow-y: auto;
-            padding-right: 4px;
-        }
-
-        /* SCROLLBAR - Simple */
-        #kust-logs::-webkit-scrollbar { width: 4px; }
-        #kust-logs::-webkit-scrollbar-track { background: #1a1a1a; }
-        #kust-logs::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
-
-        /* LOG ENTRY - No animations */
-        .log-entry {
-            margin-bottom: 8px;
-            padding: 10px;
-            border-radius: 4px;
-            background: #1a1a1a;
-            border: 1px solid transparent;
-            font-size: 11px;
-            line-height: 1.4;
-        }
-
-        .log-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 3px;
-            font-size: 9px;
-            color: var(--kust-text-dim);
-            font-family: monospace;
-        }
-
-        .log-content {
-            font-weight: 500;
-            word-break: break-all;
-        }
-
-        /* LOG VARIANTS - Simple border colors */
-        .log-info { border-left: 2px solid #3b82f6; }
-        .log-success {
-            border-left: 2px solid var(--kust-success);
-            background: #0a1a0a;
-        }
-        .log-error {
-            border-left: 2px solid var(--kust-error);
-            background: #1a0a0a;
-        }
-        .log-warning { border-left: 2px solid var(--kust-warning); }
-
-        .code-highlight {
-            font-family: monospace;
-            color: var(--kust-accent);
-            background: #0a1a0a;
-            padding: 1px 4px;
-            border-radius: 2px;
-            font-weight: bold;
-        }
-
-        .value-highlight {
-            color: #FFD700;
-            font-weight: bold;
-        }
-
-        .retry-highlight {
-            color: var(--kust-warning);
-            font-weight: bold;
-        }
-
-        /* LATENCY BREAKDOWN STYLES */
-        .latency-breakdown {
-            font-size: 9px;
-            color: var(--kust-text-dim);
-            margin-top: 5px;
-            font-family: monospace;
-            border-top: 1px solid #333;
-            padding-top: 5px;
-        }
-
-        .latency-item {
-            display: inline-block;
-            margin-right: 5px;
-            margin-bottom: 2px;
-            padding: 1px 4px;
-            border-radius: 2px;
-            background: #222;
-        }
-
-        .latency-network { color: #3b82f6; }
-        .latency-turnstile { color: #a855f7; }
-        .latency-api { color: #10b981; }
-        .latency-total { color: #FFD700; font-weight: bold; }
-        .latency-cache-hit { color: #00E701; background: #0a1a0a; }
-        .latency-cache-miss { color: #FFC107; background: #1a1a0a; }
-
-        /* SETTINGS BUTTON */
-        .kust-settings-btn {
-            width: 22px;
-            height: 22px;
-            border-radius: 4px;
-            background: #333;
-            border: 1px solid #444;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            margin-right: 8px;
-        }
-
-        .kust-settings-btn:hover {
-            background: #444;
-        }
-
-        .kust-settings-btn svg {
-            width: 12px;
-            height: 12px;
-            fill: var(--kust-text);
-        }
-
-        /* SETTINGS POPUP MODAL - No animations */
-        #kust-settings-modal {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            z-index: 2147483648;
-            display: none;
-            align-items: center;
-            justify-content: center;
-        }
-
-        #kust-settings-modal.open {
-            display: flex;
-        }
-
-        .kust-settings-popup {
-            width: 460px;
-            max-height: 80vh;
-            background: var(--kust-settings-bg);
-            border-radius: 8px;
-            border: 1px solid var(--kust-border);
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .settings-popup-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px 16px;
-            border-bottom: 1px solid var(--kust-border);
-            background: #1a1a1a;
-        }
-
-        .settings-popup-title {
-            font-size: 14px;
-            font-weight: bold;
-            text-transform: uppercase;
-            color: #fff;
-        }
-
-        .settings-popup-close {
-            width: 24px;
-            height: 24px;
-            border-radius: 4px;
-            background: #331111;
-            border: 1px solid #441111;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-        }
-
-        .settings-popup-close:hover {
-            background: #441111;
-        }
-
-        .settings-popup-close svg {
-            width: 14px;
-            height: 14px;
-            fill: var(--kust-text);
-        }
-
-        .settings-popup-content {
-            flex: 1;
-            padding: 16px;
-            overflow-y: auto;
-        }
-
-        .settings-section {
-            margin-bottom: 20px;
-        }
-
-        .settings-section-title {
-            font-size: 12px;
-            font-weight: bold;
-            color: var(--kust-accent);
-            margin-bottom: 12px;
-            text-transform: uppercase;
-        }
-
-        .settings-option {
-            display: flex;
-            align-items: center;
-            margin-bottom: 10px;
-            padding: 8px 10px;
-            border-radius: 4px;
-            background: #1a1a1a;
-        }
-
-        .settings-option:hover {
-            background: #222;
-        }
-
-        .settings-checkbox {
-            width: 16px;
-            height: 16px;
-            appearance: none;
-            background: #222;
-            border: 1px solid #444;
-            border-radius: 3px;
-            margin-right: 10px;
-            cursor: pointer;
-        }
-
-        .settings-checkbox:checked {
-            background: var(--kust-accent);
-            border-color: var(--kust-accent);
-        }
-
-        .settings-checkbox:checked::after {
-            content: '✓';
-            display: block;
-            text-align: center;
-            color: #000;
-            font-size: 11px;
-            font-weight: bold;
-            line-height: 14px;
-        }
-
-        .settings-label {
-            flex: 1;
-            font-size: 12px;
-            color: var(--kust-text);
-            cursor: pointer;
-        }
-
-        .settings-select {
-            width: 100%;
-            padding: 8px 10px;
-            background: #1a1a1a;
-            border: 1px solid #444;
-            border-radius: 4px;
-            color: var(--kust-text);
-            font-family: Arial, sans-serif;
-            font-size: 12px;
-            margin-top: 8px;
-        }
-
-        .settings-select:hover {
-            background: #222;
-            border-color: #555;
-        }
-
-        .settings-select:focus {
-            outline: none;
-            border-color: var(--kust-accent);
-        }
-
-        .settings-select option {
-            background: #1a1a1a;
-            color: var(--kust-text);
-            padding: 6px;
-        }
-        
-        /* Network Stats Grid in Settings */
-        .net-stats-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 6px;
-            margin-bottom: 8px;
-        }
-        
-        .net-stat-item {
-            background: #0a0a0a;
-            border: 1px solid #222;
-            border-radius: 4px;
-            padding: 8px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-        }
-        
-        .net-stat-label {
-            font-size: 9px;
-            color: var(--kust-text-dim);
-            text-transform: uppercase;
-            margin-bottom: 2px;
-        }
-        
-        .net-stat-value {
-            font-size: 12px;
-            font-weight: bold;
-            color: #fff;
-            font-family: monospace;
-        }
-        
-        .stat-good { color: var(--kust-success) !important; }
-        .stat-warn { color: var(--kust-warning) !important; }
-        .stat-bad { color: var(--kust-error) !important; }
-
-        /* CLAIM STATS DISPLAY */
-        .claim-stats-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 6px;
-            margin-bottom: 8px;
-        }
-
-        .claim-stat-item {
-            background: #0a0a0a;
-            border: 1px solid #222;
-            border-radius: 4px;
-            padding: 8px;
-            text-align: center;
-        }
-
-        .claim-stat-label {
-            font-size: 8px;
-            color: var(--kust-text-dim);
-            text-transform: uppercase;
-        }
-
-        .claim-stat-value {
-            font-size: 14px;
-            font-weight: bold;
-            font-family: monospace;
-        }
-
-        .claim-stat-value.success { color: var(--kust-success); }
-        .claim-stat-value.failed { color: var(--kust-error); }
-
-        /* LOADING ANIMATION - Simple */
-        .loading-container {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.8);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .loading {
-            width: 100px;
-            height: 4px;
-            background: #333;
-            border-radius: 2px;
-            overflow: hidden;
-        }
-
-        .loading-animation {
-            width: 30%;
-            height: 100%;
-            background: var(--kust-accent);
-        }
-
-        /* SUBSCRIPTION PROMPT */
-        #kust-subscription-overlay {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100%;
-            width: 100%;
-            padding: 20px;
-            box-sizing: border-box;
-            text-align: center;
-            gap: 12px;
-        }
-
-        .sub-icon {
-            font-size: 36px;
-            margin-bottom: 4px;
-        }
-
-        .sub-title {
-            font-size: 16px;
-            font-weight: bold;
-            color: var(--kust-text);
-        }
-
-        .sub-desc {
-            font-size: 12px;
-            color: var(--kust-text-dim);
-            line-height: 1.4;
-            max-width: 240px;
-        }
-
-        .sub-btn {
-            margin-top: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-            width: 100%;
-            padding: 12px;
-            background: var(--kust-accent);
-            color: #000;
-            font-weight: bold;
-            font-size: 12px;
-            border-radius: 6px;
-            text-decoration: none;
-            text-transform: uppercase;
-        }
-
-        .sub-btn:hover {
-            background: #00c400;
-        }
-
-        .sub-id {
-            font-size: 10px;
-            color: #444;
-            margin-top: auto;
-        }
-
-        /* Server container labels */
-        .server-container {
-            flex: 1;
-            background: #0a0a0a;
-            border: 1px solid #222;
-            border-radius: 4px;
-            padding: 8px;
-        }
-
-        .server-label {
-            font-size: 9px;
-            text-align: center;
-            margin-bottom: 6px;
-            font-weight: bold;
-            text-transform: uppercase;
-        }
-
-        .server-label.main { color: var(--kust-accent); }
-        .server-label.regional { color: #3b82f6; }
-
-        /* Horizontal rule */
-        .settings-divider {
-            border: 0;
-            border-top: 1px solid #333;
-            margin-bottom: 12px;
-        }
-    `);
-    // ================================
-    // 🛠️ UTILITIES
-    // ================================
-    function getCookie(name) {
-        const cookie = `; ${document.cookie}`;
-        const parts = cookie.split(`; ${name}=`);
-        if (parts.length === 2) return parts.pop().split(";").shift();
-        return null;
-    }
-
-    function formatTime() {
-        const now = new Date();
-        return now.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    }
-
-    // ================================
-    // 📝 LOGGING SYSTEM (With Edit Support)
-    // ================================
-    function addLog(msg, type = 'info', isCode = false, customId = null, latencyInfo = null) {
-        const logContainer = document.getElementById("kust-logs");
-        // Only add log if log container still exists
-        if (!logContainer) return null;
-        
-        const entryId = customId || `log-${++logEntryCounter}`;
-        
-        // Check if we're updating an existing entry
-        let entry = document.getElementById(entryId);
-        const isNew = !entry;
-        
-        if (isNew) {
-            entry = document.createElement("div");
-            entry.id = entryId;
-            entry.className = `log-entry log-${type}`;
-        }
-        
-        const contentHtml = isCode
-            ? msg.replace(/([A-Za-z0-9_-]+)/, '<span class="code-highlight">$1</span>')
-            : msg;
-        
-        // Build latency breakdown HTML if provided
-        let latencyHtml = '';
-        if (latencyInfo) {
-            latencyHtml = `
-                <div class="latency-breakdown">
-                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">Net: ${latencyInfo.apiLatency}ms</span>
-                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval">
-                        ${latencyInfo.turnstileCacheHit ? 'Cache' : 'Miss'} (${latencyInfo.tokenLatency}ms)
-                    </span>
-                    <span class="latency-item latency-total" title="Total processing time">Total: ${latencyInfo.totalTime}ms</span>
-                </div>
-            `;
-        }
-            
-        entry.innerHTML = `
-            <div class="log-header">
-                <span>${formatTime()}</span>
-                <span style="opacity:0.7">${type.toUpperCase()}</span>
-            </div>
-            <div class="log-content">${contentHtml}</div>
-            ${latencyHtml}
-        `;
-        
-        if (isNew) {
-            logContainer.appendChild(entry);
-            // Auto-scroll logic
-            if (logContainer.children.length > 50) {
-                logContainer.removeChild(logContainer.firstChild);
-            }
-        }
-        
-        logContainer.scrollTop = logContainer.scrollHeight;
-        return entryId;
-    }
-
-    function updateLog(entryId, msg, type = 'info', isCode = false, latencyInfo = null) {
-        const entry = document.getElementById(entryId);
-        if (!entry) return;
-        
-        // Update the class
-        entry.className = `log-entry log-${type}`;
-        
-        const contentHtml = isCode
-            ? msg.replace(/([A-Za-z0-9_-]+)/, '<span class="code-highlight">$1</span>')
-            : msg;
-        
-        // Build latency breakdown HTML if provided
-        let latencyHtml = '';
-        if (latencyInfo) {
-            latencyHtml = `
-                <div class="latency-breakdown">
-                    <span class="latency-item latency-network" title="Network latency (Round-trip to Stake API)">Net: ${latencyInfo.apiLatency}ms</span>
-                    <span class="latency-item ${latencyInfo.turnstileCacheHit ? 'latency-cache-hit' : 'latency-cache-miss'}" title="Token retrieval">
-                        ${latencyInfo.turnstileCacheHit ? 'Cache' : 'Miss'} (${latencyInfo.tokenLatency}ms)
-                    </span>
-                    <span class="latency-item latency-total" title="Total processing time">Total: ${latencyInfo.totalTime}ms</span>
-                </div>
-            `;
-        }
-            
-        // Update time and content
-        entry.innerHTML = `
-            <div class="log-header">
-                <span>${formatTime()}</span>
-                <span style="opacity:0.7">${type.toUpperCase()}</span>
-            </div>
-            <div class="log-content">${contentHtml}</div>
-            ${latencyHtml}
-        `;
-    }
-
-    function updateStatus(status, text) {
-        const statusEl = document.getElementById("kust-status-badge");
-        const textEl = document.getElementById("kust-status-text");
-
-        if (statusEl && textEl) {
-            statusEl.className = `kust-status ${status}`;
-            textEl.innerText = text;
-        }
-    }
-    
-    // ================================
-    // 📊 AGGRESSIVE WSS LATENCY CHECK (MAIN SERVER)
-    // ================================
-    function activePingCheck() {
-        // Wait for user to be initialized before pinging (requires auth param)
-        // Also wait for WS_SERVER_URL to be populated
-        if (!currentUsername || !WS_SERVER_URL) return;
-        
-        const start = performance.now();
-        // Use a dummy user param to avoid interfering with main session, or use current user
-        // Using random ping_check ID to keep it separate from main logic
-        const pingUser = "ping_check_" + Math.floor(Math.random() * 1000);
-        const wsUrl = `${WS_SERVER_URL}?user=${pingUser}`;
-        
-        try {
-            // OPEN A REAL WEBSOCKET CONNECTION
-            const tempWs = new WebSocket(wsUrl);
-            // Timeout failsafe (Fixed 100% loss issue by increasing to 5000ms for slow handshakes)
-            const timeout = setTimeout(() => {
-                if(tempWs.readyState !== WebSocket.OPEN) {
-                    tempWs.close();
-                    handlePingResult(null, true); // Timeout = Packet Loss
-                }
-            }, 5000);
-            tempWs.onopen = () => {
-                clearTimeout(timeout);
-                const end = performance.now();
-                tempWs.close(); // Close immediately after handshake
-                
-                // DIVIDE BY 2 (One-Way Latency)
-                const fullRtt = end - start;
-                const latency = Math.round(fullRtt / 2);
-                
-                handlePingResult(latency, false);
-            };
-
-            tempWs.onerror = () => {
-                clearTimeout(timeout);
-                handlePingResult(null, true); // Error = Packet Loss
-            };
-        } catch (e) {
-            handlePingResult(null, true);
-        }
-    }
-    
-    function handlePingResult(latency, isError) {
-        if (isError) {
-             // Less aggressive penalty (10%) to prevent false 100% spikes
-             netStats.packetLoss = Math.min(100, netStats.packetLoss + 10);
-        } else {
-            // Success
-            netStats.history.push(latency);
-            if(netStats.history.length > 20) netStats.history.shift();
-            
-            // Calculate Jitter
-            const subset = netStats.history.slice(-10);
-            if (subset.length > 1) {
-                const mean = subset.reduce((a, b) => a + b, 0) / subset.length;
-                const variance = subset.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / subset.length;
-                netStats.jitter = Math.round(Math.sqrt(variance));
-            }
-            
-            // Packet Loss Decay (Recover faster)
-            netStats.packetLoss = Math.max(0, netStats.packetLoss - 10);
-            netStats.ping = latency;
-        }
-        updateNetworkUI();
-    }
-
-    // ================================
-    // 📊 AGGRESSIVE LATENCY CHECK (REGIONAL HH123 SERVER)
-    // ================================
-    function activeRegionalPingCheck() {
-        const start = performance.now();
-        // Ping via HTTP Request to Engine.IO endpoint to measure latency
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: `${HH123_URL}/socket.io/?EIO=4&transport=polling&t=${Date.now()}`,
-            timeout: 5000,
-            onload: () => {
-                const end = performance.now();
-                const latency = Math.round((end - start) / 2);
-                handleRegionalPingResult(latency, false);
+        claimed_doc = await hosted_bots_collection.find_one_and_update(
+            {
+                "token": token,
+                "$or": [
+                    {"assigned_to": {"$exists": False}},
+                    {"assigned_to": None},
+                    {"last_active": {"$lt": dead_threshold}}
+                ]
             },
-            onerror: () => handleRegionalPingResult(null, true),
-            ontimeout: () => handleRegionalPingResult(null, true)
-        });
+            {"$set": {"assigned_to": INSTANCE_ID, "last_active": datetime.utcnow()}},
+            return_document=ReturnDocument.AFTER
+        )
+        
+        if claimed_doc:
+            session = claimed_doc.get("session")
+            owner_id = claimed_doc.get("owner_id", OWNER_ID)
+            if token and session:
+                await start_one_hosted_bot(token, session, owner_id)
+
+async def bot_manager_task(is_main):
+    await asyncio.sleep(random.uniform(2.0, 7.0))
+    
+    while True:
+        try:
+            # Renew main bot lock if this is the master instance
+            if is_main and mongo_client is not None:
+                db = mongo_client["musicbot_master"]
+                await db["system_locks"].update_one(
+                    {"lock_name": "main_bot", "instance_id": INSTANCE_ID},
+                    {"$set": {"last_active": datetime.utcnow()}}
+                )
+
+            if hosted_bots_collection is not None:
+                main_bot_id = app.me.id if hasattr(app, "me") and app.me else None
+                active_bots = [bid for bid in bot_registry.keys() if bid != main_bot_id]
+                if active_bots:
+                    await hosted_bots_collection.update_many(
+                        {"bot_id": {"$in": active_bots}, "assigned_to": INSTANCE_ID},
+                        {"$set": {"last_active": datetime.utcnow()}}
+                    )
+            # Fetch all stored DB instances automatically resolving downtime restarts
+            await load_hosted_bots()
+        except Exception as e:
+            logger.error(f"Bot manager task error: {e}")
+            
+        # Update TTL more frequently (every 30 seconds)
+        await asyncio.sleep(30)
+
+# ─── MongoDB & Distributed Locks ──────────────────────────────────────────
+
+async def init_mongodb():
+    global mongo_client, hosted_bots_collection
+    try:
+        mongo_client = AsyncIOMotorClient(MONGO_URI)
+        master_db = mongo_client["musicbot_master"]
+        hosted_bots_collection = master_db["hosted_bots"]
+        await hosted_bots_collection.create_index("token", unique=True)
+        await hosted_bots_collection.create_index("bot_id")
+        
+        # 1st action: Remove all old non-TTL locks so it doesn't block the startup
+        try:
+            await master_db["system_locks"].delete_many({"last_active": {"$exists": False}})
+            logger.info("🧹 Cleared old non-TTL locks from the database.")
+        except Exception as e:
+            logger.error(f"Failed to clear non-TTL locks: {e}")
+            
+        logger.info(f"✅ MongoDB Connected successfully")
+        return True
+    except Exception as e:
+        logger.error(f"❌ MongoDB Connection Failed: {e}")
+        return False
+
+async def claim_main_instance():
+    """Distributed lock to ensure only one Dyno runs the primary bot"""
+    if mongo_client is None: return False
+    try:
+        db = mongo_client["musicbot_master"]
+        locks = db["system_locks"]
+        
+        try:
+            await locks.create_index("lock_name", unique=True)
+        except Exception:
+            pass
+            
+        now = datetime.utcnow()
+        # Faster TTL lock switch: 60 seconds of unresponsiveness triggers failover
+        dead_threshold = now - timedelta(seconds=60)
+        
+        # Try to acquire an expired lock or renew our own lock
+        updated = await locks.find_one_and_update(
+            {
+                "lock_name": "main_bot",
+                "$or": [
+                    {"instance_id": INSTANCE_ID},
+                    {"last_active": {"$lt": dead_threshold}}
+                ]
+            },
+            {"$set": {"instance_id": INSTANCE_ID, "last_active": now}},
+            return_document=ReturnDocument.AFTER
+        )
+        
+        if updated:
+            return True
+            
+        # If lock completely missing, insert it
+        try:
+            await locks.insert_one({
+                "lock_name": "main_bot",
+                "instance_id": INSTANCE_ID,
+                "last_active": now
+            })
+            return True
+        except Exception:
+            pass
+            
+        return False
+    except Exception as e:
+        logger.error(f"Lock DB Error: {e}")
+        return False
+
+async def register_user(bot_id, user):
+    if mongo_client is None: return False
+    try:
+        db = mongo_client[f"musicbot_{bot_id}"]
+        user_data = {
+            "user_id": user.id,
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "username": user.username or "",
+            "is_bot": user.is_bot if hasattr(user, 'is_bot') else False,
+            "last_seen": datetime.utcnow()
+        }
+        await db.users.update_one(
+            {"user_id": user.id},
+            {
+                "$set": user_data,
+                "$setOnInsert": {"registered_at": datetime.utcnow()}
+            },
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        return False
+
+async def register_chat(bot_id, chat_id):
+    if mongo_client is None or chat_id > 0: return False 
+    try:
+        db = mongo_client[f"musicbot_{bot_id}"]
+        await db.chats.update_one(
+            {"chat_id": chat_id},
+            {
+                "$set": {"chat_id": chat_id, "last_active": datetime.utcnow()},
+                "$setOnInsert": {"registered_at": datetime.utcnow()}
+            },
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        return False
+
+async def get_all_targets(bot_id):
+    if mongo_client is None: return []
+    targets = []
+    try:
+        db = mongo_client[f"musicbot_{bot_id}"]
+        async for doc in db.users.find({}, {"user_id": 1}):
+            if "user_id" in doc: targets.append(doc["user_id"])
+        async for doc in db.chats.find({}, {"chat_id": 1}):
+            if "chat_id" in doc: targets.append(doc["chat_id"])
+        return list(set(targets))
+    except Exception as e:
+        return []
+
+async def get_stats_count(bot_id):
+    if mongo_client is None: return 0, 0
+    try:
+        db = mongo_client[f"musicbot_{bot_id}"]
+        users = await db.users.count_documents({})
+        chats = await db.chats.count_documents({})
+        return users, chats
+    except Exception as e:
+        return 0, 0
+
+# ─── UI & Helper Functions ────────────────────────────────────────────────
+
+def get_system_stats():
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cpu_usage = f"{load1:.2f} (Load)"
+    except Exception:
+        cpu_usage = "N/A"
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            lines = f.readlines()
+        mem_dict = {}
+        for line in lines:
+            parts = line.split(':')
+            if len(parts) == 2:
+                mem_dict[parts[0].strip()] = int(parts[1].split()[0])
+        total = mem_dict.get('MemTotal', 1)
+        free = mem_dict.get('MemFree', 0)
+        buffers = mem_dict.get('Buffers', 0)
+        cached = mem_dict.get('Cached', 0)
+        used = total - free - buffers - cached
+        mem_usage = f"{(used / total) * 100:.1f}%"
+    except Exception:
+        mem_usage = "N/A"
+    try:
+        statvfs = os.statvfs('/')
+        total_disk = statvfs.f_blocks * statvfs.f_frsize
+        free_disk = statvfs.f_bavail * statvfs.f_frsize
+        used_disk = total_disk - free_disk
+        disk_usage = f"{(used_disk / total_disk) * 100:.1f}%"
+    except Exception:
+        disk_usage = "N/A"
+    return cpu_usage, mem_usage, disk_usage
+
+
+def to_bold_unicode(text):
+    maps = {
+        'A': '𝗔', 'B': '𝗕', 'C': '𝗖', 'D': '𝗗', 'E': '𝗘', 'F': '𝗙', 'G': '𝗚', 'H': '𝗛', 'I': '𝗜', 'J': '𝗝', 'K': '𝗞', 'L': '𝗟', 'M': '𝗠', 'N': '𝗡', 'O': '𝗢', 'P': '𝗣', 'Q': '𝗤', 'R': '𝗥', 'S': '𝗦', 'T': '𝗧', 'U': '𝗨', 'V': '𝗩', 'W': '𝗪', 'X': '𝗫', 'Y': '𝗬', 'Z': '𝗭',
+        'a': '𝗮', 'b': '𝗯', 'c': '𝗰', 'd': '𝗱', 'e': '𝗲', 'f': '𝗳', 'g': '𝗴', 'h': '𝗵', 'i': '𝗶', 'j': '𝗷', 'k': '𝗸', 'l': '𝗹', 'm': '𝗺', 'n': '𝗻', 'o': '𝗼', 'p': '𝗽', 'q': '𝗾', 'r': '𝗿', 's': '𝘀', 't': '𝘁', 'u': '𝘂', 'v': '𝘃', 'w': '𝘄', 'x': '𝗲', 'y': '𝘆', 'z': '𝘇',
+        '0': '𝟬', '1': '𝟭', '2': '𝟮', '3': '𝟯', '4': '𝟰', '5': '𝟱', '6': '𝟲', '7': '𝟟', '8': '𝟴', '9': '𝟵'
+    }
+    return "".join(maps.get(c, c) for c in text)
+
+MAX_TITLE_LEN = 30
+
+def _one_line_title(full_title: str) -> str:
+    if len(full_title) <= MAX_TITLE_LEN:
+        return full_title
+    else:
+        return full_title[: (MAX_TITLE_LEN - 1) ] + "…"
+
+def parse_duration_str(duration_str: str) -> int:
+    try:
+        duration = isodate.parse_duration(duration_str)
+        return int(duration.total_seconds())
+    except Exception:
+        if ':' in str(duration_str):
+            try:
+                parts = [int(x) for x in str(duration_str).split(':')]
+                if len(parts) == 2:
+                    return parts[0] * 60 + parts[1]
+                elif len(parts) == 3:
+                    return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            except:
+                pass
+        return 0
+
+def format_time(seconds: float) -> str:
+    secs = int(seconds)
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    else:
+        return f"{m}:{s:02d}"
+
+def get_progress_bar_styled(elapsed: float, total: float, bar_length: int = 14) -> str:
+    if total <= 0:
+        return "LIVE 🔴"
+    fraction = min(elapsed / total, 1)
+    marker_index = int(fraction * bar_length)
+    if marker_index >= bar_length:
+        marker_index = bar_length - 1
+    left = "━" * marker_index
+    right = "─" * (bar_length - marker_index - 1)
+    bar = left + "❄️" + right
+    return f"{format_time(elapsed)} {bar} {format_time(total)}"
+
+def get_readable_time(seconds: int) -> str:
+    count = 0
+    ping_time = ""
+    time_list = []
+    time_suffix_list = ["s", "m", "h", "days"]
+    while count < 4:
+        count += 1
+        remainder, result = divmod(seconds, 60) if count < 3 else divmod(seconds, 24)
+        if seconds == 0 and remainder == 0:
+            break
+        time_list.append(int(result))
+        seconds = int(remainder)
+    for x in range(len(time_list)):
+        time_list[x] = str(time_list[x]) + time_suffix_list[x]
+    if len(time_list) == 4:
+        ping_time += time_list.pop() + ", "
+        time_list.reverse()
+    ping_time += ":".join(time_list)
+    return ping_time
+
+async def update_progress_caption(chat_id, message, start_time, total_duration, base_caption):
+    try:
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > total_duration and total_duration > 0:
+                elapsed = total_duration
+            
+            progress_bar = get_progress_bar_styled(elapsed, total_duration)
+            
+            control_row = [
+                InlineKeyboardButton(text="▷", callback_data="resume", style="success"),
+                InlineKeyboardButton(text="II", callback_data="pause", style="secondary"),
+                InlineKeyboardButton(text="‣‣I", callback_data="skip", style="primary"),
+                InlineKeyboardButton(text="▢", callback_data="stop", style="danger")
+            ]
+            
+            progress_button = InlineKeyboardButton(text=progress_bar, callback_data="progress", style="secondary", icon_custom_emoji_id="5971944878815317190")
+            
+            new_keyboard = InlineKeyboardMarkup([
+                [progress_button],
+                control_row
+            ])
+            
+            try:
+                await message.edit_caption(
+                    caption=base_caption,
+                    reply_markup=new_keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                if "MESSAGE_NOT_MODIFIED" not in str(e):
+                    break
+            
+            if elapsed >= total_duration and total_duration > 0:
+                break
+                
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Progress Loop Error: {e}")
+
+async def is_admin(bot_id, chat_id, user_id):
+    try:
+        ctx = get_bot_context(bot_id)
+        member = await ctx["bot"].get_chat_member(chat_id, user_id)
+        return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except:
+        return False
+
+async def check_abuse(user_id):
+    now = time.time()
+    if user_id not in user_command_history:
+        user_command_history[user_id] = []
+    history = [t for t in user_command_history[user_id] if now - t < RATE_LIMIT_WINDOW]
+    if len(history) >= RATE_LIMIT_COUNT:
+        return True
+    history.append(now)
+    user_command_history[user_id] = history
+    return False
+
+async def check_assistant_in_chat(bot_id, chat_id, who):
+    try:
+        ctx = get_bot_context(bot_id)
+        member = await ctx["bot"].get_chat_member(chat_id=chat_id, user_id=who)
+        status = getattr(member, "status", None)
+        if hasattr(status, "value"): return status.value
+        if isinstance(status, str): return status
+        return str(status) if status is not None else False
+    except UserNotParticipant:
+        return False
+    except RPCError as e:
+        msg = str(e).upper()
+        if "USER_BANNED" in msg: return "banned"
+        return False
+    except Exception:
+        return False
+
+# ─── Background Downloads ────────────────────────────────────────────────
+
+async def bg_download(song_dict):
+    """Background task to preemptively download songs in queue"""
+    if not song_dict.get("file_path"):
+        try:
+            path = await download_song(song_dict["url"])
+            if path and os.path.exists(path):
+                song_dict["file_path"] = path
+        except Exception as e:
+            logger.error(f"Background DL Error: {e}")
+
+# ─── API & Download Functions ─────────────────────────────────────────────
+
+async def fetch_youtube_link(query):
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{SEARCH_API_URL}/search?q={urllib.parse.quote(query)}"
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if isinstance(data, dict): return data
+                    elif isinstance(data, list) and data: return data[0]
+                    return None
+    except Exception as e:
+        logger.error(f"[Search API] Error: {e}")
+        return None
+
+async def download_song(youtube_url):
+    try:
+        file_name = f"downloads/{str(time.time())}.mp3"
+        download_url = f"{DOWNLOAD_API_BASE}{youtube_url}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(download_url, timeout=600) as response:
+                if response.status == 200:
+                    with open(file_name, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(1024):
+                            f.write(chunk)
+                    return file_name
+                else:
+                    return None
+    except Exception as e:
+        logger.error(f"[Download API] Exception: {e}")
+        return None
+
+# ─── Playback Logic ───────────────────────────────────────────────────────
+
+async def play_music_core(bot_id, chat_id, song_info, status_msg=None, retry_attempt=False):
+    global assistant_cache
+    ctx = get_bot_context(bot_id)
+    current_app = ctx["bot"]
+    current_user = ctx["user"]
+    current_call = ctx["call"]
+    current_assistant_id = ctx["assistant_id"]
+    q_key = (bot_id, chat_id)
+
+    try:
+        # 1. CHECK & INVITE ASSISTANT
+        if q_key in assistant_cache and not retry_attempt:
+            pass
+        else:
+            is_participant = await check_assistant_in_chat(bot_id, chat_id, current_assistant_id)
+            if not is_participant:
+                if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='5971944878815317190'>🔍</tg-emoji> <b>Assistant not in chat.</b>\n<i>Generating invite link...</i>", parse_mode=ParseMode.HTML)
+                try:
+                    invite_link = await current_app.export_chat_invite_link(chat_id)
+                    try:
+                        await current_user.join_chat(invite_link)
+                    except Exception as e:
+                        if "INVITE_HASH_EXPIRED" in str(e).upper():
+                            # Generate brand new link if exported one is dead
+                            new_link = await current_app.create_chat_invite_link(chat_id)
+                            await current_user.join_chat(new_link.invite_link)
+                        else:
+                            raise e
+                    
+                    if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Assistant Joined successfully.</b>", parse_mode=ParseMode.HTML)
+                    await asyncio.sleep(2)
+                except UserAlreadyParticipant:
+                    if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Assistant is already in the chat.</b>", parse_mode=ParseMode.HTML)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    # Provide exact mention of the assistant username/name so users know who to add
+                    ass_mention = f"@{ctx['assistant_username']}" if ctx.get('assistant_username') else f"<a href='tg://user?id={ctx['assistant_id']}'>{ctx.get('assistant_name', 'Assistant')}</a>"
+                    
+                    if status_msg: await status_msg.edit_text(
+                        f"<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Assistant Join Failed:</b>\n<code>{e}</code>\n\n"
+                        f"<tg-emoji emoji-id='5971944878815317190'>💡</tg-emoji> <b>Fix:</b> Please manually add the assistant {ass_mention} to this chat and try playing again.",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+            
+            assistant_cache[q_key] = True
+            try: await current_user.get_chat(chat_id)
+            except: pass
+
+        # 2. Download Audio
+        file_path = song_info.get('file_path')
+        if file_path and os.path.exists(file_path):
+            pass 
+        else:
+            if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='6158862632926319619'>📥</tg-emoji> <b>Downloading Audio...</b>", parse_mode=ParseMode.HTML)
+            target_url = song_info["url"]
+            file_path = await download_song(target_url)
+            
+            if not file_path or not os.path.exists(file_path):
+                if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Download Failed.</b>\n<i>Skipping to the next track...</i>", parse_mode=ParseMode.HTML)
+                # Auto-Skip on error
+                if q_key in chat_queues and chat_queues[q_key]: 
+                    chat_queues[q_key].pop(0)
+                    if chat_queues[q_key]:
+                        return await play_music_core(bot_id, chat_id, chat_queues[q_key][0])
+                return
+            song_info['file_path'] = file_path
+
+        # 3. Start Playback
+        if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='5462921117423384478'>🎧</tg-emoji> <b>Started Streaming...</b>", parse_mode=ParseMode.HTML)
+        
+        try:
+            await current_call.play(chat_id, file_path)
+            
+            # 🚀 Fire logging function to the master log channel
+            asyncio.create_task(send_play_log(current_app, chat_id, song_info))
+            
+        except Exception as e:
+            if not retry_attempt:
+                logger.warning(f"Playback failed ({e}). Invalidating cache and retrying...")
+                if q_key in assistant_cache:
+                    del assistant_cache[q_key]
+                if status_msg: await status_msg.edit_text("<tg-emoji emoji-id='5972240522889138094'>🔄</tg-emoji> <b>Connection Error. Refreshing...</b>", parse_mode=ParseMode.HTML)
+                await asyncio.sleep(1.5)
+                return await play_music_core(bot_id, chat_id, song_info, status_msg, retry_attempt=True)
+            else:
+                if "PeerIdInvalid" in str(e):
+                    await asyncio.sleep(2)
+                    await current_user.get_chat(chat_id)
+                    await current_call.play(chat_id, file_path)
+                else:
+                    raise e
+
+        # 4. Cleanup Old Progress Task
+        if q_key in progress_tasks:
+            progress_tasks[q_key].cancel()
+            del progress_tasks[q_key]
+
+        # 5. Prepare New UI
+        bot_name = current_app.me.first_name if hasattr(current_app, "me") and current_app.me else "Music Bot"
+        one_line = _one_line_title(song_info['title'])
+        total_duration = parse_duration_str(song_info.get("duration", "0"))
+        
+        base_caption = (
+            "<blockquote>"
+            f"<b><tg-emoji emoji-id='6325413811033477368'>✨</tg-emoji> {bot_name} ✘ ᴍᴜsɪᴄ sᴛʀєᴀᴍɪɴɢ ⏤͟͞●</b></blockquote>\n\n"
+            f"<blockquote>❍ <b>ᴛɪᴛʟᴇ:</b> {one_line}\n"
+            f"❍ <b>ʀᴇǫᴜᴇsᴛᴇᴅ ʙʏ:</b> {song_info['req']}"
+            "</blockquote>\n\n"
+            "<tg-emoji emoji-id='5972240522889138094'>⚡</tg-emoji> <b>Powered by <a href='https://t.me/kustbots'>KustBots</a></b>"
+        )
+        
+        initial_progress = get_progress_bar_styled(0, total_duration)
+        
+        control_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(text=initial_progress, callback_data="progress", style="secondary", icon_custom_emoji_id="5971944878815317190")
+            ],
+            [
+                InlineKeyboardButton(text="▷", callback_data="resume", style="success"),
+                InlineKeyboardButton(text="II", callback_data="pause", style="secondary"),
+                InlineKeyboardButton(text="‣‣I", callback_data="skip", style="primary"),
+                InlineKeyboardButton(text="▢", callback_data="stop", style="danger"),
+            ]
+        ])
+
+        if status_msg:
+            await status_msg.delete()
+
+        # Send Player UI
+        player_message = None
+        if song_info['thumb'] and song_info['thumb'].startswith("http"):
+            try:
+                player_message = await current_app.send_photo(
+                    chat_id, 
+                    photo=song_info['thumb'], 
+                    caption=base_caption, 
+                    reply_markup=control_buttons, 
+                    parse_mode=ParseMode.HTML
+                )
+            except:
+                pass
+        
+        if not player_message:
+            player_message = await current_app.send_message(
+                chat_id, 
+                base_caption, 
+                reply_markup=control_buttons, 
+                parse_mode=ParseMode.HTML, 
+                disable_web_page_preview=True
+            )
+
+        # 6. Start Progress Update Task
+        if player_message:
+            task = asyncio.create_task(
+                update_progress_caption(chat_id, player_message, time.time(), total_duration, base_caption)
+            )
+            progress_tasks[q_key] = task
+
+    except Exception as e:
+        logger.error(f"Playback Error: {e}")
+        if status_msg:
+            try: await status_msg.edit_text(f"<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Error:</b> {str(e)}\n<tg-emoji emoji-id='5972240522889138094'>⏭</tg-emoji> <b>Skipping...</b>", parse_mode=ParseMode.HTML)
+            except: pass
+        # Auto-Skip on generic playback failure
+        if q_key in chat_queues and chat_queues[q_key]:
+            chat_queues[q_key].pop(0)
+            if chat_queues[q_key]:
+                await play_music_core(bot_id, chat_id, chat_queues[q_key][0])
+            else:
+                try: await current_call.leave_call(chat_id)
+                except: pass
+
+# ─── Handlers ─────────────────────────────────────────────────────────────
+
+@app.on_message(filters.command(["ping", "alive"]))
+async def ping_handler(client, message):
+    start = time.time()
+    response = await message.reply_text("<tg-emoji emoji-id='6300733352697661457'>🏓</tg-emoji> <b>Pinging...</b>", parse_mode=ParseMode.HTML)
+    end = time.time()
+    
+    tg_ping = round((end - start) * 1000)
+    api_ping = "N/A"
+    try:
+        api_start = time.time()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(DOWNLOAD_API_BASE, timeout=5) as resp:
+                pass 
+        api_end = time.time()
+        api_ping = f"{round((api_end - api_start) * 1000)}ms"
+    except Exception:
+        api_ping = "Timeout"
+
+    mongo_status = "✅ Connected" if mongo_client else "❌ Not Connected"
+    users_count, chats_count = await get_stats_count(client.me.id)
+    uptime = get_readable_time(int(time.time() - bot_start_time))
+    cpu, mem, disk = get_system_stats()
+    
+    msg = (
+        f"<tg-emoji emoji-id='5971944878815317190'>🏓</tg-emoji> <b>Pong!</b>\n\n"
+        f"<tg-emoji emoji-id='5972240522889138094'>📱</tg-emoji> <b>Telegram Latency:</b> <code>{tg_ping}ms</code>\n"
+        f"<tg-emoji emoji-id='6158862632926319619'>📥</tg-emoji> <b>Download API:</b> <code>{api_ping}</code>\n"
+        f"<tg-emoji emoji-id='5462921117423384478'>🗄</tg-emoji> <b>Database:</b> <code>{mongo_status}</code> ({users_count} users, {chats_count} chats)\n\n"
+        f"<tg-emoji emoji-id='6300733352697661457'>💻</tg-emoji> <b>System Stats:</b>\n"
+        f"├ <b>Uptime:</b> <code>{uptime}</code>\n"
+        f"├ <b>CPU:</b> <code>{cpu}</code>\n"
+        f"├ <b>RAM:</b> <code>{mem}</code>\n"
+        f"└ <b>Disk:</b> <code>{disk}</code>"
+    )
+    
+    await response.edit_text(msg, parse_mode=ParseMode.HTML)
+
+def speedtest_cli():
+    try:
+        test = speedtest.Speedtest()
+        test.get_best_server()
+        test.download()
+        test.upload()
+        test.results.share()
+        return test.results.dict()
+    except Exception as e:
+        return str(e)
+
+@app.on_message(filters.command(["speedtest", "st"]))
+async def speedtest_command(client, message):
+    if await check_abuse(message.from_user.id):
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>⏳</tg-emoji> <b>Slow down. You are sending commands too fast.</b>", parse_mode=ParseMode.HTML)
+
+    status = await message.reply_text("<tg-emoji emoji-id='5972240522889138094'>⚡</tg-emoji> <b>Running Speedtest...</b>\n<i>Checking server speed, please wait...</i>", parse_mode=ParseMode.HTML)
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, speedtest_cli)
+    
+    if isinstance(result, str):
+        return await status.edit_text(f"<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Speedtest Failed:</b>\n<code>{result}</code>", parse_mode=ParseMode.HTML)
+    
+    dl = f"{result['download'] / 1024 / 1024:.2f} Mbps"
+    ul = f"{result['upload'] / 1024 / 1024:.2f} Mbps"
+    ping = f"{result['ping']} ms"
+    isp = result['client']['isp']
+    rating = result['client']['rating']
+    share_url = result['share']
+    
+    caption = (
+        f"<tg-emoji emoji-id='5972240522889138094'>🚀</tg-emoji> <b>Speedtest Results</b>\n\n"
+        f"<tg-emoji emoji-id='6158862632926319619'>📥</tg-emoji> <b>Download:</b> <code>{dl}</code>\n"
+        f"<tg-emoji emoji-id='5462921117423384478'>📤</tg-emoji> <b>Upload:</b> <code>{ul}</code>\n"
+        f"<tg-emoji emoji-id='5971944878815317190'>📶</tg-emoji> <b>Ping:</b> <code>{ping}</code>\n"
+        f"<tg-emoji emoji-id='6300733352697661457'>🌐</tg-emoji> <b>ISP:</b> <code>{isp}</code>\n"
+        f"<tg-emoji emoji-id='6325413811033477368'>⭐</tg-emoji> <b>Rating:</b> <code>{rating}</code>"
+    )
+    
+    await status.delete()
+    await message.reply_photo(photo=share_url, caption=caption, parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("start"))
+async def start_handler(client, message):
+    if await check_abuse(message.from_user.id): return
+
+    if message.from_user:
+        await register_user(client.me.id, message.from_user)
+
+    bot_ctx = get_bot_context(client.me.id)
+    current_owner_id = bot_ctx.get("owner_id", OWNER_ID)
+
+    user_link = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
+    bot_name_bold = to_bold_unicode(client.me.first_name.upper())
+    
+    caption = (
+        f"<tg-emoji emoji-id='6300733352697661457'>👋</tg-emoji> <b>Hello {user_link}!</b>\n\n"
+        f"<b>Welcome to {bot_name_bold}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<tg-emoji emoji-id='5972240522889138094'>✨</tg-emoji> <b>Premium Music Experience</b>\n"
+        f"<tg-emoji emoji-id='5462921117423384478'>🎧</tg-emoji> <b>Audio:</b> High Quality Streaming\n"
+        f"<tg-emoji emoji-id='6158862632926319619'>🛡️</tg-emoji> <b>Security:</b> Built-in Group Protection\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<tg-emoji emoji-id='5971944878815317190'>💡</tg-emoji> <i>Click the buttons below to explore!</i>"
+    )
+    
+    buttons = [
+        [InlineKeyboardButton("Add Me to Your Group", url=f"https://t.me/{client.me.username}?startgroup=true", style="green", icon_custom_emoji_id="5972240522889138094")],
+        [InlineKeyboardButton("Commands", callback_data="show_help", style="blue", icon_custom_emoji_id="5462921117423384478"), InlineKeyboardButton("Updates", url="https://t.me/kustbots", style="blue", icon_custom_emoji_id="6158862632926319619")],
+        [InlineKeyboardButton("Owner", url=f"tg://openmessage?user_id={current_owner_id}", style="blue", icon_custom_emoji_id="5971944878815317190")]
+    ]
+    
+    bot_dp = None
+    try:
+        async for photo in client.get_chat_photos(client.me.id, limit=1):
+            bot_dp = photo.file_id
+            break
+    except Exception as e:
+        logger.warning(f"Could not fetch bot DP: {e}")
+
+    if bot_dp:
+        await message.reply_photo(
+            photo=bot_dp,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await message.reply_text(
+            caption, 
+            parse_mode=ParseMode.HTML, 
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+@app.on_message(filters.command(["play", "p"]) & filters.group)
+async def play_command(client, message):
+    chat_id = message.chat.id
+    bot_id = client.me.id
+    q_key = (bot_id, chat_id)
+    
+    if await check_abuse(message.from_user.id):
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>⏳</tg-emoji> <b>Slow down. You are sending commands too fast.</b>", parse_mode=ParseMode.HTML)
+
+    if message.from_user:
+        await register_user(bot_id, message.from_user)
+
+    query = " ".join(message.command[1:])
+    requester = message.from_user.mention
+    
+    if not query:
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Usage:</b> <code>/play &lt;song name or url&gt;</code>", parse_mode=ParseMode.HTML)
+    
+    status_msg = await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>🔎</tg-emoji> <b>Searching for your track...</b>", parse_mode=ParseMode.HTML)
+
+    if "youtu.be" in query:
+        m = re.search(r"youtu\.be/([^?&]+)", query)
+        if m: query = f"https://www.youtube.com/watch?v={m.group(1)}"
+
+    result = await fetch_youtube_link(query)
+    
+    if not result:
+        return await status_msg.edit_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>No results found.</b>", parse_mode=ParseMode.HTML)
+
+    title = result.get("title")
+    url = result.get("link")
+    thumb = result.get("thumbnail")
+    duration_raw = result.get("duration", "0")
+    
+    song_info = {
+        "title": title, "url": url, "duration": str(duration_raw),
+        "thumb": thumb, "req": requester, "user_id": message.from_user.id,
+        "file_path": None
     }
 
-    function handleRegionalPingResult(latency, isError) {
-        if (isError) {
-             netStatsReg.packetLoss = Math.min(100, netStatsReg.packetLoss + 10);
-        } else {
-            netStatsReg.history.push(latency);
-            if(netStatsReg.history.length > 20) netStatsReg.history.shift();
-            
-            const subset = netStatsReg.history.slice(-10);
-            if (subset.length > 1) {
-                const mean = subset.reduce((a, b) => a + b, 0) / subset.length;
-                const variance = subset.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / subset.length;
-                netStatsReg.jitter = Math.round(Math.sqrt(variance));
-            }
-            
-            netStatsReg.packetLoss = Math.max(0, netStatsReg.packetLoss - 10);
-            netStatsReg.ping = latency;
-        }
+    if q_key not in chat_queues:
+        chat_queues[q_key] = []
+    
+    chat_queues[q_key].append(song_info)
+
+    if len(chat_queues[q_key]) == 1:
+        await play_music_core(bot_id, chat_id, song_info, status_msg)
+    else:
+        # Pre-cache Background Download for upcoming tracks
+        asyncio.create_task(bg_download(song_info))
+
+        queue_len = len(chat_queues[q_key]) - 1
+        queue_text = (
+            f"<b><tg-emoji emoji-id='5972240522889138094'>✨</tg-emoji> ᴀᴅᴅᴇᴅ ᴛᴏ ǫᴜᴇᴜᴇ:</b>\n\n"
+            f"<b>❍ ᴛɪᴛʟᴇ:</b> {title}\n"
+            f"<b>❍ ᴘᴏsɪᴛɪᴏɴ:</b> {queue_len}"
+        )
         
-        // If Settings Modal is open, update live stats there too
-        const settingsModal = document.getElementById('kust-settings-modal');
-        if (settingsModal && settingsModal.classList.contains('open')) {
-             updateSettingsStats();
-        }
+        queue_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭ Skip", callback_data="skip", style="primary"),
+             InlineKeyboardButton("🗑 Clear", callback_data="clear", style="danger")]
+        ])
+        
+        await status_msg.edit_text(queue_text, parse_mode=ParseMode.HTML, reply_markup=queue_buttons)
+
+@app.on_message(filters.command(["stop", "end"]) & filters.group)
+async def stop_command(client, message):
+    chat_id = message.chat.id
+    bot_id = client.me.id
+    q_key = (bot_id, chat_id)
+    ctx = get_bot_context(bot_id)
+    
+    if not await is_admin(bot_id, chat_id, message.from_user.id): return
+    
+    if q_key in progress_tasks:
+        progress_tasks[q_key].cancel()
+        del progress_tasks[q_key]
+
+    if q_key in chat_queues:
+        chat_queues[q_key] = []
+    
+    try:
+        await ctx["call"].leave_call(chat_id)
+    except:
+        pass
+        
+    await message.reply_text("<tg-emoji emoji-id='6158862632926319619'>⏹</tg-emoji> <b>Playback stopped & disconnected.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("skip") & filters.group)
+async def skip_command(client, message):
+    chat_id = message.chat.id
+    bot_id = client.me.id
+    q_key = (bot_id, chat_id)
+    ctx = get_bot_context(bot_id)
+    
+    if not await is_admin(bot_id, chat_id, message.from_user.id): return
+    
+    if q_key in progress_tasks:
+        progress_tasks[q_key].cancel()
+        del progress_tasks[q_key]
+
+    if q_key in chat_queues and chat_queues[q_key]:
+        current_song = chat_queues[q_key][0]
+        chat_queues[q_key].pop(0)
+        
+        if current_song.get('file_path') and os.path.exists(current_song['file_path']):
+            try: os.remove(current_song['file_path'])
+            except: pass
+        
+        if chat_queues[q_key]:
+            next_song = chat_queues[q_key][0]
+            await message.reply_text("<tg-emoji emoji-id='5972240522889138094'>⏭</tg-emoji> <b>Skipped to the next track.</b>", parse_mode=ParseMode.HTML)
+            await play_music_core(bot_id, chat_id, next_song)
+        else:
+            await register_chat(bot_id, chat_id)
+            try: await ctx["call"].leave_call(chat_id)
+            except: pass
+            await message.reply_text("<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Queue finished. Leaving voice chat.</b>", parse_mode=ParseMode.HTML)
+    else:
+        await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Nothing to skip. The queue is empty.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command(["clear", "clean"]) & filters.group)
+async def clear_command(client, message):
+    chat_id = message.chat.id
+    bot_id = client.me.id
+    q_key = (bot_id, chat_id)
+    ctx = get_bot_context(bot_id)
+    
+    if not await is_admin(bot_id, chat_id, message.from_user.id): return
+    
+    # Drops the entire queue entirely
+    if q_key in chat_queues and len(chat_queues[q_key]) > 0:
+        chat_queues[q_key] = []  # Completely Empty
+        
+        # Cancel Progress Task
+        if q_key in progress_tasks:
+            progress_tasks[q_key].cancel()
+            del progress_tasks[q_key]
+
+        # Force bot to leave call since queue is 0
+        try:
+            await ctx["call"].leave_call(chat_id)
+        except:
+            pass
+
+        await message.reply_text("<tg-emoji emoji-id='5462921117423384478'>🗑</tg-emoji> <b>Queue cleared & Playback stopped.</b>", parse_mode=ParseMode.HTML)
+        await register_chat(bot_id, chat_id)
+    else:
+        await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Queue is already empty.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("pause") & filters.group)
+async def pause_command(client, message):
+    bot_id = client.me.id
+    ctx = get_bot_context(bot_id)
+    if not await is_admin(bot_id, message.chat.id, message.from_user.id): return
+    try:
+        await ctx["call"].pause(message.chat.id)
+        await message.reply_text("<tg-emoji emoji-id='5462921117423384478'>⏸</tg-emoji> <b>Playback Paused.</b>", parse_mode=ParseMode.HTML)
+    except: pass
+
+@app.on_message(filters.command("resume") & filters.group)
+async def resume_command(client, message):
+    bot_id = client.me.id
+    ctx = get_bot_context(bot_id)
+    if not await is_admin(bot_id, message.chat.id, message.from_user.id): return
+    try:
+        await ctx["call"].resume(message.chat.id)
+        await message.reply_text("<tg-emoji emoji-id='5972240522889138094'>▶️</tg-emoji> <b>Playback Resumed.</b>", parse_mode=ParseMode.HTML)
+    except: pass
+
+# ─── BROADCAST COMMAND ────────────────────────────────────────
+
+@app.on_message(filters.command("broadcast") & filters.private)
+async def broadcast_command(client, message):
+    user_id = message.from_user.id
+    bot_id = client.me.id
+    
+    bot_ctx = get_bot_context(bot_id)
+    allowed_owners = [OWNER_ID, bot_ctx.get("owner_id", OWNER_ID)]
+    
+    if user_id not in allowed_owners:
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>This command is restricted to the bot owner only.</b>", parse_mode=ParseMode.HTML)
+    
+    if mongo_client is None:
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Database not connected. Cannot broadcast.</b>", parse_mode=ParseMode.HTML)
+    
+    if message.reply_to_message:
+        broadcast_msg = message.reply_to_message
+    else:
+        query = " ".join(message.command[1:])
+        if not query:
+            return await message.reply_text(
+                "<b><tg-emoji emoji-id='6300733352697661457'>📢</tg-emoji> Broadcast Usage:</b>\n\n"
+                "• Reply to a message with <code>/broadcast</code> to forward it\n"
+                "• Or use <code>/broadcast &lt;message&gt;</code> to send text\n\n"
+                "<b>Example:</b>\n"
+                "<code>/broadcast Hello everyone! New update available.</code>",
+                parse_mode=ParseMode.HTML
+            )
+        broadcast_msg = None 
+    
+    targets = await get_all_targets(bot_id)
+    total_targets = len(targets)
+    
+    if total_targets == 0:
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>No registered users or chats found.</b>", parse_mode=ParseMode.HTML)
+    
+    confirm_text = (
+        f"<tg-emoji emoji-id='6300733352697661457'>📢</tg-emoji> <b>Broadcast Confirmation</b>\n\n"
+        f"<tg-emoji emoji-id='5972240522889138094'>👥</tg-emoji> <b>Total Targets (Users + Chats):</b> <code>{total_targets}</code>\n\n"
+        f"<b>Do you want to proceed?</b>"
+    )
+    
+    confirm_buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, Broadcast", callback_data=f"broadcast_yes_{user_id}", style="success"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"broadcast_no_{user_id}", style="danger")
+        ]
+    ])
+    
+    if not hasattr(client, 'broadcast_data'):
+        client.broadcast_data = {}
+    
+    client.broadcast_data[user_id] = {
+        'targets': targets,
+        'message': broadcast_msg,
+        'text': query if not broadcast_msg else None
     }
     
-    function updateNetworkUI() {
-        const bars = document.getElementById('kust-network-bars');
-        if (!bars) return;
-        
-        // Reset classes
-        bars.className = 'network-bars';
-        // THRESHOLDS: 
-        // Green: 0-250ms
-        // Yellow: 251-350ms
-        // Red: 350ms+
-        
-        if (netStats.ping <= 280 && netStats.packetLoss < 10) {
-            bars.classList.add('net-good');
-            bars.title = `Excellent: ${netStats.ping}ms`;
-        } else if (netStats.ping <= 380 && netStats.packetLoss < 30) {
-            bars.classList.add('net-med');
-            bars.title = `Moderate: ${netStats.ping}ms`;
-        } else {
-            bars.classList.add('net-bad');
-            bars.title = `Poor: ${netStats.ping}ms (Loss: ~${netStats.packetLoss}%)`;
-        }
-        
-        // If Settings Modal is open, update live stats there too
-        const settingsModal = document.getElementById('kust-settings-modal');
-        if (settingsModal && settingsModal.classList.contains('open')) {
-             updateSettingsStats();
-        }
-    }
+    await message.reply_text(confirm_text, reply_markup=confirm_buttons, parse_mode=ParseMode.HTML)
+
+@app.on_callback_query(filters.regex(r"^broadcast_"))
+async def broadcast_callback(client, query: CallbackQuery):
+    user_id = query.from_user.id
+    bot_id = client.me.id
+    data = query.data
     
-    function updateSettingsStats() {
-        // --- MAIN SERVER STATS ---
-        const latencyEl = document.getElementById('stat-latency');
-        const jitterEl = document.getElementById('stat-jitter');
-        const lossEl = document.getElementById('stat-loss');
-        const serverEl = document.getElementById('stat-server');
-
-        if(latencyEl) {
-            latencyEl.innerText = `${netStats.ping}ms`;
-            latencyEl.className = `net-stat-value ${netStats.ping <= 250 ? 'stat-good' : netStats.ping <= 350 ? 'stat-warn' : 'stat-bad'}`;
-        }
-        if(jitterEl) {
-            jitterEl.innerText = `±${netStats.jitter}ms`;
-            jitterEl.className = `net-stat-value ${netStats.jitter < 10 ? 'stat-good' : 'stat-warn'}`;
-        }
-        if(lossEl) {
-            lossEl.innerText = `~${netStats.packetLoss}%`;
-            lossEl.className = `net-stat-value ${netStats.packetLoss === 0 ? 'stat-good' : 'stat-bad'}`;
-        }
-        if(serverEl) {
-            const isMainConnected = webSocket && webSocket.readyState === WebSocket.OPEN;
-            serverEl.innerText = isMainConnected ? "ON" : "OFF";
-            serverEl.className = `net-stat-value ${isMainConnected ? 'stat-good' : 'stat-bad'}`;
-        }
-
-        // --- REGIONAL SERVER STATS ---
-        const latencyRegEl = document.getElementById('stat-latency-reg');
-        const jitterRegEl = document.getElementById('stat-jitter-reg');
-        const lossRegEl = document.getElementById('stat-loss-reg');
-        const serverRegEl = document.getElementById('stat-server-reg');
-
-        if(latencyRegEl) {
-            latencyRegEl.innerText = `${netStatsReg.ping}ms`;
-            latencyRegEl.className = `net-stat-value ${netStatsReg.ping <= 250 ? 'stat-good' : netStatsReg.ping <= 350 ? 'stat-warn' : 'stat-bad'}`;
-        }
-        if(jitterRegEl) {
-            jitterRegEl.innerText = `±${netStatsReg.jitter}ms`;
-            jitterRegEl.className = `net-stat-value ${netStatsReg.jitter < 10 ? 'stat-good' : 'stat-warn'}`;
-        }
-        if(lossRegEl) {
-            lossRegEl.innerText = `~${netStatsReg.packetLoss}%`;
-            lossRegEl.className = `net-stat-value ${netStatsReg.packetLoss === 0 ? 'stat-good' : 'stat-bad'}`;
-        }
-        if(serverRegEl) {
-            const isRegConnected = hh123Socket && hh123Socket.connected;
-            serverRegEl.innerText = isRegConnected ? "ON" : "OFF";
-            serverRegEl.className = `net-stat-value ${isRegConnected ? 'stat-good' : 'stat-bad'}`;
-        }
-
-        // --- CLAIM STATS ---
-        const successEl = document.getElementById('stat-success-count');
-        const failedEl = document.getElementById('stat-failed-count');
-        const totalValueEl = document.getElementById('stat-total-value');
-        const successRateEl = document.getElementById('stat-success-rate');
-
-        if(successEl) {
-            successEl.innerText = claimStats.successCount;
-            successEl.className = 'claim-stat-value success';
-        }
-        if(failedEl) {
-            failedEl.innerText = claimStats.failedCount;
-            failedEl.className = 'claim-stat-value failed';
-        }
-        if(totalValueEl) {
-            totalValueEl.innerText = `$${claimStats.totalClaimedValue.toFixed(2)}`;
-        }
-        if(successRateEl) {
-            const total = claimStats.successCount + claimStats.failedCount;
-            const rate = total > 0 ? ((claimStats.successCount / total) * 100).toFixed(1) : 0;
-            successRateEl.innerText = `${rate}%`;
-            successRateEl.className = `claim-stat-value ${rate >= 50 ? 'success' : 'failed'}`;
-        }
-    }
-
-    // ================================
-    // ⚡ TOKEN OVERLAY TRACKER
-    // ================================
-    function updateTokenUI() {
-        const overlayEl = document.getElementById('kust-token-overlay');
-        const countEl = document.getElementById('kust-token-count');
+    bot_ctx = get_bot_context(bot_id)
+    allowed_owners = [OWNER_ID, bot_ctx.get("owner_id", OWNER_ID)]
+    
+    if user_id not in allowed_owners:
+        return await query.answer("❌ Unauthorized!", show_alert=True)
+    
+    if not hasattr(client, 'broadcast_data') or user_id not in client.broadcast_data:
+        return await query.answer("❌ Broadcast session expired!", show_alert=True)
+    
+    if "broadcast_no" in data:
+        del client.broadcast_data[user_id]
+        await query.message.edit_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Broadcast cancelled.</b>", parse_mode=ParseMode.HTML)
+        return
+    
+    if "broadcast_yes" in data:
+        broadcast_data = client.broadcast_data[user_id]
+        targets = broadcast_data['targets']
+        broadcast_msg = broadcast_data['message']
+        broadcast_text = broadcast_data['text']
         
-        // Ensure UI and Turnstile Manager exist
-        if (!overlayEl || !countEl || !turnstileManager) return;
-
-        // Get current token count and max capacity
-        const count = turnstileManager.tokenCache.length;
-        const max = turnstileManager.maxCacheSize;
-        const isGenerating = turnstileManager.isGenerating;
-
-        // Update the text
-        countEl.innerText = `${count}/${max}`;
-
-        // Update state classes
-        if (count === 0) {
-            overlayEl.className = 'depleted';
-            overlayEl.title = 'Tokens Depleted! Waiting for generation...';
-        } else if (isGenerating) {
-            overlayEl.className = 'charging';
-            overlayEl.title = 'Generating new tokens...';
-        } else {
-            overlayEl.className = '';
-            overlayEl.title = 'Bypass Tokens Ready';
-        }
-    }
-
-    function updateUsername(name) {
-        const userEl = document.getElementById("kust-username");
-        if (userEl) {
-            userEl.innerText = name;
-            userEl.classList.add('active');
-        }
-    }
-
-    function showLoading() {
-        const panel = document.getElementById("kust-panel");
-        if (!panel) return;
-
-        // Remove existing loading if any
-        const existingLoading = panel.querySelector('.loading-container');
-        if (existingLoading) existingLoading.remove();
-
-        const loadingContainer = document.createElement("div");
-        loadingContainer.className = "loading-container";
-        loadingContainer.innerHTML = `
-            <div class="loading">
-                <div class="loading-animation"></div>
-            </div>
-        `;
-        panel.appendChild(loadingContainer);
-    }
-
-    function hideLoading() {
-        const loadingContainer = document.querySelector('.loading-container');
-        if (loadingContainer) {
-            loadingContainer.remove();
-        }
-    }
-
-    /**
-     * Replaces log panel content with a PREMIUM subscription prompt.
-     */
-    function showSubscriptionPrompt() {
-        const bodyEl = document.querySelector('.kust-body');
-        if (!bodyEl) return;
-
-        // Prevent re-rendering if already showing
-        if(document.getElementById('kust-subscription-overlay')) return;
-        // Clear existing content safely
-        bodyEl.innerHTML = `
-            <div id="kust-subscription-overlay">
-                <div class="sub-icon">🔒</div>
-                <div class="sub-title">Access Restricted</div>
-                <div class="sub-desc">
-                    Your premium subscription has expired or is invalid. Renew to continue claiming.
-                </div>
-                <a href="https://t.me/kustchatbot" target="_blank" class="sub-btn">
-                    <span>Get Access Now</span>
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
-                </a>
-                <div class="sub-id">
-                    ID: <span style="font-family: monospace;">${currentUsername || 'UNKNOWN'}</span>
-                </div>
-            </div>
-        `;
-        updateStatus("disconnected", "Sub Expired");
-    }
-
-    /**
-     * Restore the logs view when subscription is re-validated.
-     */
-    function restoreLogsView() {
-        const bodyEl = document.querySelector('.kust-body');
-        if (bodyEl && document.getElementById('kust-subscription-overlay')) {
-            bodyEl.innerHTML = `
-                <div id="kust-logs"></div>
-            `;
-            addLog("Subscription Verified. Welcome back!", "success");
-        }
-    }
-
-    // ================================
-    // 📢 RAW JSON REPORTING TO CUSTOM BACKEND
-    // ================================
-    function reportToBackend(reportData) {
-        // Send raw JSON to custom backend interface
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: REPORTING_BACKEND_URL,
-            headers: { 
-                "Content-Type": "application/json"
-            },
-            data: JSON.stringify(reportData),
-            onload: (res) => {
-                // Silent success - backend received the report
-            },
-            onerror: (e) => {
-                // Silent error to prevent UI spam
-            }
-        });
-    }
-
-    // ================================
-    // 🔄 TURNSTILE TOKEN MANAGEMENT (Improved)
-    // ================================
-    class TurnstileManager {
-        constructor() {
-            this.siteKey = TURNSTILE_SITE_KEY;
-            this.widgetId = null;
-            this.tokenCache = [];
-            this.maxCacheSize = 8; 
-            this.initialized = false;
-            this.tokenTimeout = 2.6 * 60 * 1000; // 2.6 mins
-            this.refreshThreshold = 60 * 1000; // 60 seconds before expiration
-            this.maintenanceTimer = null;
-            this.maintenanceInterval = 1000 + Math.floor(Math.random() * 1000); // 1s-2s to add variation across clients
-            this.isGenerating = false;
-            this.isMaintaining = false; // Prevents concurrent overlapping requests causing 600010 and "already rendered" issues
-            this.consecutiveFailures = 0; // Track consecutive failures
-        }
-
-        // Helper to map annoying error codes to human-readable text
-        getHumanReadableError(error) {
-            const errStr = String(error);
-            if (errStr.includes('600010')) return "Cloudflare Timeout / Rate Limit (600010)";
-            if (errStr.includes('110200')) return "Invalid/Expired Token Parameter (110200)";
-            if (errStr.includes('300030')) return "Challenge Execution Failed (300030)";
-            if (errStr.includes('timeout') || errStr.toLowerCase().includes('timeout')) return "Challenge Timeout";
-            return `Turnstile Error (${errStr})`;
-        }
-
-        async initialize() {
-            if (this.initialized) return;
-            try {
-                await this.loadTurnstileScript();
-                if (!unsafeWindow.turnstile) {
-                    throw new Error('Turnstile unavailable');
-                }
-                this.initialized = true;
-                addLog('Event Manager initialized', 'success');
-
-                // Generate initial token immediately, do not delay
-                this.generateCacheToken();
+        total_targets = len(targets)
+        success_count = 0
+        fail_count = 0
+        blocked_count = 0
+        
+        status_msg = await query.message.edit_text(
+            f"<tg-emoji emoji-id='6300733352697661457'>📢</tg-emoji> <b>Broadcasting...</b>\n\n"
+            f"<tg-emoji emoji-id='5462921117423384478'>📊</tg-emoji> <b>Progress:</b> <code>0/{total_targets}</code>\n"
+            f"<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Success:</b> <code>0</code>\n"
+            f"<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Failed:</b> <code>0</code>\n"
+            f"<tg-emoji emoji-id='6158862632926319619'>🚫</tg-emoji> <b>Blocked:</b> <code>0</code>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        for i, target_id in enumerate(targets):
+            try:
+                if broadcast_msg:
+                    await broadcast_msg.copy(target_id)
+                else:
+                    await client.send_message(target_id, broadcast_text)
                 
-                // Start token maintenance immediately
-                this.startTokenMaintenance();
-            } catch (error) {
-                addLog(`Failed to initialize Turnstile: ${error.message}`, 'error');
-            }
-        }
-
-        async loadTurnstileScript() {
-            return new Promise((resolve, reject) => {
-                if (typeof unsafeWindow.turnstile !== 'undefined') {
-                    resolve();
-                    return;
-                }
-
-                const script = document.createElement('script');
-                script.id = 'turnstile-scripts';
-                script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-                script.type = 'application/javascript';
-                script.onload = resolve;
-                script.onerror = reject;
-                document.head.appendChild(script);
-            });
-        }
-
-        createTurnstileContainer() {
-            // Check if container already exists and actively destroy it to prevent Cloudflare "already rendered" conflicts
-            let existingContainer = document.getElementById('kust-turnstile-container');
-            if (existingContainer) {
-                existingContainer.remove();
-            }
-
-            const container = document.createElement('div');
-            container.id = 'kust-turnstile-container';
-            container.style.position = 'fixed';
-            container.style.top = '-9999px';
-            container.style.left = '-9999px';
-            container.style.width = '0px';
-            container.style.height = '0px';
-            container.style.overflow = 'hidden';
-            document.body.appendChild(container);
-            return container;
-        }
-
-        async createToken() {
-            this.isGenerating = true;
-            return new Promise((resolve, reject) => {
-                try {
-                    const container = this.createTurnstileContainer();
-                    const config = {
-                        sitekey: this.siteKey,
-                        theme: 'dark',
-                        callback: (token) => {
-                            this.isGenerating = false;
-                            this.consecutiveFailures = 0; // Reset on success
-                            turnstileFailureStart = null; // Clear failure timestamp
-                            resolve(token);
-                        },
-                        'error-callback': (error) => {
-                            this.isGenerating = false;
-                            this.consecutiveFailures++;
-                            this.checkTurnstileFailure();
-                            reject(error);
-                        },
-                        'timeout-callback': () => {
-                            this.isGenerating = false;
-                            this.consecutiveFailures++;
-                            this.checkTurnstileFailure();
-                            reject('Get token timeout.');
-                        }
-                    };
-
-                    this.widgetId = unsafeWindow.turnstile.render(container, config);
-        
-                } catch (error) {
-                    this.isGenerating = false;
-                    this.consecutiveFailures++;
-                    this.checkTurnstileFailure();
-                    reject(error);
-                }
-            });
-        }
-
-        // Check if turnstile has been failing for too long
-        checkTurnstileFailure() {
-            if (!turnstileFailureStart) {
-                turnstileFailureStart = Date.now();
-            }
+                success_count += 1
+            except Exception as e:
+                error_str = str(e).upper()
+                if any(err in error_str for err in ["BLOCKED", "USER_IS_BLOCKED", "DELETED", "KICKED"]):
+                    blocked_count += 1
+                else:
+                    fail_count += 1
+                    logger.debug(f"Broadcast failed for {target_id}: {e}")
             
-            // If failing for more than 60 seconds, request restart
-            const failureDuration = Date.now() - turnstileFailureStart;
-            if (failureDuration > 60000) {
-                addLog('Turnstile tokens failing for 1+ minute. Requesting restart...', 'error');
-                requestRestart('turnstile_token_generation_failed');
-            }
+            if (i + 1) % 20 == 0:
+                try:
+                    await status_msg.edit_text(
+                        f"<tg-emoji emoji-id='6300733352697661457'>📢</tg-emoji> <b>Broadcasting...</b>\n\n"
+                        f"<tg-emoji emoji-id='5462921117423384478'>📊</tg-emoji> <b>Progress:</b> <code>{i + 1}/{total_targets}</code>\n"
+                        f"<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Success:</b> <code>{success_count}</code>\n"
+                        f"<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Failed:</b> <code>{fail_count}</code>\n"
+                        f"<tg-emoji emoji-id='6158862632926319619'>🚫</tg-emoji> <b>Blocked:</b> <code>{blocked_count}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                except:
+                    pass
+            
+            await asyncio.sleep(0.035)
+        
+        final_text = (
+            f"<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Broadcast Complete!</b>\n\n"
+            f"<tg-emoji emoji-id='5462921117423384478'>📊</tg-emoji> <b>Total Targets:</b> <code>{total_targets}</code>\n"
+            f"<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>Success:</b> <code>{success_count}</code>\n"
+            f"<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>Failed:</b> <code>{fail_count}</code>\n"
+            f"<tg-emoji emoji-id='6158862632926319619'>🚫</tg-emoji> <b>Blocked/Deleted:</b> <code>{blocked_count}</code>"
+        )
+        
+        await status_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
+        del client.broadcast_data[user_id]
+
+@app.on_message(filters.command("users") & filters.private)
+async def users_command(client, message):
+    user_id = message.from_user.id
+    bot_id = client.me.id
+    
+    bot_ctx = get_bot_context(bot_id)
+    allowed_owners = [OWNER_ID, bot_ctx.get("owner_id", OWNER_ID)]
+    
+    if user_id not in allowed_owners:
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>This command is restricted to the bot owner only.</b>", parse_mode=ParseMode.HTML)
+    
+    users_count, chats_count = await get_stats_count(bot_id)
+    
+    await message.reply_text(
+        f"<tg-emoji emoji-id='5462921117423384478'>📊</tg-emoji> <b>Statistics for this Bot</b>\n\n"
+        f"<tg-emoji emoji-id='5972240522889138094'>👥</tg-emoji> <b>Users:</b> <code>{users_count}</code>\n"
+        f"<tg-emoji emoji-id='6300733352697661457'>💬</tg-emoji> <b>Groups/Chats:</b> <code>{chats_count}</code>\n"
+        f"<tg-emoji emoji-id='6158862632926319619'>🗄</tg-emoji> <b>Database Isolated:</b> <code>musicbot_{bot_id}</code>\n",
+        parse_mode=ParseMode.HTML
+    )
+
+@app.on_message(filters.command(["active", "activebots"]) & filters.private)
+async def active_command(client, message):
+    user_id = message.from_user.id
+    bot_id = client.me.id
+    
+    bot_ctx = get_bot_context(bot_id)
+    allowed_owners = [OWNER_ID, bot_ctx.get("owner_id", OWNER_ID)]
+    
+    if user_id not in allowed_owners:
+        return await message.reply_text("<tg-emoji emoji-id='5971944878815317190'>❌</tg-emoji> <b>This command is restricted to the bot owner only.</b>", parse_mode=ParseMode.HTML)
+    
+    active_bots_count = len(bot_registry)
+    active_vcs_count = len(progress_tasks)
+    
+    await message.reply_text(
+        f"<tg-emoji emoji-id='5462921117423384478'>📊</tg-emoji> <b>System Activity Status</b>\n\n"
+        f"<tg-emoji emoji-id='5972240522889138094'>🤖</tg-emoji> <b>Active Hosted Bots:</b> <code>{active_bots_count}</code>\n"
+        f"<tg-emoji emoji-id='5462921117423384478'>🎧</tg-emoji> <b>Live Voice Chats:</b> <code>{active_vcs_count}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+# ─── PyTgCalls Event Handlers ─────────────────────────────────────────────
+
+@call_py.on_update(fl.stream_end())
+async def on_stream_end(client: PyTgCalls, update: StreamEnded):
+    chat_id = update.chat_id
+    
+    bot_id = None
+    for b_id, b_ctx in bot_registry.items():
+        if b_ctx["call"] == client:
+            bot_id = b_id
+            break
+
+    if not bot_id:
+        if hasattr(app, "me") and app.me:
+            bot_id = app.me.id
+
+    if not bot_id: return
+
+    q_key = (bot_id, chat_id)
+
+    if q_key in progress_tasks:
+        progress_tasks[q_key].cancel()
+        del progress_tasks[q_key]
+
+    if q_key in chat_queues:
+        if chat_queues[q_key]:
+            finished_song = chat_queues[q_key][0]
+            if finished_song.get('file_path') and os.path.exists(finished_song['file_path']):
+                try: os.remove(finished_song['file_path'])
+                except: pass
+            
+            chat_queues[q_key].pop(0)
+        
+        if chat_queues[q_key]:
+            next_song = chat_queues[q_key][0]
+            await play_music_core(bot_id, chat_id, next_song)
+        else:
+            await register_chat(bot_id, chat_id)
+            try: await client.leave_call(chat_id)
+            except: pass
+
+# ─── Callback & Admin Handlers ────────────────────────────────────────────
+
+@app.on_callback_query()
+async def callback_handler(client, query: CallbackQuery):
+    data = query.data
+    chat_id = query.message.chat.id
+    user_id = query.from_user.id
+    bot_id = client.me.id
+    q_key = (bot_id, chat_id)
+    ctx = get_bot_context(bot_id)
+
+    if data == "progress":
+        await query.answer("❄️ Live Playback")
+        return
+
+    if data == "show_help":
+        buttons = [
+            [InlineKeyboardButton("🎵 Music", callback_data="help_music", style="primary"),
+             InlineKeyboardButton("🛡️ Admin", callback_data="help_admin", style="secondary")],
+            [InlineKeyboardButton("🏠 Home", callback_data="go_back", style="success")]
+        ]
+        text = (
+            "<blockquote><b><tg-emoji emoji-id='5971944878815317190'>💡</tg-emoji> ʙᴏᴛ ᴄᴏᴍᴍᴀɴᴅs ᴍᴇɴᴜ</b></blockquote>\n\n"
+            "<i>Select a category below to explore the commands.</i>\n\n"
+            "<b>🔧 Utility Commands:</b>\n"
+            "❍ `/ping` - <i>Check bot latency and system stats</i>\n"
+            "❍ `/speedtest` - <i>Run a server speedtest</i>\n"
+            "❍ `/users` - <i>Check registered users & chats (Owner)</i>\n"
+            "❍ `/broadcast` - <i>Send a message to all users (Owner)</i>"
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "go_back":
+        await start_handler(client, query.message)
+        return
+
+    if data == "help_music":
+        text = (
+            "<blockquote><b><tg-emoji emoji-id='6325413811033477368'>✨</tg-emoji> ᴍᴜsɪᴄ ᴄᴏᴍᴍᴀɴᴅs</b></blockquote>\n\n"
+            "❍ `/play` or `/p` - <i>Play a song or add it to the queue</i>\n"
+            "❍ `/stop` or `/end` - <i>Stop playback and leave VC</i>\n"
+            "❍ `/skip` - <i>Skip the current track</i>\n"
+            "❍ `/pause` - <i>Pause the playing stream</i>\n"
+            "❍ `/resume` - <i>Resume the paused stream</i>\n"
+            "❍ `/clear` or `/clean` - <i>Empty the entire queue</i>"
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="show_help", style="secondary")]]))
+        return
+
+    if data == "help_admin":
+        text = (
+            "<blockquote><b><tg-emoji emoji-id='6158862632926319619'>🛡️</tg-emoji> ᴀᴅᴍɪɴ & ᴍᴏᴅᴇʀᴀᴛɪᴏɴ</b></blockquote>\n\n"
+            "<i>(Reply to a user's message with these commands)</i>\n\n"
+            "❍ `/kick` - <i>Kick the user from the group</i>\n"
+            "❍ `/ban` - <i>Ban the user from the group</i>\n"
+            "❍ `/unban` - <i>Unban the user</i>\n"
+            "❍ `/mute` - <i>Restrict the user from sending messages</i>\n"
+            "❍ `/unmute` - <i>Allow the user to send messages again</i>"
+        )
+        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="show_help", style="secondary")]]))
+        return
+
+    if data in ["stop", "skip", "pause", "resume", "clear"]:
+        if not await is_admin(bot_id, chat_id, user_id):
+            return await query.answer("❌ Admin only!", show_alert=True)
+        
+        if data == "stop": await stop_command(client, query.message)
+        elif data == "skip": await skip_command(client, query.message)
+        elif data == "pause": await pause_command(client, query.message)
+        elif data == "resume": await resume_command(client, query.message)
+        elif data == "clear":
+             if q_key in chat_queues and len(chat_queues[q_key]) > 0:
+                 chat_queues[q_key] = []
+                 if q_key in progress_tasks:
+                     progress_tasks[q_key].cancel()
+                     del progress_tasks[q_key]
+                 try: await ctx["call"].leave_call(chat_id)
+                 except: pass
+                 await query.answer("🗑 Queue cleared & Playback stopped.")
+                 await query.message.edit_text("<tg-emoji emoji-id='5462921117423384478'>🗑</tg-emoji> <b>Queue cleared & Playback stopped by admin.</b>", parse_mode=ParseMode.HTML)
+                 await register_chat(bot_id, chat_id)
+             else:
+                 await query.answer("❌ Queue is already empty.")
+
+        try: await query.answer()
+        except: pass
+
+# ─── Admin Tools ──────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("kick") & filters.group)
+async def kick_user(c, m):
+    if not await is_admin(c.me.id, m.chat.id, m.from_user.id): return
+    if m.reply_to_message:
+        await m.chat.ban_member(m.reply_to_message.from_user.id)
+        await m.chat.unban_member(m.reply_to_message.from_user.id)
+        await m.reply_text("<tg-emoji emoji-id='6158862632926319619'>👞</tg-emoji> <b>User Kicked successfully.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("ban") & filters.group)
+async def ban_user(c, m):
+    if not await is_admin(c.me.id, m.chat.id, m.from_user.id): return
+    if m.reply_to_message:
+        await m.chat.ban_member(m.reply_to_message.from_user.id)
+        await m.reply_text("<tg-emoji emoji-id='6158862632926319619'>⛔</tg-emoji> <b>User Banned successfully.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("unban") & filters.group)
+async def unban_user(c, m):
+    if not await is_admin(c.me.id, m.chat.id, m.from_user.id): return
+    if m.reply_to_message:
+        await m.chat.unban_member(m.reply_to_message.from_user.id)
+        await m.reply_text("<tg-emoji emoji-id='6325413811033477368'>✅</tg-emoji> <b>User Unbanned successfully.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("mute") & filters.group)
+async def mute_user(c, m):
+    if not await is_admin(c.me.id, m.chat.id, m.from_user.id): return
+    if m.reply_to_message:
+        await m.chat.restrict_member(m.reply_to_message.from_user.id, ChatPermissions(can_send_messages=False))
+        await m.reply_text("<tg-emoji emoji-id='6158862632926319619'>🔇</tg-emoji> <b>User Muted successfully.</b>", parse_mode=ParseMode.HTML)
+
+@app.on_message(filters.command("unmute") & filters.group)
+async def unmute_user(c, m):
+    if not await is_admin(c.me.id, m.chat.id, m.from_user.id): return
+    if m.reply_to_message:
+        await m.chat.restrict_member(m.reply_to_message.from_user.id, ChatPermissions(can_send_messages=True))
+        await m.reply_text("<tg-emoji emoji-id='6325413811033477368'>🔊</tg-emoji> <b>User Unmuted successfully.</b>", parse_mode=ParseMode.HTML)
+
+# ─── Main Execution ───────────────────────────────────────────────────────
+
+async def main():
+    global ASSISTANT_ID
+    logger.info(f"🚀 Initializing System with Instance ID: {INSTANCE_ID}")
+    
+    # 1. Connect to MongoDB to enable Distributed Locking
+    await init_mongodb()
+    
+    # 2. Compete for Master Node Execution
+    is_main = await claim_main_instance()
+    
+    if is_main:
+        logger.info("✅ Acquired Master Node Lock! Starting Primary MusicBot & Assistant...")
+        await app.start()
+        await user_app.start()
+        
+        me = await user_app.get_me()
+        ASSISTANT_ID = me.id
+        logger.info(f"✅ Main Assistant ID: {ASSISTANT_ID}")
+        
+        bot_info = await app.get_me()
+        try:
+            main_bot_db = mongo_client[f"musicbot_{bot_info.id}"]
+            await main_bot_db.users.create_index("user_id", unique=True)
+            await main_bot_db.chats.create_index("chat_id", unique=True)
+        except:
+            pass
+        
+        await call_py.start()
+        
+        # Store Assistant Username/Name explicitly for dynamic manual add messages
+        bot_registry[bot_info.id] = {
+            "bot": app,
+            "user": user_app,
+            "call": call_py,
+            "assistant_id": ASSISTANT_ID,
+            "assistant_username": me.username,
+            "assistant_name": me.first_name,
+            "owner_id": OWNER_ID
         }
+        
+        logger.info(f"✅ Primary Bot Started: @{bot_info.username}")
+    else:
+        logger.info("⚠️ Primary Bot is running on another Dyno. Falling back into Worker Node Mode.")
+    
+    # 3. Start Distributed Handlers
+    asyncio.create_task(bot_manager_task(is_main))
 
-        async generateCacheToken(retryCount = 0) {
-            // If we are already generating on the initial call, prevent overlapping loops
-            if (this.isGenerating && retryCount === 0) {
-                return;
-            }
+    app_web = web.Application()
+    app_web.add_routes(routes)
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"✅ Web Server API Started on port {port}")
 
-            // Don't generate if cache is already full
-            if (this.tokenCache.length >= this.maxCacheSize) {
-                return;
-            }
-
-            try {
-                let token = await this.createToken();
-                const tokenData = {
-                    token: token,
-                    timestamp: Date.now()
-                };
-                // Double-check before adding to prevent overfilling
-                if (this.tokenCache.length < this.maxCacheSize) {
-                    this.tokenCache.push(tokenData);
-                }
-                this.remove();
-            } catch (error) {
-                const readableError = this.getHumanReadableError(error);
-                this.remove();
+    # Pyrogram's idle intercepts SIGINT, SIGTERM, SIGABRT cleanly, so when 
+    # Heroku tells the container to shut down, idle() unblocks gracefully.
+    await idle()
+    
+    # 4. Graceful Cleanup
+    logger.info("Shutdown signal received! Starting graceful cleanup...")
+    await app_web.cleanup()
+    
+    if is_main:
+        try: await call_py.stop()
+        except: pass
+        try: await user_app.stop()
+        except: pass
+        try: await app.stop()
+        except: pass
+        
+    for b_id, b_ctx in bot_registry.items():
+        if not is_main or (hasattr(app, "me") and app.me and b_id != app.me.id):
+            try:
+                await b_ctx["call"].stop()
+                await b_ctx["user"].stop()
+                await b_ctx["bot"].stop()
+            except:
+                pass
                 
-                // Add retry logic with exponential backoff for specific errors like 600010
-                if (retryCount < 3) {
-                    if (this.tokenCache.length === 0) {
-                        addLog(`Token generation failed (${readableError}). Retrying ${retryCount + 1}/3...`, 'warning');
-                    }
-                    await new Promise(resolve => setTimeout(resolve, (2000 * (retryCount + 1)) + Math.random() * 1000)); // 2s, 4s, 6s Backoff + Jitter
-                    await this.generateCacheToken(retryCount + 1);
-                } else {
-                    if (this.tokenCache.length === 0) {
-                        addLog(`Failed to generate token: ${readableError}`, 'error');
-                    }
-                }
-            }
-        }
+    if mongo_client:
+        if hosted_bots_collection is not None:
+            try:
+                # Instantly release all hosted bots assigned to this instance so another instance picks them up immediately
+                await hosted_bots_collection.update_many(
+                    {"assigned_to": INSTANCE_ID},
+                    {"$set": {"assigned_to": None, "last_active": datetime.utcnow() - timedelta(days=1)}}
+                )
+                logger.info("✅ Released all hosted bots instantly.")
+            except Exception as e:
+                logger.error(f"Error releasing hosted bots: {e}")
 
-        // INSTANT SYNC GRABBER - Returns {token, cacheHit, latency}
-        getFastTokenWithMetrics() {
-            const startTime = performance.now();
-            const now = Date.now();
-            while (this.tokenCache.length > 0) {
-                const tokenData = this.tokenCache.shift();
-                if (now - tokenData.timestamp < this.tokenTimeout) {
-                    if (this.tokenCache.length < this.maxCacheSize && !this.isGenerating) {
-                        this.generateCacheToken();
-                    }
-                    return {
-                        token: tokenData.token,
-                        cacheHit: true,
-                        latency: Math.round(performance.now() - startTime)
-                    };
-                }
-            }
-            return null;
-        }
-
-        // Keep old method for backward compatibility
-        getFastToken() {
-            const result = this.getFastTokenWithMetrics();
-            return result ? result.token : null;
-        }
-
-        async getTokenWithMetrics() {
-            const startTime = performance.now();
-            this.cleanExpiredTokens();
-            if (this.tokenCache.length > 0) {
-                let tokenData = this.tokenCache.shift();
-                return {
-                    token: tokenData.token,
-                    cacheHit: true,
-                    latency: Math.round(performance.now() - startTime)
-                };
-            }
-
-            // Emergency generation with single retry if fallback fails
-            try {
-                const token = await this.createToken();
-                this.remove();
-                return {
-                    token: token,
-                    cacheHit: false,
-                    latency: Math.round(performance.now() - startTime)
-                };
-            } catch (error) {
-                this.remove();
-                const readableError = this.getHumanReadableError(error);
-                addLog(`Emergency token generation failed: ${readableError}. Retrying once...`, 'warning');
-                try {
-                    const retryToken = await this.createToken();
-                    this.remove();
-                    return {
-                        token: retryToken,
-                        cacheHit: false,
-                        latency: Math.round(performance.now() - startTime)
-                    };
-                } catch(e) {
-                    this.remove();
-                    throw new Error(this.getHumanReadableError(e));
-                }
-            }
-        }
-
-        async getToken() {
-            const result = await this.getTokenWithMetrics();
-            return result.token;
-        }
-
-        cleanExpiredTokens() {
-            const now = Date.now();
-            this.tokenCache = this.tokenCache.filter(tokenData =>
-                now - tokenData.timestamp < this.tokenTimeout
-            );
-        }
-
-        async maintainTokens() {
-            // Adding maintenance lock to prevent overlapping API calls causing DOM overlapping and CF panic
-            if (!this.initialized || this.isMaintaining) {
-                return;
-            }
-
-            this.isMaintaining = true;
-
-            try {
-                this.cleanExpiredTokens();
-                // Check if any tokens are about to expire and refresh them
-                const now = Date.now();
-                for (let i = 0; i < this.tokenCache.length; i++) {
-                    const tokenData = this.tokenCache[i];
-                    const timeUntilExpiration = this.tokenTimeout - (now - tokenData.timestamp);
-
-                    // If token is about to expire, replace it (with robust retries)
-                    if (timeUntilExpiration <= this.refreshThreshold) {
-                        let success = false;
-                        let retry = 0;
-                        
-                        while (!success && retry < 2) {
-                            try {
-                                const newToken = await this.createToken();
-                                this.tokenCache[i] = {
-                                    token: newToken,
-                                    timestamp: Date.now()
-                                };
-                                this.remove();
-                                success = true;
-                            } catch (error) {
-                                retry++;
-                                this.remove();
-                                const readableError = this.getHumanReadableError(error);
-                                if (retry >= 2) {
-                                    addLog(`Token refresh error: ${readableError}`, 'error');
-                                } else {
-                                    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 500)); // wait with jitter
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Generate new tokens if needed (fill the buffer)
-                const tokensNeeded = this.maxCacheSize - this.tokenCache.length;
-                if (tokensNeeded > 0) {
-                    // Loop to spawn tokens. generateCacheToken itself handles internal retries.
-                    for (let i = 0; i < tokensNeeded; i++) {
-                         await this.generateCacheToken();
-                         await new Promise(resolve => setTimeout(resolve, 3000 + Math.random() * 2000)); // Delay between generation + jitter
-                    }
-                }
-            } finally {
-                // Free lock
-                this.isMaintaining = false;
-            }
-        }
-
-        startTokenMaintenance() {
-            if (this.maintenanceTimer) {
-                return;
-            }
-
-            this.maintenanceTimer = setInterval(() => {
-                this.maintainTokens();
-            }, this.maintenanceInterval);
-        }
-
-        stopTokenMaintenance() {
-            if (this.maintenanceTimer) {
-                clearInterval(this.maintenanceTimer);
-                this.maintenanceTimer = null;
-            }
-        }
-
-        remove() {
-            if (this.widgetId !== null) {
-                try {
-                    unsafeWindow.turnstile.remove(this.widgetId);
-                } catch (error) {
-                    // silently fail cleanup 
-                }
-                this.widgetId = null;
-            }
-            // Double assure the DOM node is nuked
-            let existing = document.getElementById('kust-turnstile-container');
-            if (existing) {
-                existing.remove();
-            }
-        }
-
-        destroy() {
-            this.stopTokenMaintenance();
-            this.remove();
-            this.tokenCache = [];
-            this.initialized = false;
-        }
-    }
-
-    // Initialize Turnstile Manager
-    const turnstileManager = new TurnstileManager();
-    let turnstileTokens = []; // For backward compatibility
-
-    // ================================
-    // 🔄 STAKE API HANDLER (Improved)
-    // ================================
-    class StakeAPIHandler {
-        constructor(sessionToken, apiUrl) {
-            this.sessionToken = sessionToken;
-            this.apiUrl = apiUrl;
-        }
-
-        async makeRequest(query, variables, operationName, operationType = "query") {
-            return new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: this.apiUrl,
-                    headers: OPTIMIZED_HEADERS || {
-                        "Content-Type": "application/json",
-                        "x-access-token": this.sessionToken,
-                        "x-operation-name": operationName,
-                        "x-operation-type": operationType,
-                        // DYNAMIC HEADERS: EXTRACTED MIRROR
-                        "Origin": CURRENT_MIRROR,
-                        "Referer": window.location.href
-                    },
-                    data: JSON.stringify({
-                        operationName: operationName,
-                        query: query,
-                        variables: variables
-                    }),
-                    onload: (response) => {
-                        try {
-                            const data = JSON.parse(response.responseText);
-                            resolve(data);
-                        } catch (error) {
-                            reject(error);
-                        }
-                    },
-                    onerror: (error) => {
-                        reject(error);
-                    }
-                });
-            });
-        }
-
-        async checkBonusCode(code) {
-            const query = `
-                query BonusCodeInformation($code: String!, $couponType: CouponType!) {
-                    bonusCodeInformation(code: $code, couponType: $couponType) {
-                        availabilityStatus
-                        bonusValue
-                        cryptoMultiplier
-                    }
-                }
-            `;
-            const variables = {
-                code: code,
-                couponType: "drop"
-            };
-            try {
-                // Operation type is "query"
-                const response = await this.makeRequest(query, variables, "BonusCodeInformation", "query");
-                if (response.errors && response.errors.length > 0) {
-                    return {
-                        success: false,
-                        error: response.errors[0].message
-                    };
-                }
-
-                if (response.data && response.data.bonusCodeInformation) {
-                    return {
-                        success: true,
-                        data: response.data.bonusCodeInformation
-                    };
-                }
-
-                return {
-                    success: false,
-                    error: "Invalid response from API"
-                };
-            } catch (error) {
-                return {
-                    success: false,
-                    error: error.message
-                };
-            }
-        }
-
-        async claimBonusCode(code, currency, turnstileToken) {
-            const query = `
-                mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) {
-                    claimConditionBonusCode(
-                        code: $code
-                        currency: $currency
-                        turnstileToken: $turnstileToken
-                    ) {
-                        bonusCode {
-                            id
-                            code
-                            __typename
-                        }
-                        amount
-                        currency
-                        user {
-                            id
-                            balances {
-                                available {
-                                    amount
-                                    currency
-                                    __typename
-                                }
-                                __typename
-                            }
-                            __typename
-                        }
-                        __typename
-                    }
-                }
-        `;
-            const variables = {
-                code: code,
-                currency: currency,
-                turnstileToken: turnstileToken
-            };
-            try {
-                // Operation type is "query" even though it's a mutation (matches working curl)
-                const response = await this.makeRequest(query, variables, "ClaimConditionBonusCode", "query");
-                if (response.errors && response.errors.length > 0) {
-                    return {
-                        success: false,
-                        error: response.errors[0].message
-                    };
-                }
-
-                if (response.data && response.data.claimConditionBonusCode) {
-                    return {
-                        success: true,
-                        data: response.data.claimConditionBonusCode
-                    };
-                }
-
-                return {
-                    success: false,
-                    error: "Invalid response from API"
-                };
-            } catch (error) {
-                return {
-                    success: false,
-                    error: error.message
-                };
-            }
-        }
-
-        async getUserInfo() {
-            const query = `
-                query UserMeta($name: String, $signupCode: Boolean = false) {
-                    user(name: $name) {
-                        id
-                        name
-                        isMuted
-                        isRainproof
-                        isBanned
-                        createdAt
-                        campaignSet
-                        selfExclude {
-                            id
-                            status
-                            active
-                            createdAt
-                            expireAt
-                        }
-                        signupCode @include(if: $signupCode) {
-                            id
-                            code {
-                                id
-                                code
-                            }
-                        }
-                    }
-                }
-            `;
-            try {
-                const response = await this.makeRequest(query, {}, "UserMeta", "query");
-                if (response.errors && response.errors.length > 0) {
-                    return {
-                        success: false,
-                        error: response.errors[0].message
-                    };
-                }
-
-                if (response.data && response.data.user) {
-                    return {
-                        success: true,
-                        data: response.data.user
-                    };
-                }
-
-                return {
-                    success: false,
-                    error: "Invalid response from API"
-                };
-            } catch (error) {
-                return {
-                    success: false,
-                    error: error.message
-                };
-            }
-        }
-
-        async getConversionRate() {
-            const query = `
-                query CurrencyNewConversionRate($displayCurrencies: [FiatCurrencyEnum!]!) {
-                    info {
-                        currencies {
-                            name
-                                values(displayCurrencies: $displayCurrencies) {
-                                currency
-                                rate
-                            }
-                        }
-                        }
-            }
-            `;
-            const variables = {
-                displayCurrencies: ['usd', 'eur', 'ars', 'jpy', 'cad', 'clp', 'cny', 'dkk', 'ghs', 'idr', 'inr', 'kes', 'krw', 'mxn', 'ngn', 'pen', 'php', 'pln', 'rub', 'try', 'vnd']
-            };
-            try {
-                const response = await this.makeRequest(query, variables, "CurrencyNewConversionRate", "query");
-                if (response.errors && response.errors.length > 0) {
-                    return {
-                        success: false,
-                        error: response.errors[0].message
-                    };
-                }
-
-                if (response.data && response.data.info) {
-                    return {
-                        success: true,
-                        data: response.data.info
-                    };
-                }
-
-                return {
-                    success: false,
-                    error: "Invalid response from API"
-                };
-            } catch (error) {
-                return {
-                    success: false,
-                    error: error.message
-                };
-            }
-        }
-
-        async createVaultDeposit(currency, amount) {
-            const query = `
-                mutation CreateVaultDeposit($currency: CurrencyEnum!, $amount: Float!) {
-                    createVaultDeposit(currency: $currency, amount: $amount) {
-                        id
-                        amount
-                        currency
-                        user {
-                            id
-                            balances {
-                                available {
-                                    amount
-                                    currency
-                                }
-                                vault {
-                                    amount
-                                    currency
-                                }
-                            }
-                        }
-                        __typename
-                    }
-                }
-            `;
-            const variables = {
-                currency: currency,
-                amount: amount
-            };
-            try {
-                const response = await this.makeRequest(query, variables, "CreateVaultDeposit", "query");
-                if (response.errors && response.errors.length > 0) {
-                    return {
-                        success: false,
-                        error: response.errors[0].message
-                    };
-                }
-
-                if (response.data && response.data.createVaultDeposit) {
-                    return {
-                        success: true,
-                        data: response.data.createVaultDeposit
-                    };
-                }
-
-                return {
-                    success: false,
-                    error: "Invalid response from API"
-                };
-            } catch (error) {
-                return {
-                    success: false,
-                    error: error.message
-                };
-            }
-        }
-    }
-
-    // ================================
-    // 🕵️ USER DETECTION API
-    // ================================
-    async function getStakeUserFromAPI() {
-        try {
-            // Priority: HARDCODED_SESSION_TOKEN > localStorage > window.__KUST_SESSION_TOKEN__ > Cookie
-            let sessionToken = getHardcodedSessionToken();
+        if is_main:
+            try:
+                db = mongo_client["musicbot_master"]
+                # Instantly release the master lock
+                await db["system_locks"].delete_one({"lock_name": "main_bot", "instance_id": INSTANCE_ID})
+                logger.info("✅ Master lock released.")
+            except: pass
             
-            // If no hardcoded token, fall back to cookie
-            if (!sessionToken) {
-                const sessionCookie = getCookie("session");
-                if (!sessionCookie) {
-                    addLog(`No session token found`, 'error');
-                    return null;
-                }
-                sessionToken = sessionCookie;
-            }
-            
-            // Store session for later use
-            currentSession = sessionToken;
-            // Initialize API handler
-            stakeApi = new StakeAPIHandler(sessionToken, STAKE_API_URL);
-            // Get user info
-            const result = await stakeApi.getUserInfo();
-            if (result.success && result.data && result.data.name) {
-                const username = result.data.name;
-                return username;
-            } else {
-                addLog(`${result.error || 'No user data in response'}`, 'error');
-                return null;
-            }
-        } catch (error) {
-            addLog(`Error fetching user from API: ${error.message}`, 'error');
-            return null;
-        }
-    }
-
-    // ================================
-    // 🔐 AUTHORIZATION CHECK
-    // ================================
-    function checkAuthorization(username) {
-        if (!username) {
-            return Promise.resolve(false);
-        }
-
-        // Prevent multiple simultaneous auth checks
-        if (authCheckInProgress) {
-            return Promise.resolve(true);
-            // Assume authorized if check is already in progress
-        }
-
-        authCheckInProgress = true;
-        
-        // UPDATED: Using dynamic AUTH_CHECK_URL variable
-        const authUrl = `${AUTH_CHECK_URL}?user=@${username}`;
-
-        // Only update status if we are currently disconnected (to avoid spamming "Authorizing" on active connections)
-        const statusEl = document.getElementById("kust-status-text");
-        if(statusEl && statusEl.innerText !== "Live Stream" && statusEl.innerText !== "UPLINK ACTIVE") {
-            updateStatus("disconnected", "Authorizing...");
-        }
-
-        // GM_xmlhttpRequest is asynchronous
-        return new Promise((resolve) => {
-            // Add timeout to prevent hanging
-            const timeoutId = setTimeout(() => {
-                authCheckInProgress = false;
-                addLog("Authorization check timed out", "warning");
-                resolve(true); // Assume authorized on timeout to prevent false negatives
-            }, 10000); // 10 second timeout
-
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: authUrl,
-                timeout: 8000, // 8 second timeout for the request itself
-                onload: (res) => {
-                    clearTimeout(timeoutId);
-                    authCheckInProgress = false;
-                    try {
-                        const response = JSON.parse(res.responseText);
-                        if (response.exists === true) {
-                            resolve(true); // Authorized
-                        } else {
-                            resolve(false);
-                            // Not Authorized
-                        }
-                    } catch (e) {
-                        addLog(`Authorization API error: ${e.message}`, "error");
-                        resolve(false);
-                    }
-                },
-                onerror: (error) => {
-                    clearTimeout(timeoutId);
-                    authCheckInProgress = false;
-                    addLog("Network error while checking authorization.", "error");
-                    // Don't kill connection on network error, assume authorized to prevent false negatives
-                    resolve(true);
-                },
-                ontimeout: () => {
-                    clearTimeout(timeoutId);
-                    authCheckInProgress = false;
-                    addLog("Authorization request timed out.", "warning");
-                    resolve(true);
-                    // Assume authorized on timeout
-                }
-            });
-        });
-    }
-
-    // Function to determine error type from error message
-    // Returns the specific error type based on the error message content
-    function getErrorType(errorMessage) {
-        const msg = (errorMessage || '').toLowerCase();
-        
-        // Check for bonusCodeInactive - code has been fully claimed
-        if (msg.includes('bonuscodeinactive') || 
-            msg.includes('code has been fully claimed') || 
-            msg.includes('fully claimed') ||
-            msg.includes('inactive')) {
-            return 'bonusCodeInactive';
-        }
-        
-        // Check for weeklyWagerRequirement
-        if (msg.includes('weeklywagerrequirement') || 
-            msg.includes('wager requirement')) {
-            return 'weeklyWagerRequirement';
-        }
-        
-        // Check for alreadyClaimed
-        if (msg.includes('alreadyclaimed') || 
-            msg.includes('codealreadyclaimed') || 
-            msg.includes('codealreadyredeemed') || 
-            msg.includes('already claimed') || 
-            msg.includes('have already claimed') ||
-            msg.includes('already redeemed')) {
-            return 'alreadyClaimed';
-        }
-        
-        // Check for withdrawError
-        if (msg.includes('withdrawerror') || 
-            msg.includes('withdraw error')) {
-            return 'withdrawError';
-        }
-        
-        // Check for emailUnverified
-        if (msg.includes('emailunverified') || 
-            msg.includes('email unverified')) {
-            return 'emailUnverified';
-        }
-        
-        // Check for kycLevelNotSufficient
-        if (msg.includes('kyclevelnotsufficient') || 
-            msg.includes('verification level') || 
-            msg.includes('kyc')) {
-            return 'kycLevelNotSufficient';
-        }
-        
-        // Success marker
-        if (msg.includes('claim_success')) {
-            return 'CLAIM_SUCCESS';
-        }
-        
-        // Unknown error
-        return 'unknown';
-    }
-
-    // ================================
-    // 🔄 UI FORM SUBMISSION LOGIC (FALLBACK)
-    // ================================
-    function processCodeViaUI(code) {
-        // 1. Find form elements
-        const codeInput = document.querySelector('input[data-testid="bonus-code"]');
-        const submitButton = document.querySelector('button[data-testid="claim-drop"]');
-
-        if (!codeInput || !submitButton) {
-            addLog("UI: Bonus Code Form not found. Navigate to the Offers page.", "error");
-            return;
-        }
-
-        addLog(`UI: Typing code ${code} and clicking Submit.`, "warning");
-        try {
-            // 2. Set value and dispatch events
-            codeInput.value = code;
-            codeInput.dispatchEvent(new Event('input', { bubbles: true }));
-            codeInput.dispatchEvent(new Event('change', { bubbles: true }));
-            // 3. Click submit (with short delay)
-            setTimeout(() => {
-                submitButton.click();
-                addLog("UI: Submit button clicked. Waiting for modal...", "success");
-
-                // 4. Wait for modal and click dismiss button
-                setTimeout(() => {
-                    const dismissButton = document.querySelector('button[data-testid="claim-bonus-dismiss"]');
-                    if (dismissButton) {
-                        dismissButton.click();
-                        addLog("UI: Modal dismissed.", "info");
-                    } else {
-                        addLog("UI: Dismiss button not found.", "warning");
-                    }
-                }, 300); // Wait 0.3 seconds
-
-            }, 300);
-        } catch (e) {
-            addLog(`UI Submission Error: ${e.message}`, "error");
-        }
-    }
-
-    // ================================
-    // 🚀 API LOGIC (Fully Optimized for Speed with Latency Tracking)
-    // NO AUTO RETRY - Manual retry via "r-" prefix
-    // ================================
-    async function testBonusCode(code, isUncheck = false, wsReceiveTime = null, isRetry = false) {
-        if (!code) return addLog("Empty code received", "error");
-        
-        // Calculate internal processing delay (time from WebSocket receive to processing start)
-        const processingStartTime = performance.now();
-        const internalDelay = wsReceiveTime ? Math.round(processingStartTime - wsReceiveTime) : 0;
-        
-        // Check if this code is already being processed (skip check if it's a retry)
-        if (!isRetry && processingCodes.has(code)) {
-            return; // Silently skip duplicate
-        }
-        
-        // Only apply rate limits and add to claimedCodes if not a retry
-        if (!isRetry) {
-            claimedCodes.add(code);
-
-            // --- 🚦 RATE LIMIT CHECK 1 (Max 2 codes per 20 seconds) ---
-            const now = Date.now();
-            rateLimitTimestamps = rateLimitTimestamps.filter(t => now - t < 20000);
-            if (rateLimitTimestamps.length >= 2) {
-                addLog(`Rate limit exceeded! Dropped code: ${code} (Max 2 per 20s)`, "warning");
-                return; // Stop processing this code
-            }
-            rateLimitTimestamps.push(now);
-            
-            // --- 🚦 RATE LIMIT CHECK 2 (0.5s difference between codes) ---
-            const timeSinceLast = now - lastCodeClaimTime;
-            if (timeSinceLast < 500) {
-                const delay = 500 - timeSinceLast;
-                lastCodeClaimTime = now + delay; // Set target execution time
-                await new Promise(resolve => setTimeout(resolve, delay));
-            } else {
-                lastCodeClaimTime = now;
-            }
-            // --------------------------------------------------------
-        }
-        processingCodes.add(code);
-
-        // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE
-        // Fire the info API call and immediately proceed to claim (fire and forget)
-        if (stakeApi) {
-            stakeApi.checkBonusCode(code).catch(() => {}); // Fire and forget - no waiting
-        }
-
-        // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
-        let tokenResult = turnstileManager.getFastTokenWithMetrics();
-
-        if (tokenResult && tokenResult.token) {
-            // FAST PATH: Token exists. Fire request in the current execution tick.
-            const token = tokenResult.token;
-            const turnstileCacheHit = tokenResult.cacheHit;
-            const tokenLatency = tokenResult.latency;
-
-            const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
-
-            // Record API call start time - this measures the actual network latency to Stake API
-            const apiCallStartTime = performance.now();
-
-            // Fire request instantly using OPTIMIZED_HEADERS
-            const claimPromise = fetch(STAKE_API_URL, {
-                method: 'POST',
-                headers: OPTIMIZED_HEADERS,
-                body: payload
-            });
-
-            // UI updates happen AFTER the request is on the network
-            const logId = addLog(`${isRetry ? 'RETRY - ' : ''}Processing: ${code}...`, "info", true);
-
-            // Handle the response asynchronously (non-blocking)
-            claimPromise
-                .then(r => r.json())
-                .catch(e => ({ errors: [{ message: e.message }] }))
-                .then(claimResponse => {
-                    const apiCallEndTime = performance.now();
-                    // API latency is the actual network round-trip time to Stake API
-                    const apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
-                    const totalTime = Math.round(apiCallEndTime - processingStartTime);
-                    
-                    const latencyInfo = {
-                        internalDelay,
-                        turnstileCacheHit,
-                        tokenLatency,
-                        apiLatency,
-                        totalTime
-                    };
-                    
-                    handleClaimResponse(claimResponse, code, token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
-                });
-
-        } else {
-            // SLOW PATH: No token cache, fallback to async generation
-            addLog(`Token cache empty! Falling back...`, "warning");
-            const logId = addLog(`${isRetry ? 'RETRY - ' : ''}Processing: ${code}...`, "info", true);
-            const tokenStartTime = performance.now();
-            
-            turnstileManager.getTokenWithMetrics().then(tokenResult => {
-                const token = tokenResult.token;
-                const turnstileCacheHit = tokenResult.cacheHit;
-                const tokenLatency = Math.round(performance.now() - tokenStartTime);
-                
-                const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
-                
-                const apiCallStartTime = performance.now();
-                
-                fetch(STAKE_API_URL, {
-                    method: 'POST',
-                    headers: OPTIMIZED_HEADERS,
-                    body: payload
-                })
-                .then(r => r.json())
-                .catch(e => ({ errors: [{ message: e.message }] }))
-                .then(claimResponse => {
-                    const apiCallEndTime = performance.now();
-                    const apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
-                    const totalTime = Math.round(apiCallEndTime - processingStartTime);
-                    
-                    const latencyInfo = {
-                        internalDelay,
-                        turnstileCacheHit,
-                        tokenLatency,
-                        apiLatency,
-                        totalTime
-                    };
-                    
-                    handleClaimResponse(claimResponse, code, token, processingStartTime, logId, latencyInfo, wsReceiveTime, isRetry);
-                });
-            });
-        }
-    }
-
-    async function handleClaimResponse(claimResponse, code, token, startTime, logId, latencyInfo, wsReceiveTime, isRetry = false) {
-        const timeTaken = (performance.now() - startTime).toFixed(0);
-
-        // Fix: Retry on invalid turnstile error
-        if (claimResponse.errors && claimResponse.errors.length > 0 && claimResponse.errors[0].message === 'error.invalid_turnstile') {
-            updateLog(logId, `Invalid Turnstile. Retrying...`, "warning", true);
-            turnstileManager.tokenCache = []; 
-            const tokenStartTime = performance.now();
-            let newTokenResult = await turnstileManager.getTokenWithMetrics();
-            
-            const payload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${code}","currency":"${selectedCurrency}","turnstileToken":"${newTokenResult.token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
-            
-            const apiCallStartTime = performance.now();
-            
-            claimResponse = await fetch(STAKE_API_URL, {
-                method: 'POST',
-                headers: OPTIMIZED_HEADERS,
-                body: payload
-            }).then(r => r.json()).catch(e => ({ errors: [{ message: e.message }] }));
-            
-            const apiCallEndTime = performance.now();
-            latencyInfo.apiLatency = Math.round(apiCallEndTime - apiCallStartTime);
-            latencyInfo.turnstileCacheHit = false;
-            latencyInfo.tokenLatency = Math.round(apiCallEndTime - tokenStartTime);
-            latencyInfo.totalTime = Math.round(apiCallEndTime - startTime);
-        }
-
-        if (!claimResponse.errors && claimResponse.data && claimResponse.data.claimConditionBonusCode) {
-            // SUCCESS
-            const data = claimResponse.data.claimConditionBonusCode;
-            
-            // Update claim statistics
-            claimStats.successCount++;
-            claimStats.totalClaimedValue += parseFloat(data.amount) || 0;
-            
-            // Add to recent claims
-            claimStats.recentClaims.push({
-                username: currentUsername,
-                code: code,
-                status: 'SUCCESS',
-                amount: data.amount,
-                currency: data.currency,
-                timestamp: new Date().toISOString(),
-                latencyInfo: latencyInfo,
-                isRetry: isRetry
-            });
-            if (claimStats.recentClaims.length > 50) claimStats.recentClaims.shift();
-            
-            updateLog(logId, `SUCCESS! Claimed ${code}! Bonus: ${data.amount} ${data.currency}${isRetry ? ' (MANUAL RETRY)' : ''}`, "success", true, latencyInfo);
-            
-            // Remove from processing set
-            processingCodes.delete(code);
-            
-            if (userSettings && userSettings.vault) {
-                stakeApi.createVaultDeposit(data.currency, data.amount).then(() => addLog(`Amount deposited to vault`, "success")).catch(() => {});
-            }
-            
-            // Build raw JSON report for custom backend
-            const reportData = { 
-                username: currentUsername,
-                code: code, 
-                status: "SUCCESS", 
-                message: "Claimed successfully", 
-                amount: data.amount,
-                currency: data.currency,
-                isRetry: isRetry,
-                latency: {
-                    network: latencyInfo.apiLatency, // Actual API network latency
-                    token: latencyInfo.tokenLatency,
-                    cacheHit: latencyInfo.turnstileCacheHit,
-                    total: latencyInfo.totalTime
-                },
-                data: data,
-                timestamp: new Date().toISOString()
-            };
-            reportToBackend(reportData);
-        } else {
-            // FAILURE LOGIC - NO AUTO RETRY
-            // Extract error message with proper fallbacks - handle all edge cases
-            let failureReason = "Unknown error";
-            
-            if (claimResponse.errors && Array.isArray(claimResponse.errors) && claimResponse.errors.length > 0) {
-                // Check if first error has a message
-                if (claimResponse.errors[0] && claimResponse.errors[0].message) {
-                    failureReason = claimResponse.errors[0].message;
-                } else if (claimResponse.errors[0]) {
-                    // Error object exists but no message property - stringify it
-                    failureReason = JSON.stringify(claimResponse.errors[0]);
-                }
-            } else if (claimResponse.error) {
-                // Some APIs return a single 'error' field
-                failureReason = typeof claimResponse.error === 'string' ? claimResponse.error : JSON.stringify(claimResponse.error);
-            } else if (claimResponse.message) {
-                // Some APIs return a 'message' field at root
-                failureReason = claimResponse.message;
-            }
-            
-            const errorType = getErrorType(failureReason);
-            
-            // Update failed claim statistics
-            claimStats.failedCount++;
-            
-            // Add to recent claims
-            claimStats.recentClaims.push({
-                username: currentUsername,
-                code: code,
-                status: 'FAILED',
-                reason: errorType,
-                error: failureReason,
-                timestamp: new Date().toISOString(),
-                latencyInfo: latencyInfo,
-                isRetry: isRetry
-            });
-            if (claimStats.recentClaims.length > 50) claimStats.recentClaims.shift();
-            
-            // All errors are now non-retryable (no auto retry)
-            // Just show the error message
-            processingCodes.delete(code);
-            
-            let logMessage = `FAILED ${code}. Reason: ${failureReason}`;
-            let logType = "error";
-            
-            if (errorType === 'bonusCodeInactive') { 
-                logMessage = `Code ${code} has been fully claimed`; 
-                logType = "warning"; 
-            } else if (errorType === 'alreadyClaimed') { 
-                logMessage = `Already claimed code ${code}`; 
-                logType = "warning"; 
-            } else if (errorType === 'weeklyWagerRequirement') { 
-                logMessage = `Wager requirement not met for ${code}`; 
-                logType = "warning"; 
-            } else if (errorType === 'withdrawError') { 
-                logMessage = `Deposit required to claim ${code}`; 
-                logType = "warning"; 
-            } else if (errorType === 'emailUnverified') { 
-                logMessage = `Email verification required for ${code}`; 
-                logType = "warning"; 
-            } else if (errorType === 'kycLevelNotSufficient') { 
-                logMessage = `KYC level insufficient for ${code}`; 
-                logType = "warning"; 
-            }
-            
-            updateLog(logId, logMessage, logType, true, latencyInfo);
-            
-            // Build raw JSON report for custom backend - include raw response for debugging
-            const reportData = { 
-                username: currentUsername,
-                code: code, 
-                status: "FAILED", 
-                reason: errorType, 
-                error: failureReason,
-                isRetry: isRetry,
-                latency: {
-                    network: latencyInfo.apiLatency,
-                    token: latencyInfo.tokenLatency,
-                    cacheHit: latencyInfo.turnstileCacheHit,
-                    total: latencyInfo.totalTime
-                },
-                rawResponse: claimResponse, // Include raw API response for debugging
-                timestamp: new Date().toISOString()
-            };
-            reportToBackend(reportData);
-        }
-    }
-
-    // ================================
-    // 📡 DUAL WEBSOCKET CONNECTIONS
-    // ================================
-
-    // 1. MAIN WEBSOCKET (HEROKU)
-    function connectWebSocket() {
-        if (webSocket && webSocket.readyState === WebSocket.OPEN) return;
-        updateStatus("disconnected", "Connecting...");
-
-        try {
-            // Append username to WS URL for backend auth
-            const wsUrlWithUser = `${WS_SERVER_URL}?user=${currentUsername}`;
-            webSocket = new WebSocket(wsUrlWithUser);
-            webSocket.onopen = () => {
-                addLog("Connected to Main Server", "success");
-                updateStatus("connected", "UPLINK ACTIVE");
-
-                // Start token maintenance when connected
-                if (turnstileManager && turnstileManager.initialized) {
-                    turnstileManager.startTokenMaintenance();
-                }
-            };
-            webSocket.onmessage = (event) => {
-                const raw = event.data;
-                const receiveTime = performance.now(); // INSTANT TIMER START
-                
-                // --- OPTIMIZATION: FAST-FAIL PARSING ---
-                if (typeof raw !== 'string' || !raw.includes('"code"')) return;
-                // ---------------------------------------
-
-                // Check for "r-" or "-r" prefix for manual retry
-                let actualCode = raw;
-                let isRetry = false;
-                
-                // Try to extract code and check for prefix
-                const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
-                if (codeMatch && codeMatch[1]) {
-                    actualCode = codeMatch[1];
-                    // Check if code starts with "r-" or "-r" for manual retry
-                    if (actualCode.startsWith('r-') || actualCode.startsWith('-r')) {
-                        isRetry = true;
-                        actualCode = actualCode.substring(2); // Strip prefix
-                    }
-                }
-
-                // --- 🚀 GOD TIER OPTIMIZATION: Bypassing JSON.parse ---
-                if (userSettings && userSettings.processAll) {
-                    if (codeMatch && codeMatch[1]) {
-                        if (!claimedCodes.has(actualCode) || isRetry) {
-                            // FIRE IMMEDIATELY without waiting for JSON parse
-                            testBonusCode(actualCode, false, receiveTime, isRetry);
-                        }
-                        // Silently ignore duplicate codes
-                    }
-                    return; // Skip standard parsing if processed via regex
-                } 
-                // --------------------------------------------------------
-
-                try {
-                    const payload = JSON.parse(raw);
-                    let messageData = null;
-
-                    // If outer wrapper indicates sub_code_v2 OR stake_bonus_code, use inner msg
-                    if (payload && (payload.type === "sub_code_v2" || payload.type === "stake_bonus_code") && payload.msg) {
-                        messageData = payload.msg;
-                    } 
-                    // Legacy or other format where msg exists - prefer inner msg if present
-                    else if (payload && payload.msg) {
-                        messageData = payload.msg;
-                    } 
-                    // Fallback: use payload directly
-                    else {
-                        messageData = payload;
-                    }
-
-                    // If after extraction we still have a lingering 'type' field equal to 'sub_code_v2' or 'stake_bonus_code', remove it
-                    if (messageData && (messageData.type === "sub_code_v2" || messageData.type === "stake_bonus_code")) {
-                        if (messageData.msg) {
-                            // If inner msg exists, unwrap it
-                            messageData = messageData.msg;
-                        } else {
-                            // Otherwise just remove the irrelevant wrapper type
-                            delete messageData.type;
-                        }
-                    }
-
-                    if (messageData && messageData.code) {
-                        // Check for retry prefix in the code for manual retry
-                        let code = messageData.code;
-                        let isManualRetry = false;
-                        
-                        if (code.startsWith('r-') || code.startsWith('-r')) {
-                            isManualRetry = true;
-                            code = code.substring(2); // Strip prefix
-                            messageData.code = code; // Update for further processing
-                        }
-                        
-                        // Check if we should process this code based on user settings
-                        const codeType = getCodeType(messageData);
-                        // If user enabled 'processAll' OR code type is in allowed drops
-                        if (!userSettings.processAll && userSettings.drops && userSettings.drops.includes(codeType)) {
-                            // Check if code is already processed (skip check if it's a retry)
-                            if (!claimedCodes.has(code) || isManualRetry) {
-                                testBonusCode(code, messageData.msgType === 'unck', receiveTime, isManualRetry);
-                            }
-                            // Silently ignore duplicate codes
-                        } else if (!userSettings.processAll) {
-                            addLog(`Skipping code type: ${codeType}`, "info");
-                        }
-                    }
-                } catch (e) {
-                    // Silent catch for JSON parse errors
-                }
-            };
-            webSocket.onclose = (event) => {
-                updateStatus("disconnected", "Reconnecting...");
-                webSocket = null;
-                
-                // Only reconnect if we aren't blocked by auth
-                if (!document.getElementById('kust-subscription-overlay')) {
-                    setTimeout(connectWebSocket, 4000 + Math.random() * 2000); // Added jitter
-                }
-            };
-            webSocket.onerror = (error) => {
-                // WebSocket errors usually trigger onclose immediately after, so we handle reconnection there
-                console.error("Main WebSocket Error:", error);
-            };
-
-        } catch (e) {
-            addLog(`Connection Failed: ${e.message}`, 'error');
-            updateStatus("disconnected", "Error");
-            setTimeout(connectWebSocket, 4000 + Math.random() * 2000); // Added jitter
-        }
-    }
-
-    function disconnectWebSocket() {
-        if (webSocket) {
-            webSocket.close();
-            webSocket = null;
-        }
-        if (hh123Socket) {
-            hh123Socket.disconnect();
-            hh123Socket = null;
-        }
-        if (healthWsSocket) {
-            healthWsSocket.close();
-            healthWsSocket = null;
-        }
-        if (healthWsReconnectTimer) {
-            clearTimeout(healthWsReconnectTimer);
-            healthWsReconnectTimer = null;
-        }
-        if (healthWsReportInterval) {
-            clearInterval(healthWsReportInterval);
-            healthWsReportInterval = null;
-        }
-    }
-
-    // 2. REGIONAL WEBSOCKET (HH123 Socket.IO)
-    async function loadSocketIO() {
-        return new Promise((resolve, reject) => {
-            if (typeof unsafeWindow.io !== 'undefined') return resolve();
-            const script = document.createElement('script');
-            script.src = 'https://cdn.socket.io/4.7.4/socket.io.min.js';
-            script.onload = resolve;
-            script.onerror = reject;
-            document.head.appendChild(script);
-        });
-    }
-
-    async function connectRegionalServer() {
-        if (hh123Socket && hh123Socket.connected) return;
-
-        try {
-            await loadSocketIO();
-            
-            // 1. HTTP Auth to get HH123 Token
-            const loginResText = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: `${HH123_URL}/api/login`,
-                    headers: {
-                        'Accept': 'application/json, text/plain, */*',
-                        'Content-Type': 'application/json',
-                        'Origin': 'https://stake.com',
-                        'Referer': 'https://stake.com/settings/offers'
-                    },
-                    data: JSON.stringify({
-                        username: HH123_USERNAME,
-                        platform: 'stake.com',
-                        version: HH123_VERSION
-                    }),
-                    onload: (res) => resolve(res.responseText),
-                    onerror: reject,
-                    ontimeout: reject
-                });
-            });
-
-            const loginData = JSON.parse(loginResText);
-            const token = loginData.data || loginData.token;
-            if (!token) throw new Error("No token returned from Regional Server");
-
-            // 2. Connect via Socket.IO
-            hh123Socket = unsafeWindow.io(HH123_URL, {
-                auth: { token: token, version: HH123_VERSION, locale: 'en' },
-                transports: ['polling'],
-                reconnection: true,
-                reconnectionAttempts: 10,
-                reconnectionDelay: 5000
-            });
-
-            hh123Socket.on('connect', () => {
-                addLog("Connected to Regional Server", "success");
-                hh123Socket.emit('auth', { token: token, username: HH123_USERNAME });
-            });
-
-            const handleRegionalMessage = (data) => {
-                const receiveTime = performance.now(); // INSTANT TIMER START
-                
-                let raw = typeof data === 'string' ? data : JSON.stringify(data);
-                
-                if (typeof raw === 'string' && !raw.includes('"code"')) return;
-
-                // Check for retry prefix for manual retry
-                let actualCode = raw;
-                let isRetry = false;
-                
-                // Try to extract code and check for prefix
-                const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
-                if (codeMatch && codeMatch[1]) {
-                    actualCode = codeMatch[1];
-                    // Check if code starts with prefix for manual retry
-                    if (actualCode.startsWith('r-') || actualCode.startsWith('-r')) {
-                        isRetry = true;
-                        actualCode = actualCode.substring(2); // Strip prefix
-                    }
-                }
-
-                // --- 🚀 GOD TIER OPTIMIZATION: Bypassing JSON.parse ---
-                if (userSettings && userSettings.processAll) {
-                    if (codeMatch && codeMatch[1]) {
-                        if (!claimedCodes.has(actualCode) || isRetry) {
-                            // FIRE IMMEDIATELY
-                            testBonusCode(actualCode, false, receiveTime, isRetry);
-                        }
-                        // Silently ignore duplicate codes
-                    }
-                    return; // Skip standard parsing if processed via regex
-                }
-                // --------------------------------------------------------
-
-                try {
-                    let messageData = null;
-                    if (data && (data.type === "sub_code_v2" || data.type === "stake_bonus_code") && data.msg) {
-                        messageData = data.msg;
-                    } else if (data && data.msg) {
-                        messageData = data.msg;
-                    } else {
-                        messageData = data;
-                    }
-
-                    if (messageData && (messageData.type === "sub_code_v2" || messageData.type === "stake_bonus_code")) {
-                        if (messageData.msg) messageData = messageData.msg;
-                        else delete messageData.type;
-                    }
-
-                    if (messageData && messageData.code) {
-                        // Check for prefix in the code for manual retry
-                        let code = messageData.code;
-                        let isManualRetry = false;
-                        
-                        if (code.startsWith('r-') || code.startsWith('-r')) {
-                            isManualRetry = true;
-                            code = code.substring(2); // Strip prefix
-                            messageData.code = code; // Update for further processing
-                        }
-                        
-                        const codeType = getCodeType(messageData);
-                        if (!userSettings.processAll && userSettings.drops && userSettings.drops.includes(codeType)) {
-                            if (!claimedCodes.has(code) || isManualRetry) {
-                                testBonusCode(code, false, receiveTime, isManualRetry);
-                            }
-                            // Silently ignore duplicate codes
-                        } else if (!userSettings.processAll) {
-                            addLog(`Skipping code type: ${codeType}`, "info");
-                        }
-                    }
-                } catch (e) {}
-            };
-
-            hh123Socket.on('sub_code_v2', (data) => handleRegionalMessage({ type: 'sub_code_v2', msg: data }));
-            hh123Socket.on('message', handleRegionalMessage);
-            
-            hh123Socket.on('disconnect', () => {
-                // Background reconnect handles itself via Socket.io internal logic
-            });
-
-            // Keepalive specific to this socket
-            setInterval(() => {
-                if (hh123Socket && hh123Socket.connected) {
-                    hh123Socket.emit('ping_from_bot', { ts: Date.now() });
-                }
-            }, 25000);
-
-        } catch (e) {
-            addLog(`Regional Server Connect Failed. Retrying...`, "warning");
-            setTimeout(connectRegionalServer, 8000 + Math.random() * 4000); // Added jitter
-        }
-    }
-
-    // ================================
-    // 🏥 HEALTH CHECK WEBSOCKET
-    // Connects to healthUrl from velocity config.
-    // Initializes by sending username on open (same pattern as main WSS).
-    // Responds on-demand to "report_request" from server:
-    //   - Runs a dummy claim attempt (stake1234) to measure real API latency
-    //   - Reports: username, token cache count, network stats, connection state
-    // ================================
-    function connectHealthSocket() {
-        if (!HEALTH_WS_URL) {
-            addLog('[Health] No healthUrl from config — skipping health socket.', 'warning');
-            return;
-        }
-        if (healthWsSocket && healthWsSocket.readyState === WebSocket.OPEN) return;
-
-        // Clear any pending reconnect timer
-        if (healthWsReconnectTimer) {
-            clearTimeout(healthWsReconnectTimer);
-            healthWsReconnectTimer = null;
-        }
-
-        try {
-            // Append username exactly like the main code WSS does
-            const healthUrl = `${HEALTH_WS_URL}?user=${currentUsername}`;
-            healthWsSocket = new WebSocket(healthUrl);
-
-            healthWsSocket.onopen = () => {
-                addLog('[Health] Health socket connected.', 'success');
-                // Send hello/init message with username (mirrors main WSS pattern)
-                try {
-                    healthWsSocket.send(JSON.stringify({
-                        type: 'hello',
-                        username: currentUsername
-                    }));
-                } catch (e) { /* ignore */ }
-
-                // Start periodic token reporting every 30 seconds
-                if (healthWsReportInterval) {
-                    clearInterval(healthWsReportInterval);
-                }
-                healthWsReportInterval = setInterval(() => {
-                    if (healthWsSocket && healthWsSocket.readyState === WebSocket.OPEN) {
-                        const tokenCacheCount = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
-                        const report = {
-                            type: 'token_report',
-                            username: currentUsername,
-                            token_count: tokenCacheCount,
-                            timestamp: new Date().toISOString()
-                        };
-                        try {
-                            healthWsSocket.send(JSON.stringify(report));
-                        } catch (e) { /* ignore */ }
-                    }
-                }, 30000);
-            };
-
-            healthWsSocket.onmessage = async (event) => {
-                let msg;
-                try { msg = JSON.parse(event.data); } catch (e) { return; }
-
-                // Server sends {"type":"report_request"} or {"type":"ping_health"} to trigger a report
-                if (msg.type === 'report_request' || msg.type === 'ping_health') {
-                    addLog('[Health] Report requested by server — running dummy claim...', 'info');
-
-                    // ── Dummy claim attempt (stake1234) to measure real API latency ──
-                    let dummyLatency = null;
-                    let dummyResult = 'not_attempted';
-                    let dummyError = null;
-
-                    if (stakeApi && OPTIMIZED_HEADERS) {
-                        const dummyCode = 'stake1234';
-                        const dummyTokenResult = turnstileManager.getFastTokenWithMetrics();
-
-                        if (dummyTokenResult && dummyTokenResult.token) {
-                            const dummyPayload = `{"operationName":"ClaimConditionBonusCode","variables":{"code":"${dummyCode}","currency":"${selectedCurrency}","turnstileToken":"${dummyTokenResult.token}"},"query":"mutation ClaimConditionBonusCode($code: String!, $currency: CurrencyEnum!, $turnstileToken: String!) { claimConditionBonusCode(code: $code, currency: $currency, turnstileToken: $turnstileToken) { bonusCode { id code __typename } amount currency user { id balances { available { amount currency __typename } __typename } __typename } __typename } }"}`;
-                            const dummyStart = performance.now();
-                            try {
-                                const dummyResp = await fetch(STAKE_API_URL, {
-                                    method: 'POST',
-                                    headers: OPTIMIZED_HEADERS,
-                                    body: dummyPayload
-                                });
-                                const dummyJson = await dummyResp.json();
-                                dummyLatency = Math.round(performance.now() - dummyStart);
-
-                                if (dummyJson.errors && dummyJson.errors.length > 0) {
-                                    const errMsg = dummyJson.errors[0].message || '';
-                                    dummyError = errMsg;
-                                    // Expected: bonusCodeInactive / alreadyClaimed / etc — API is reachable
-                                    dummyResult = 'api_reached_error';
-                                } else {
-                                    dummyResult = 'api_reached_success';
-                                }
-                            } catch (e) {
-                                dummyLatency = Math.round(performance.now() - dummyStart);
-                                dummyResult = 'fetch_error';
-                                dummyError = e.message;
-                            }
-                        } else {
-                            dummyResult = 'no_token_in_cache';
-                        }
-                    } else {
-                        dummyResult = 'api_not_initialized';
-                    }
-                    // ── End dummy claim ──
-
-                    const tokenCacheCount = turnstileManager.tokenCache ? turnstileManager.tokenCache.length : 0;
-                    const mainConnected = webSocket && webSocket.readyState === WebSocket.OPEN;
-                    const regionalConnected = hh123Socket && hh123Socket.connected;
-                    const healthConnected = healthWsSocket && healthWsSocket.readyState === WebSocket.OPEN;
-
-                    const report = {
-                        type: 'health_report',
-                        username: currentUsername,
-                        timestamp: new Date().toISOString(),
-                        dummy_claim: {
-                            code: 'stake1234',
-                            result: dummyResult,
-                            latency_ms: dummyLatency,
-                            error: dummyError
-                        },
-                        token_cache: {
-                            count: tokenCacheCount,
-                            max: turnstileManager.maxCacheSize || 3
-                        },
-                        network: {
-                            main_wss: {
-                                ping_ms: netStats.ping,
-                                jitter_ms: netStats.jitter,
-                                packet_loss_pct: netStats.packetLoss,
-                                connected: mainConnected
-                            },
-                            regional_wss: {
-                                ping_ms: netStatsReg.ping,
-                                jitter_ms: netStatsReg.jitter,
-                                packet_loss_pct: netStatsReg.packetLoss,
-                                connected: regionalConnected
-                            },
-                            health_wss: {
-                                connected: healthConnected
-                            }
-                        },
-                        claim_stats: {
-                            success: claimStats.successCount,
-                            failed: claimStats.failedCount,
-                            total_claimed_value: claimStats.totalClaimedValue
-                        },
-                        turnstile: {
-                            initialized: turnstileManager.initialized,
-                            is_generating: turnstileManager.isGenerating,
-                            consecutive_failures: turnstileManager.consecutiveFailures || 0
-                        },
-                        currency: selectedCurrency
-                    };
-
-                    try {
-                        healthWsSocket.send(JSON.stringify(report));
-                        addLog(`[Health] Report sent (latency: ${dummyLatency}ms, tokens: ${tokenCacheCount})`, 'success');
-                    } catch (e) {
-                        addLog('[Health] Failed to send report.', 'error');
-                    }
-                }
-            };
-
-            healthWsSocket.onclose = () => {
-                addLog('[Health] Health socket disconnected. Reconnecting in 10s...', 'warning');
-                healthWsSocket = null;
-                // Clear the report interval on disconnect
-                if (healthWsReportInterval) {
-                    clearInterval(healthWsReportInterval);
-                    healthWsReportInterval = null;
-                }
-                healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000 + Math.random() * 2000); // Added jitter
-            };
-
-            healthWsSocket.onerror = (err) => {
-                console.error('[Health] Health WebSocket error:', err);
-                // onclose fires after onerror, handles reconnect
-            };
-
-        } catch (e) {
-            addLog(`[Health] Connection failed: ${e.message}. Retrying in 10s...`, 'error');
-            healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000 + Math.random() * 2000); // Added jitter
-        }
-    }
-
-    // Function to determine code type from payload
-    function getCodeType(payload) {
-        let codeType = 'OtherDrops';
-        if (payload.type === 'DailyDrops') {
-            if (payload.amount === 1) {
-                codeType = 'Daily1';
-            } else if (payload.amount === 2) {
-                codeType = 'Daily2';
-            } else if (payload.amount === 3) {
-                codeType = 'Daily3';
-            } else {
-                codeType = 'DailyOther';
-            }
-        } else if (payload.type) {
-            codeType = payload.type;
-        }
-
-        return codeType;
-    }
-
-    // ================================
-    // ⏱️ PERIODIC AUTH CHECKER
-    // ================================
-    function startSubscriptionCheck() {
-        // Run check every 60 seconds
-        setInterval(async () => {
-            if (!currentUsername) return;
-
-            const isAuthorized = await checkAuthorization(currentUsername);
-
-            if (!isAuthorized) {
-                // Increment consecutive failures counter
-                consecutiveAuthFailures++;
-                addLog(`Authorization check failed (${consecutiveAuthFailures}/2)`, "warning");
-                
-                // Only show subscription prompt after 2 consecutive failures
-                if (consecutiveAuthFailures >= 2) {
-                    // Not authorized: Kill connection and lock UI
-                    if (webSocket || hh123Socket) {
-                        addLog("Subscription expired. Stopping connection.", "error");
-                        disconnectWebSocket();
-                    }
-                    showSubscriptionPrompt();
-                    // Report invalid username to internal API
-                    reportHealth('invalid_username', { username: currentUsername });
-                }
-            } else {
-                // Reset consecutive failures counter on success
-                if (consecutiveAuthFailures > 0) {
-                    addLog("Authorization check passed", "success");
-                }
-                consecutiveAuthFailures = 0;
-                // Authorized: Check if we need to unlock UI
-                if (document.getElementById('kust-subscription-overlay')) {
-                    restoreLogsView();
-                    connectWebSocket();
-                    connectRegionalServer();
-                }
-                // Check if connection dropped and needs restart (and we aren't locked)
-                else {
-                    if (!webSocket || webSocket.readyState === WebSocket.CLOSED) {
-                        connectWebSocket();
-                    }
-                    if (!hh123Socket || !hh123Socket.connected) {
-                        connectRegionalServer();
-                    }
-                    if (!healthWsSocket || healthWsSocket.readyState === WebSocket.CLOSED) {
-                        connectHealthSocket();
-                    }
-                }
-            }
-        }, 60000 + Math.random() * 5000); // Added jitter
-    }
-
-    // ================================
-    // ⚙️ USER SETTINGS
-    // ================================
-    function initUserSettings() {
-        try {
-            // Default settings - all checkboxes checked by default
-            const defaultSettings = {
-                drops: ['Daily1', 'Daily2', 'Daily3', 'DailyOther', 'HighRollers', 'PlaySmarter', 'WeeklyStream', 'OtherDrops'],
-                vault: false,
-                processAll: false, // Added default for new button
-                currency: 'usdt'
-            };
-            // Load saved settings or use defaults
-            userSettings = GM_getValue(FC_USER_SETTINGS) ||
-                defaultSettings;
-
-            // Ensure all required properties exist
-            if (!userSettings.drops) userSettings.drops = defaultSettings.drops;
-            if (!userSettings.vault) userSettings.vault = defaultSettings.vault;
-            if (userSettings.processAll === undefined) userSettings.processAll = defaultSettings.processAll;
-            if (!userSettings.currency) userSettings.currency = defaultSettings.currency;
-            // Set selected currency
-            selectedCurrency = userSettings.currency;
-            // Save settings
-            GM_setValue(FC_USER_SETTINGS, userSettings);
-
-            return userSettings;
-        } catch (error) {
-            addLog(`Error initializing user settings: ${error.message}`, "error");
-            return {
-                drops: ['Daily1', 'Daily2', 'Daily3', 'DailyOther', 'HighRollers', 'PlaySmarter', 'WeeklyStream', 'OtherDrops'],
-                vault: false,
-                processAll: false,
-                currency: 'usdt'
-            };
-        }
-    }
-
-    function saveUserSettings() {
-        try {
-            GM_setValue(FC_USER_SETTINGS, userSettings);
-            addLog("Settings saved", "success");
-        } catch (error) {
-            addLog(`Error saving settings: ${error.message}`, "error");
-        }
-    }
-
-    function updateSettingsUI() {
-        // Update checkboxes based on current settings
-        const checkboxes = document.querySelectorAll('.settings-checkbox');
-        checkboxes.forEach(checkbox => {
-            if (checkbox.id === 'vaultDeposit') {
-                checkbox.checked = userSettings.vault || false;
-            } else if (checkbox.id === 'processAll') {
-                checkbox.checked = userSettings.processAll || false;
-            } else if (checkbox.value) {
-                checkbox.checked = userSettings.drops.includes(checkbox.value);
-            }
-        });
-        // Update currency selection
-        const currencySelect = document.getElementById('currencySelect');
-        if (currencySelect) {
-            currencySelect.value = userSettings.currency || 'usdt';
-        }
-        
-        // Also update network stats if opening
-        updateSettingsStats();
-    }
-
-    // ================================
-    // 🖼️ UI CONSTRUCTION
-    // ================================
-    function createPanel() {
-        // Remove existing panel if any
-        const existing = document.getElementById("kust-panel");
-        if (existing) existing.remove();
-
-        const panel = document.createElement("div");
-        panel.id = "kust-panel";
-        panel.innerHTML = `
-            <div class="kust-header">
-                <div class="kust-header-left">
-                    <div class="kust-title">KUST CLAIMER</div>
-                    <div id="kust-username" class="kust-username">Guest</div>
-                </div>
-                <div class="kust-header-right">
-                    <div id="kust-network-bars" class="network-bars" title="Checking...">
-                        <div class="net-bar"></div>
-                        <div class="net-bar"></div>
-                        <div class="net-bar"></div>
-                    </div>
-
-                    <div class="kust-settings-btn" id="kust-settings-btn" title="Settings">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <circle cx="12" cy="12" r="3"></circle>
-                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                        </svg>
-                    </div>
-                    <div id="kust-status-badge" class="kust-status disconnected">
-                        <div class="status-dot"></div>
-                        <span id="kust-status-text">Init...</span>
-                    </div>
-                </div>
-            </div>
-            <div class="kust-body">
-                <div id="kust-logs"></div>
-            </div>
-        `;
-        document.body.appendChild(panel);
-
-        // ================================
-        // INJECT SIMPLIFIED TOKEN OVERLAY
-        // ================================
-        const overlay = document.createElement("div");
-        overlay.id = "kust-token-overlay";
-        overlay.innerHTML = `
-            <div class="token-icon">⚡</div>
-            <div class="token-text">
-                <span class="token-label">Bypass Ammo</span>
-                <span id="kust-token-count" class="token-value">0/5</span>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        // Create settings modal
-        const settingsModal = document.createElement("div");
-        settingsModal.id = "kust-settings-modal";
-        settingsModal.innerHTML = `
-            <div class="kust-settings-popup">
-                <div class="settings-popup-header">
-                    <div class="settings-popup-title">Settings</div>
-                    <div class="settings-popup-close" id="settings-popup-close">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                        </svg>
-                    </div>
-                </div>
-                <div class="settings-popup-content">
-                    
-                    <div class="settings-section">
-                        <div class="settings-section-title">Claim Statistics</div>
-                        <div class="claim-stats-grid">
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Success</span>
-                                <span class="claim-stat-value success" id="stat-success-count">0</span>
-                            </div>
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Failed</span>
-                                <span class="claim-stat-value failed" id="stat-failed-count">0</span>
-                            </div>
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Total Value</span>
-                                <span class="claim-stat-value" id="stat-total-value">$0.00</span>
-                            </div>
-                            <div class="claim-stat-item">
-                                <span class="claim-stat-label">Success Rate</span>
-                                <span class="claim-stat-value" id="stat-success-rate">0%</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="settings-section">
-                        <div class="settings-section-title">Network Status</div>
-                        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-                            
-                            <div class="server-container">
-                                <div class="server-label main">Main Server</div>
-                                <div class="net-stats-grid" style="margin-bottom: 0;">
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Latency</span>
-                                        <span class="net-stat-value" id="stat-latency">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Jitter</span>
-                                        <span class="net-stat-value" id="stat-jitter">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Loss</span>
-                                        <span class="net-stat-value" id="stat-loss">--%</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Status</span>
-                                        <span class="net-stat-value" id="stat-server">--</span>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            <div class="server-container">
-                                <div class="server-label regional">Regional</div>
-                                <div class="net-stats-grid" style="margin-bottom: 0;">
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Latency</span>
-                                        <span class="net-stat-value" id="stat-latency-reg">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Jitter</span>
-                                        <span class="net-stat-value" id="stat-jitter-reg">--ms</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Loss</span>
-                                        <span class="net-stat-value" id="stat-loss-reg">--%</span>
-                                    </div>
-                                    <div class="net-stat-item" style="padding: 6px;">
-                                        <span class="net-stat-label">Status</span>
-                                        <span class="net-stat-value" id="stat-server-reg">--</span>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                        </div>
-                    </div>
-                
-                    <div class="settings-section">
-                        <div class="settings-section-title">Code Types to Claim</div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="processAll" class="settings-checkbox">
-                            <label for="processAll" class="settings-label" style="color: #00E701; font-weight: bold;">Process ALL Codes (Ignore Filters)</label>
-                        </div>
-                        <hr class="settings-divider">
-
-                        <div class="settings-option">
-                            <input type="checkbox" id="daily1" class="settings-checkbox" value="Daily1" checked>
-                            <label for="daily1" class="settings-label">Daily $1</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="daily2" class="settings-checkbox" value="Daily2" checked>
-                            <label for="daily2" class="settings-label">Daily $2</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="daily3" class="settings-checkbox" value="Daily3" checked>
-                            <label for="daily3" class="settings-label">Daily $3</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="dailyOther" class="settings-checkbox" value="DailyOther" checked>
-                            <label for="dailyOther" class="settings-label">Daily Other</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="highRollers" class="settings-checkbox" value="HighRollers" checked>
-                            <label for="highRollers" class="settings-label">High Rollers</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="weeklyStream" class="settings-checkbox" value="WeeklyStream" checked>
-                            <label for="weeklyStream" class="settings-label">Weekly Stream Drops</label>
-                        </div>
-                        <div class="settings-option">
-                               <input type="checkbox" id="playSmarter" class="settings-checkbox" value="PlaySmarter" checked>
-                            <label for="playSmarter" class="settings-label">Play Smarter Drops</label>
-                        </div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="otherDrops" class="settings-checkbox" value="OtherDrops" checked>
-                            <label for="otherDrops" class="settings-label">Other Drops</label>
-                        </div>
-                    </div>
-             
-                    <div class="settings-section">
-                        <div class="settings-section-title">Claim Settings</div>
-                        <div class="settings-option">
-                            <input type="checkbox" id="vaultDeposit" class="settings-checkbox">
-                            <label for="vaultDeposit" class="settings-label">Deposit to Vault</label>
-                        </div>
-                        <div class="settings-option">
-                            <label for="currencySelect" class="settings-label">Currency:</label>
-                        </div>
-                        <select id="currencySelect" class="settings-select">
-                            <option value="btc">BTC</option>
-                            <option value="eth">ETH</option>
-                            <option value="ltc">LTC</option>
-                            <option value="usdt" selected>USDT</option>
-                            <option value="sol">SOL</option>
-                            <option value="doge">DOGE</option>
-                            <option value="xrp">XRP</option>
-                            <option value="trx">TRX</option>
-                            <option value="eos">EOS</option>
-                            <option value="bnb">BNB</option>
-                            <option value="usdc">USDC</option>
-                            <option value="dai">DAI</option>
-                            <option value="link">LINK</option>
-                            <option value="shib">SHIB</option>
-                            <option value="uni">UNI</option>
-                            <option value="pol">POL</option>
-                            <option value="trump">TRUMP</option>
-                        </select>
-                    </div>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(settingsModal);
-
-        // Settings button click handler
-        document.getElementById('kust-settings-btn').addEventListener('click', () => {
-            const settingsModal = document.getElementById('kust-settings-modal');
-            settingsModal.classList.add('open');
-
-            // Update UI when opening settings
-            updateSettingsUI();
-        });
-        // Settings modal close button
-        document.getElementById('settings-popup-close').addEventListener('click', () => {
-            document.getElementById('kust-settings-modal').classList.remove('open');
-        });
-        // Close modal when clicking outside
-        document.getElementById('kust-settings-modal').addEventListener('click', (e) => {
-            if (e.target.id === 'kust-settings-modal') {
-                document.getElementById('kust-settings-modal').classList.remove('open');
-            }
-        });
-        // Settings checkboxes
-        const settingsCheckboxes = document.querySelectorAll('.settings-checkbox');
-        settingsCheckboxes.forEach(checkbox => {
-            checkbox.addEventListener('change', () => {
-                if (!userSettings.drops) userSettings.drops = [];
-
-                if (checkbox.id === 'vaultDeposit') {
-                    userSettings.vault = checkbox.checked;
-                } else if (checkbox.id === 'processAll') {
-                    userSettings.processAll = checkbox.checked;
-                } else if (checkbox.value) {
-                    if (checkbox.checked && !userSettings.drops.includes(checkbox.value)) {
-                        userSettings.drops.push(checkbox.value);
-                    } else if (!checkbox.checked && userSettings.drops.includes(checkbox.value)) {
-                        const index = userSettings.drops.indexOf(checkbox.value);
-                        userSettings.drops.splice(index, 1);
-                    }
-                }
-                saveUserSettings();
-            });
-        });
-        // Currency select
-        document.getElementById('currencySelect').addEventListener('change', (e) => {
-            selectedCurrency = e.target.value;
-            userSettings.currency = selectedCurrency;
-            saveUserSettings();
-        });
-        // Drag Logic
-        const header = panel.querySelector('.kust-header');
-        let isDragging = false, startX, startY, initialLeft, initialTop;
-
-        header.addEventListener('mousedown', (e) => {
-            if (e.target.closest('.kust-settings-btn')) return;
-            isDragging = true;
-            startX = e.clientX;
-            startY = e.clientY;
-            const rect = panel.getBoundingClientRect();
-            initialLeft = rect.left;
-            initialTop = rect.top;
-        });
-        document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
-            panel.style.top = `${initialTop + dy}px`;
-            panel.style.left = `${initialLeft + dx}px`;
-            panel.style.right = 'auto';
-        });
-
-        document.addEventListener('mouseup', () => {
-            isDragging = false;
-        });
-    }
-
-    // ================================
-    // 🌐 REMOTE CONFIG FETCHER
-    // ================================
-    async function fetchRemoteConfig() {
-        return new Promise((resolve, reject) => {
-            updateStatus("disconnected", "Fetching config...");
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: REMOTE_CONFIG_URL,
-                timeout: 10000,
-                headers: { "Content-Type": "application/json" },
-                onload: (res) => {
-                    try {
-                        const config = JSON.parse(res.responseText);
-                        // The worker returns 'wssUrl' (best one) and 'authUrl' (default)
-                        if (config.wssUrl && config.authUrl) {
-                            WS_SERVER_URL = config.wssUrl;
-                            AUTH_CHECK_URL = config.authUrl;
-                            if (config.regionalUrl) {
-                                HH123_URL = config.regionalUrl;
-                            }
-                            if (config.healthUrl) {
-                                HEALTH_WS_URL = config.healthUrl;
-                            }
-                            addLog(`Config loaded`, "success");
-                            resolve(true);
-                        } else {
-                            reject("Invalid Config Structure");
-                        }
-                    } catch (e) {
-                        reject("Config Parse Error");
-                    }
-                },
-                onerror: () => reject("Config Network Error"),
-                ontimeout: () => reject("Config Timeout")
-            });
-        });
-    }
-
-    // ================================
-    // 🔥 INITIALIZATION
-    // ================================
-    async function init() {
-        // --- Site load error detection ---
-        window.addEventListener('error', (e) => {
-            if (e.target === window || e.target === document) {
-                addLog('Site load error detected. Requesting restart...', 'error');
-                requestRestart('site_load_failed');
-            }
-        }, true);
-        
-        // Detect page visibility issues (site not loading properly)
-        if (document.visibilityState === 'hidden' && !document.hasFocus()) {
-            setTimeout(() => {
-                if (document.visibilityState === 'hidden') {
-                    addLog('Page visibility issue detected. Requesting restart...', 'warning');
-                    requestRestart('page_visibility_issue');
-                }
-            }, 30000);
-        }
-        // ------------------------------------------
-        
-        // --- OPTIMIZATION: PRE-WARM CONNECTIONS ---
-        const preconnect = document.createElement('link');
-        preconnect.rel = 'preconnect';
-        preconnect.href = CURRENT_MIRROR;
-        preconnect.crossOrigin = 'anonymous';
-        document.head.appendChild(preconnect);
-        // ------------------------------------------
-
-        createPanel();
-        addLog("Kust Claimer v2.5-lite Initialized (VPS Optimized)", "info");
-        
-        // 🔥 START TURNSTILE EARLY
-        // Give the token cache huge breathing room to fill up before anything else executes
-        turnstileManager.initialize();
-
-        // Fetch remote configuration
-        try {
-            await fetchRemoteConfig();
-        } catch (e) {
-            addLog(`Config Fetch Failed: ${e}. Using defaults.`, "warning");
-            // WS_SERVER_URL and AUTH_CHECK_URL retain their default values defined at the top
-        }
-
-        updateStatus("disconnected", "Fetching User...");
-        
-        // Start AGGRESSIVE WSS Network Stats Polling (runs every 2s + jitter)
-        setInterval(activePingCheck, 2000 + Math.random() * 1000);
-        setInterval(activeRegionalPingCheck, 2000 + Math.random() * 1000);
-        activePingCheck(); // Initial check
-        activeRegionalPingCheck();
-        
-        // Start Token UI Polling
-        setInterval(updateTokenUI, 500);
-
-        // 🔥 START TOKEN CACHE WATCHER - Separate watcher for detecting stuck token generation
-        startTokenCacheWatcher();
-
-        // 1. Initialize user settings
-        initUserSettings();
-        // 2. Get Username
-        currentUsername = await getStakeUserFromAPI();
-        
-        // Report health status based on username fetch result
-        if (currentUsername) {
-            // API is working - username obtained
-            reportHealth('api_ok', { username: currentUsername });
-        } else {
-            // API failed - could not get username
-            addLog('Failed to obtain username from API. Reporting invalid API...', 'error');
-            reportHealth('invalid_api', { error: 'Could not fetch user from API' });
-            
-            // Request restart after a short delay
-            setTimeout(() => {
-                requestRestart('invalid_api_cannot_get_username');
-            }, 5000);
-            
-            updateStatus("disconnected", "API Error");
-            return; // Don't continue if API is broken
-        }
-        
-        if (currentUsername) {
-            
-            // 🚀 GOD TIER OPTIMIZATION: Pre-build the fetch headers once session is known
-            OPTIMIZED_HEADERS = {
-                'Content-Type': 'application/json',
-                'x-access-token': currentSession,
-                'x-operation-name': 'ClaimConditionBonusCode',
-                'x-operation-type': 'query',
-                'Origin': CURRENT_MIRROR,
-                'Referer': window.location.href
-            };
-
-            updateUsername(currentUsername);
-            // 3. (TurnstileManager already initialized above to gain buffer time)
-            
-            // 4. Check Authorization
-            const isAuthorized = await checkAuthorization(currentUsername);
-            
-            // Report authorization status
-            if (!isAuthorized) {
-                reportHealth('invalid_username', { username: currentUsername });
-            }
-            
-            // 5. Start Periodic Check (runs every 60s)
-            startSubscriptionCheck();
-            if (isAuthorized) {
-                // Initialize both sockets in parallel
-                connectWebSocket();
-                connectRegionalServer();
-                connectHealthSocket();
-            } else {
-                // Not authorized: Show subscription prompt immediately (no grace period)
-                showSubscriptionPrompt();
-            }
-        } else {
-            addLog("Cannot proceed without a valid Stake username. Please log in.", "error");
-            updateStatus("disconnected", "Login Req.");
-        }
-    }
-
-    // Clear claimed codes periodically
-    setInterval(() => {
-        claimedCodes.clear(); // Set clear method
-        processingCodes.clear(); // Also clear processing set
-    }, 3 * 60 * 1000);
-    // Clear every 3 minutes
-
-    // Start
-    init();
-})();
+        mongo_client.close()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())

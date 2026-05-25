@@ -7,6 +7,7 @@ import json
 import zipfile
 import re
 import threading
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
@@ -19,7 +20,7 @@ EXTENSION_DIR = os.path.join(WORKDIR, "claimer")
 PROFILE_DIR = os.path.join(WORKDIR, "firefox-profile") 
 INTERNAL_SERVER_PORT = int(os.environ.get("INTERNAL_SERVER_PORT", 17532))
 INTERNAL_SERVER_HOST = "127.0.0.1"
-MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.ac")
+MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.com")
 TARGET_URL = f"https://{MIRROR_SITE}/"
 WARMUP_DELAY = int(os.environ.get("WARMUP_DELAY", 45)) # Time to wait for site to load before loading extension
 
@@ -152,6 +153,45 @@ def start_internal_server():
     server_thread.start()
     print(f"[INTERNAL SERVER] 🌐 Started on {INTERNAL_SERVER_HOST}:{INTERNAL_SERVER_PORT}", flush=True)
 
+# ================================
+# FIREFOX POLICIES SETUP
+# ================================
+def setup_firefox_policies():
+    """Creates the policies.json file to completely disable the welcome screen and telemetry."""
+    print("=" * 60, flush=True)
+    print("[POLICY SETUP] Creating enterprise policies.json...", flush=True)
+    print("=" * 60, flush=True)
+    
+    policies = {
+        "policies": {
+            "DisableTelemetry": True,
+            "DisableFirefoxStudies": True,
+            "DisableProfileTutorial": True,
+            "DisableFirefoxAccounts": True,
+            "DontCheckDefaultBrowser": True,
+            "OverrideFirstRunPage": "",
+            "OverridePostUpdatePage": "",
+            "CaptivePortal": False
+        }
+    }
+    
+    # Standard installation paths for Firefox/Developer Edition in Linux containers
+    paths = [
+        "/usr/lib/firefox/distribution",
+        "/usr/lib/firefox-developer-edition/distribution",
+        "/etc/firefox/policies"
+    ]
+    
+    for path in paths:
+        try:
+            os.makedirs(path, exist_ok=True)
+            policy_file = os.path.join(path, "policies.json")
+            with open(policy_file, "w") as f:
+                json.dump(policies, f, indent=4)
+            print(f"[POLICY SETUP] ✓ Wrote policies to {policy_file}", flush=True)
+        except Exception as e:
+            print(f"[POLICY SETUP] ⚠️ Could not write to {path} (might need root permissions): {e}", flush=True)
+    print("=" * 60, flush=True)
 
 # ================================
 # EXTENSION SETUP
@@ -238,6 +278,9 @@ def main():
     time.sleep(5)
     print("[MAIN] ✓ Xvfb should be ready", flush=True)
 
+    # Build and inject the Firefox Enterprise Policies to nuke the welcome screen
+    setup_firefox_policies()
+
     if not os.path.exists(PROFILE_DIR):
         os.makedirs(PROFILE_DIR)
         print("[MAIN] Created new profile directory.", flush=True)
@@ -253,8 +296,28 @@ def main():
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     print(f"[MAIN] Writing Firefox preferences...", flush=True)
     
-    # NEW STEALTH UA: High-quality Firefox on Windows 10 string
-    REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
+    # ==========================================
+    # RANDOMIZATION ENGINE (STEALTH SPOOFING)
+    # ==========================================
+    firefox_versions = ["123.0", "124.0", "125.0", "126.0", "127.0", "128.0"]
+    selected_version = random.choice(firefox_versions)
+    REAL_UA = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{selected_version}) Gecko/20100101 Firefox/{selected_version}"
+    
+    gpus = [
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3060"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3070"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3080"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 4070"),
+        ("Advanced Micro Devices, Inc.", "AMD Radeon RX 6700 XT"),
+        ("Advanced Micro Devices, Inc.", "AMD Radeon RX 6800 XT")
+    ]
+    gpu_vendor, gpu_renderer = random.choice(gpus)
+    
+    cores = random.choice([4, 6, 8, 12, 16])
+    ram = random.choice([8, 16, 32])
+    
+    print(f"[MAIN] 🎭 Spoofing Hardware: {cores} Cores | {ram}GB RAM | {gpu_renderer}", flush=True)
+    print(f"[MAIN] 🎭 Spoofing User-Agent: {REAL_UA}", flush=True)
     
     prefs_content = f"""
     // Extension logic
@@ -263,20 +326,30 @@ def main():
     user_pref("extensions.enabledScopes", 15);
     user_pref("extensions.startupScanScopes", 15);
     
+    // Disable First-Run, Terms, and Telemetry Prompts
+    user_pref("datareporting.healthreport.service.firstRun", false);
+    user_pref("datareporting.policy.dataSubmissionEnabled", false);
+    user_pref("datareporting.policy.dataSubmissionPolicyAcceptedVersion", 2);
+    user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+    user_pref("browser.aboutwelcome.enabled", false);
+    user_pref("browser.rights.3.shown", true);
+    user_pref("browser.EULA.override", true);
+    user_pref("browser.EULA.3.accepted", true);
+    
     // Anti-detection & Hardware Spoofing
     user_pref("dom.webdriver.enabled", false);
     user_pref("usePrivilegedMozillaProcess", true);
     user_pref("privacy.resistFingerprinting", false);
     
     // Hardware Fixes (RAM & CPU Cores)
-    user_pref("dom.maxHardwareConcurrency", 8);
-    user_pref("dom.processorCoreCount", 8);
-    user_pref("dom.deviceMemory", 8); 
+    user_pref("dom.maxHardwareConcurrency", {cores});
+    user_pref("dom.processorCoreCount", {cores});
+    user_pref("dom.deviceMemory", {ram}); 
 
-    // Hardware Rendering Spoof (Advanced NVIDIA mask)
+    // Hardware Rendering Spoof
     user_pref("webgl.enable-debug-renderer-info", true);
-    user_pref("webgl.renderer-string-override", "NVIDIA GeForce RTX 3080");
-    user_pref("webgl.vendor-string-override", "NVIDIA Corporation");
+    user_pref("webgl.renderer-string-override", "{gpu_renderer}");
+    user_pref("webgl.vendor-string-override", "{gpu_vendor}");
     user_pref("webgl.force-enabled", true);
     user_pref("webgl.disabled", false);
 

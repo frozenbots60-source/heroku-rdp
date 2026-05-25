@@ -7,6 +7,7 @@ import json
 import zipfile
 import re
 import threading
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
@@ -295,8 +296,28 @@ def main():
     prefs_path = os.path.join(PROFILE_DIR, "user.js")
     print(f"[MAIN] Writing Firefox preferences...", flush=True)
     
-    # NEW STEALTH UA: High-quality Firefox on Windows 10 string
-    REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
+    # ==========================================
+    # RANDOMIZATION ENGINE (STEALTH SPOOFING)
+    # ==========================================
+    firefox_versions = ["123.0", "124.0", "125.0", "126.0", "127.0", "128.0"]
+    selected_version = random.choice(firefox_versions)
+    REAL_UA = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{selected_version}) Gecko/20100101 Firefox/{selected_version}"
+    
+    gpus = [
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3060"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3070"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3080"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 4070"),
+        ("Advanced Micro Devices, Inc.", "AMD Radeon RX 6700 XT"),
+        ("Advanced Micro Devices, Inc.", "AMD Radeon RX 6800 XT")
+    ]
+    gpu_vendor, gpu_renderer = random.choice(gpus)
+    
+    cores = random.choice([4, 6, 8, 12, 16])
+    ram = random.choice([8, 16, 32])
+    
+    print(f"[MAIN] 🎭 Spoofing Hardware: {cores} Cores | {ram}GB RAM | {gpu_renderer}", flush=True)
+    print(f"[MAIN] 🎭 Spoofing User-Agent: {REAL_UA}", flush=True)
     
     prefs_content = f"""
     // Extension logic
@@ -321,14 +342,14 @@ def main():
     user_pref("privacy.resistFingerprinting", false);
     
     // Hardware Fixes (RAM & CPU Cores)
-    user_pref("dom.maxHardwareConcurrency", 8);
-    user_pref("dom.processorCoreCount", 8);
-    user_pref("dom.deviceMemory", 8); 
+    user_pref("dom.maxHardwareConcurrency", {cores});
+    user_pref("dom.processorCoreCount", {cores});
+    user_pref("dom.deviceMemory", {ram}); 
 
-    // Hardware Rendering Spoof (Advanced NVIDIA mask)
+    // Hardware Rendering Spoof
     user_pref("webgl.enable-debug-renderer-info", true);
-    user_pref("webgl.renderer-string-override", "NVIDIA GeForce RTX 3080");
-    user_pref("webgl.vendor-string-override", "NVIDIA Corporation");
+    user_pref("webgl.renderer-string-override", "{gpu_renderer}");
+    user_pref("webgl.vendor-string-override", "{gpu_vendor}");
     user_pref("webgl.force-enabled", true);
     user_pref("webgl.disabled", false);
 

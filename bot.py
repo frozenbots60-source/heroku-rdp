@@ -24,10 +24,6 @@ MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.com")
 TARGET_URL = f"https://{MIRROR_SITE}/"
 WARMUP_DELAY = int(os.environ.get("WARMUP_DELAY", 45)) # Time to wait for site to load before loading extension
 
-# Proxy Settings (Hardcoded for your burner VPS)
-PROXY_HOST = "139.59.24.235" 
-PROXY_PORT = 3128 
-
 BOT_START_TIME = time.time()
 
 # Global state
@@ -322,23 +318,6 @@ def main():
     
     print(f"[MAIN] 🎭 Spoofing Hardware: {cores} Cores | {ram}GB RAM | {gpu_renderer}", flush=True)
     print(f"[MAIN] 🎭 Spoofing User-Agent: {REAL_UA}", flush=True)
-
-    # Dynamically build proxy preferences
-    proxy_prefs = ""
-    if PROXY_HOST and PROXY_PORT:
-        print(f"[MAIN] 🌐 Configuring Proxy routing for: {PROXY_HOST}:{PROXY_PORT}", flush=True)
-        proxy_prefs = f"""
-    // Proxy Configuration
-    user_pref("network.proxy.type", 1);
-    user_pref("network.proxy.http", "{PROXY_HOST}");
-    user_pref("network.proxy.http_port", {PROXY_PORT});
-    user_pref("network.proxy.ssl", "{PROXY_HOST}");
-    user_pref("network.proxy.ssl_port", {PROXY_PORT});
-    user_pref("network.proxy.socks", "{PROXY_HOST}");
-    user_pref("network.proxy.socks_port", {PROXY_PORT});
-    user_pref("network.proxy.socks_remote_dns", true);
-    user_pref("network.proxy.share_proxy_settings", true);
-        """
     
     prefs_content = f"""
     // Extension logic
@@ -398,7 +377,6 @@ def main():
     user_pref("browser.startup.homepage", "{TARGET_URL}");
     user_pref("browser.startup.page", 1);
     user_pref("browser.startup.homepage_override.mstone", "ignore");
-    {proxy_prefs}
     """
     
     with open(prefs_path, "w") as f:

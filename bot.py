@@ -23,9 +23,8 @@ MIRROR_SITE = os.environ.get("MIRROR_SITE", "stake.com")
 TARGET_URL = f"https://{MIRROR_SITE}/"
 WARMUP_DELAY = int(os.environ.get("WARMUP_DELAY", 45)) # Time to wait for site to load before loading extension
 
-# Proxy Settings (Hardcoded for your VPS test)
-# NOTE: Replace the placeholder IP below with your actual VPS IP
-PROXY_HOST = "198.51.100.1" 
+# Proxy Settings (Hardcoded for your burner VPS)
+PROXY_HOST = "139.59.24.235" 
 PROXY_PORT = 3128 
 
 BOT_START_TIME = time.time()

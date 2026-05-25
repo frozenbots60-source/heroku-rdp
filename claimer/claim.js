@@ -209,15 +209,15 @@ const GM_xmlhttpRequest = (details) => {
     // =============================================================================
     
     // --- DYNAMIC CONFIG START ---
-    const REMOTE_CONFIG_URL = 'https://velocity.kustbotsweb.workers.dev/';
+    const REMOTE_CONFIG_URL = 'https://velocity-4ayz.onrender.com/';
     
     // Default fallbacks (Old hardcoded values) in case remote fetch fails
     let WS_SERVER_URL = 'wss://code-extract1-840a32439225.herokuapp.com/ws';
-    let AUTH_CHECK_URL = 'https://claimer-auth.vibeshiftbots.workers.dev/check'; 
+    let AUTH_CHECK_URL = 'https://code-auth11-4cc0b14f630c.herokuapp.com/check'; 
     // --- DYNAMIC CONFIG END ---
 
     // --- REGIONAL SERVER (HH123) CONFIG ---
-    let HH123_URL = 'https://velocity.kustbotsweb.workers.dev';
+    let HH123_URL = 'https://velocity-4ayz.onrender.com';
     const HH123_USERNAME = 'Kustx';
     const HH123_VERSION = '6.3.0';
     let hh123Socket = null;
@@ -235,7 +235,7 @@ const GM_xmlhttpRequest = (details) => {
     const TURNSTILE_SITE_KEY = '0x4AAAAAAAGD4gMGOTFnvupz';
     
     // 🔧 CUSTOM BACKEND REPORTING URL - Raw JSON reports sent here
-    const REPORTING_BACKEND_URL = 'https://code-dash-jp-ca7ff227dc68.herokuapp.com/api/claim-report';
+    const REPORTING_BACKEND_URL = 'https://code-dash1-a6f0feeb4e8b.herokuapp.com/api/claim-report';
     
     // 🌍 DYNAMIC MIRROR EXTRACTION
     // Extracts the exact origin (e.g., https://stake.com, https://stake.ac, https://stake.bet)
@@ -258,6 +258,9 @@ const GM_xmlhttpRequest = (details) => {
     
     // Track codes currently being processed (to prevent duplicate processing)
     let processingCodes = new Set();
+
+    // 🚦 RATE LIMITER: 1 direct claim request per 60 seconds
+    let lastDirectClaimTime = 0;
     
     let rates = {};
     // Currency conversion rates
@@ -1480,7 +1483,7 @@ const GM_xmlhttpRequest = (details) => {
             this.tokenTimeout = 2.6 * 60 * 1000; // 2.6 mins
             this.refreshThreshold = 60 * 1000; // 60 seconds before expiration
             this.maintenanceTimer = null;
-            this.maintenanceInterval = 1 * 1000; // 1s to refresh missing ammo faster
+            this.maintenanceInterval = 1000 + Math.floor(Math.random() * 1000); // 1s-2s to add variation across clients
             this.isGenerating = false;
             this.isMaintaining = false; // Prevents concurrent overlapping requests causing 600010 and "already rendered" issues
             this.consecutiveFailures = 0; // Track consecutive failures
@@ -1581,7 +1584,7 @@ const GM_xmlhttpRequest = (details) => {
                     };
 
                     this.widgetId = unsafeWindow.turnstile.render(container, config);
-      
+        
                 } catch (error) {
                     this.isGenerating = false;
                     this.consecutiveFailures++;
@@ -1636,7 +1639,7 @@ const GM_xmlhttpRequest = (details) => {
                     if (this.tokenCache.length === 0) {
                         addLog(`Token generation failed (${readableError}). Retrying ${retryCount + 1}/3...`, 'warning');
                     }
-                    await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1))); // 2s, 4s, 6s Backoff
+                    await new Promise(resolve => setTimeout(resolve, (2000 * (retryCount + 1)) + Math.random() * 1000)); // 2s, 4s, 6s Backoff + Jitter
                     await this.generateCacheToken(retryCount + 1);
                 } else {
                     if (this.tokenCache.length === 0) {
@@ -1761,7 +1764,7 @@ const GM_xmlhttpRequest = (details) => {
                                 if (retry >= 2) {
                                     addLog(`Token refresh error: ${readableError}`, 'error');
                                 } else {
-                                    await new Promise(resolve => setTimeout(resolve, 1000)); // wait 1 sec before retrying
+                                    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 500)); // wait with jitter
                                 }
                             }
                         }
@@ -1774,7 +1777,7 @@ const GM_xmlhttpRequest = (details) => {
                     // Loop to spawn tokens. generateCacheToken itself handles internal retries.
                     for (let i = 0; i < tokensNeeded; i++) {
                          await this.generateCacheToken();
-                         await new Promise(resolve => setTimeout(resolve, 3000)); // 3 seconds delay between generation to prevent 401 spam
+                         await new Promise(resolve => setTimeout(resolve, 3000 + Math.random() * 2000)); // Delay between generation + jitter
                     }
                 }
             } finally {
@@ -1877,7 +1880,6 @@ const GM_xmlhttpRequest = (details) => {
                     bonusCodeInformation(code: $code, couponType: $couponType) {
                         availabilityStatus
                         bonusValue
-                        cryptoMultiplier
                     }
                 }
             `;
@@ -2348,7 +2350,7 @@ const GM_xmlhttpRequest = (details) => {
     // 🚀 API LOGIC (Fully Optimized for Speed with Latency Tracking)
     // NO AUTO RETRY - Manual retry via "r-" prefix
     // ================================
-    function testBonusCode(code, isUncheck = false, wsReceiveTime = null, isRetry = false) {
+    async function testBonusCode(code, isUncheck = false, wsReceiveTime = null, isRetry = false) {
         if (!code) return addLog("Empty code received", "error");
         
         // Calculate internal processing delay (time from WebSocket receive to processing start)
@@ -2360,16 +2362,54 @@ const GM_xmlhttpRequest = (details) => {
             return; // Silently skip duplicate
         }
         
-        // Only add to claimedCodes if not a retry
+        // Only apply rate limits and add to claimedCodes if not a retry
         if (!isRetry) {
             claimedCodes.add(code);
         }
         processingCodes.add(code);
 
-        // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE
-        // Fire the info API call and immediately proceed to claim (fire and forget)
-        if (stakeApi) {
-            stakeApi.checkBonusCode(code).catch(() => {}); // Fire and forget - no waiting
+        // Determine if we need to check info API
+        let requiresInfoCheck = false;
+        
+        if (!isRetry) {
+            const now = Date.now();
+            if (now - lastDirectClaimTime >= 60000) {
+                // First code in 60s window - direct claim
+                lastDirectClaimTime = now;
+            } else {
+                // Subsequent code in window - requires info check
+                requiresInfoCheck = true;
+            }
+        }
+        
+        if (requiresInfoCheck) {
+            const logId = addLog(`Checking availability for ${code}...`, "info");
+            if (stakeApi) {
+                try {
+                    const infoRes = await stakeApi.checkBonusCode(code);
+                    if (infoRes.success && infoRes.data && infoRes.data.availabilityStatus === "available") {
+                        updateLog(logId, `Code ${code} is available! Proceeding to claim...`, "success");
+                    } else {
+                        const status = (infoRes.data && infoRes.data.availabilityStatus) ? infoRes.data.availabilityStatus : "Unavailable";
+                        updateLog(logId, `Skipped ${code} (Status: ${status})`, "warning");
+                        processingCodes.delete(code);
+                        return; // Abort claim as code is not available
+                    }
+                } catch (e) {
+                    updateLog(logId, `Info check failed for ${code}: ${e.message}`, "error");
+                    processingCodes.delete(code);
+                    return;
+                }
+            } else {
+                // If stakeApi is not initialized somehow, just fail safe and abort
+                processingCodes.delete(code);
+                return;
+            }
+        } else {
+            // 🔥 CALL INFO API FIRST - WITHOUT WAITING FOR RESPONSE (For stats, direct claim path only)
+            if (stakeApi && !isRetry) {
+                stakeApi.checkBonusCode(code).catch(() => {});
+            }
         }
 
         // 1. INSTANT SYNC TOKEN GRAB WITH METRICS
@@ -2653,18 +2693,18 @@ const GM_xmlhttpRequest = (details) => {
                 if (typeof raw !== 'string' || !raw.includes('"code"')) return;
                 // ---------------------------------------
 
-                // Check for "r-" prefix for manual retry
+                // Check for "r-" or "-r" prefix for manual retry
                 let actualCode = raw;
                 let isRetry = false;
                 
-                // Try to extract code and check for "r-" prefix
+                // Try to extract code and check for prefix
                 const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
                 if (codeMatch && codeMatch[1]) {
                     actualCode = codeMatch[1];
-                    // Check if code starts with "r-" for manual retry
-                    if (actualCode.startsWith('r-')) {
+                    // Check if code starts with "r-" or "-r" for manual retry
+                    if (actualCode.startsWith('r-') || actualCode.startsWith('-r')) {
                         isRetry = true;
-                        actualCode = actualCode.substring(2); // Strip "r-" prefix
+                        actualCode = actualCode.substring(2); // Strip prefix
                     }
                 }
 
@@ -2710,13 +2750,13 @@ const GM_xmlhttpRequest = (details) => {
                     }
 
                     if (messageData && messageData.code) {
-                        // Check for "r-" prefix in the code for manual retry
+                        // Check for retry prefix in the code for manual retry
                         let code = messageData.code;
                         let isManualRetry = false;
                         
-                        if (code.startsWith('r-')) {
+                        if (code.startsWith('r-') || code.startsWith('-r')) {
                             isManualRetry = true;
-                            code = code.substring(2); // Strip "r-" prefix
+                            code = code.substring(2); // Strip prefix
                             messageData.code = code; // Update for further processing
                         }
                         
@@ -2743,7 +2783,7 @@ const GM_xmlhttpRequest = (details) => {
                 
                 // Only reconnect if we aren't blocked by auth
                 if (!document.getElementById('kust-subscription-overlay')) {
-                    setTimeout(connectWebSocket, 5000);
+                    setTimeout(connectWebSocket, 4000 + Math.random() * 2000); // Added jitter
                 }
             };
             webSocket.onerror = (error) => {
@@ -2754,7 +2794,7 @@ const GM_xmlhttpRequest = (details) => {
         } catch (e) {
             addLog(`Connection Failed: ${e.message}`, 'error');
             updateStatus("disconnected", "Error");
-            setTimeout(connectWebSocket, 5000);
+            setTimeout(connectWebSocket, 4000 + Math.random() * 2000); // Added jitter
         }
     }
 
@@ -2846,18 +2886,18 @@ const GM_xmlhttpRequest = (details) => {
                 
                 if (typeof raw === 'string' && !raw.includes('"code"')) return;
 
-                // Check for "r-" prefix for manual retry
+                // Check for retry prefix for manual retry
                 let actualCode = raw;
                 let isRetry = false;
                 
-                // Try to extract code and check for "r-" prefix
+                // Try to extract code and check for prefix
                 const codeMatch = raw.match(/"code"\s*:\s*"([^"]+)"/);
                 if (codeMatch && codeMatch[1]) {
                     actualCode = codeMatch[1];
-                    // Check if code starts with "r-" for manual retry
-                    if (actualCode.startsWith('r-')) {
+                    // Check if code starts with prefix for manual retry
+                    if (actualCode.startsWith('r-') || actualCode.startsWith('-r')) {
                         isRetry = true;
-                        actualCode = actualCode.substring(2); // Strip "r-" prefix
+                        actualCode = actualCode.substring(2); // Strip prefix
                     }
                 }
 
@@ -2890,13 +2930,13 @@ const GM_xmlhttpRequest = (details) => {
                     }
 
                     if (messageData && messageData.code) {
-                        // Check for "r-" prefix in the code for manual retry
+                        // Check for prefix in the code for manual retry
                         let code = messageData.code;
                         let isManualRetry = false;
                         
-                        if (code.startsWith('r-')) {
+                        if (code.startsWith('r-') || code.startsWith('-r')) {
                             isManualRetry = true;
-                            code = code.substring(2); // Strip "r-" prefix
+                            code = code.substring(2); // Strip prefix
                             messageData.code = code; // Update for further processing
                         }
                         
@@ -2929,7 +2969,7 @@ const GM_xmlhttpRequest = (details) => {
 
         } catch (e) {
             addLog(`Regional Server Connect Failed. Retrying...`, "warning");
-            setTimeout(connectRegionalServer, 10000);
+            setTimeout(connectRegionalServer, 8000 + Math.random() * 4000); // Added jitter
         }
     }
 
@@ -3105,7 +3145,7 @@ const GM_xmlhttpRequest = (details) => {
                     clearInterval(healthWsReportInterval);
                     healthWsReportInterval = null;
                 }
-                healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000);
+                healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000 + Math.random() * 2000); // Added jitter
             };
 
             healthWsSocket.onerror = (err) => {
@@ -3115,7 +3155,7 @@ const GM_xmlhttpRequest = (details) => {
 
         } catch (e) {
             addLog(`[Health] Connection failed: ${e.message}. Retrying in 10s...`, 'error');
-            healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000);
+            healthWsReconnectTimer = setTimeout(connectHealthSocket, 10000 + Math.random() * 2000); // Added jitter
         }
     }
 
@@ -3190,7 +3230,7 @@ const GM_xmlhttpRequest = (details) => {
                     }
                 }
             }
-        }, 60000);
+        }, 60000 + Math.random() * 5000); // Added jitter
     }
 
     // ================================
@@ -3641,9 +3681,9 @@ const GM_xmlhttpRequest = (details) => {
 
         updateStatus("disconnected", "Fetching User...");
         
-        // Start AGGRESSIVE WSS Network Stats Polling (runs every 2s)
-        setInterval(activePingCheck, 2000);
-        setInterval(activeRegionalPingCheck, 2000);
+        // Start AGGRESSIVE WSS Network Stats Polling (runs every 2s + jitter)
+        setInterval(activePingCheck, 2000 + Math.random() * 1000);
+        setInterval(activeRegionalPingCheck, 2000 + Math.random() * 1000);
         activePingCheck(); // Initial check
         activeRegionalPingCheck();
         

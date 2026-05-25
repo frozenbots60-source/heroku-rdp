@@ -2594,6 +2594,15 @@ const GM_xmlhttpRequest = (details) => {
                 // Some APIs return a 'message' field at root
                 failureReason = claimResponse.message;
             }
+
+            // --- JSON.PARSE ERROR INTERCEPTOR START ---
+            const errorStr = failureReason.toLowerCase();
+            if (errorStr.includes('json.parse: unexpected character') || errorStr.includes('unexpected token')) {
+                addLog('API returned invalid JSON (Likely 502/Cloudflare). Forcing immediate refresh...', 'error');
+                requestRestart('API_JSON_Parse_Error');
+                return; // Stop further processing immediately
+            }
+            // --- JSON.PARSE ERROR INTERCEPTOR END ---
             
             const errorType = getErrorType(failureReason);
             

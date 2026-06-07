@@ -261,6 +261,7 @@ const GM_xmlhttpRequest = (details) => {
 
     // 🚦 RATE LIMITER: 1 direct claim request per 60 seconds
     let lastDirectClaimTime = 0;
+    let codesProcessedInWindow = 0;
     
     let rates = {};
     // Currency conversion rates
@@ -1478,7 +1479,7 @@ const GM_xmlhttpRequest = (details) => {
             this.siteKey = TURNSTILE_SITE_KEY;
             this.widgetId = null;
             this.tokenCache = [];
-            this.maxCacheSize = 8; 
+            this.maxCacheSize = 4; 
             this.initialized = false;
             this.tokenTimeout = 2.6 * 60 * 1000; // 2.6 mins
             this.refreshThreshold = 60 * 1000; // 60 seconds before expiration
@@ -2376,8 +2377,15 @@ const GM_xmlhttpRequest = (details) => {
             if (now - lastDirectClaimTime >= 60000) {
                 // First code in 60s window - direct claim
                 lastDirectClaimTime = now;
+                codesProcessedInWindow = 1; // Reset counter, count this first one
             } else {
                 // Subsequent code in window - requires info check
+                if (codesProcessedInWindow >= 3) {
+                    addLog(`Rate limit reached (3 codes/60s). Ignoring ${code}. Use r- prefix to force claim.`, "warning");
+                    processingCodes.delete(code);
+                    return; // Abort processing this code
+                }
+                codesProcessedInWindow++;
                 requiresInfoCheck = true;
             }
         }
